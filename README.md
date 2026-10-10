@@ -54,7 +54,7 @@ Independent GitHub Actions workflow: [`.github/workflows/ci.yml`](.github/workfl
 runs the three Linux checks for this crate as its own repository root, plus a
 native `windows-latest` job (`cargo test --locked`, `cargo build --locked --release`)
 that uploads a disposable development download bundle (`hs-server.exe`,
-`scripts/start-development.ps1`, `scripts/windows-tester.md`).
+`scripts/start-development.cmd`, `scripts/start-development.ps1`, `scripts/windows-tester.md`).
 
 ## Operate (development)
 
@@ -83,6 +83,7 @@ CI artifact `hs-server-windows-x64-dev` (from the `windows-latest` job) contains
 | File | Purpose |
 | --- | --- |
 | `hs-server.exe` | Release build of this server |
+| [`scripts/start-development.cmd`](scripts/start-development.cmd) | Double-click launcher that retains errors |
 | [`scripts/start-development.ps1`](scripts/start-development.ps1) | Disposable literal-loopback fixture launcher |
 | [`scripts/windows-tester.md`](scripts/windows-tester.md) | Tester instructions and manual CLI steps |
 
@@ -137,3 +138,7 @@ HTTP wire shape is unchanged from that version-1 file.
 Broader plan work (file jobs, MFA factors, recovery/cutover, remote desktop,
 native apps, production installers) remains required and unfinished. See
 `BUILD-REPORT.md` for tested versus unproven boundaries.
+
+On Windows, double-click `start-development.cmd` or run the PowerShell script
+from an existing terminal. The CMD launcher keeps errors visible after the
+child process stops and preserves the configured execution policy.

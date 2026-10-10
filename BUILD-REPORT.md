@@ -220,3 +220,14 @@ install, scope auto-grant, secret zeroization claims, starting the server on
 this Mac, asserting Windows CI green from Mac.
 
 Coordinator review changed bootstrap to a child-only environment and explicit UTF-8 stdin, preserving the calling PowerShell environment/encoding and applying a 15-second deadline. Windows CI parses the actual launcher with Windows PowerShell, calls its real init/bootstrap helpers, authenticates the Unicode password, checks caller environment preservation and refuses reused bootstrap. Results remain pending until that native job completes.
+
+## Windows user handoff correction
+
+The user confirmed both Windows apps launch. Their server-test video showed
+Explorer opening the PowerShell source in an editor and a subsequent
+PowerShell window closing before an error could be read. No sign-in success
+is inferred from that video. The bundle now includes `start-development.cmd`,
+which invokes the same script without elevation or policy override and pauses
+after its child exits, preserving visible error diagnostics. The launcher
+keeps the exact foreground loopback behavior and does not install a service.
+Actual double-click behavior on the user's PC still needs their test.

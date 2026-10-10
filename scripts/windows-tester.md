@@ -11,6 +11,7 @@ installer, not authority, and not a remote-engine claim.
 | File | Purpose |
 | --- | --- |
 | `hs-server.exe` | Coordination server (local accounts, manager enrollment, scoped inventory) |
+| `start-development.cmd` | Double-click launcher; retains errors without changing execution policy |
 | `start-development.ps1` | Disposable fixture launcher (review it before running) |
 | `windows-tester.md` | This document |
 
@@ -42,8 +43,10 @@ instead of weakening policy for this fixture.
 ## Quick start (script)
 
 1. Download and unzip the bundle to a local folder.
-2. Inspect `start-development.ps1`.
-3. Open PowerShell in that folder and run:
+2. Double-click `start-development.cmd`. It opens PowerShell, runs the fixture,
+   and waits for a key after the server stops or an error occurs. It changes no
+   execution policy and requests no administrator access.
+3. Alternatively, open an existing PowerShell window in that folder and run:
 
 ```powershell
 .\start-development.ps1
@@ -190,12 +193,14 @@ When finished:
 1. Stop the server with Ctrl+C.
 2. Delete the disposable directory printed by the script
    (under `%TEMP%\helicoid-hs-server-...` by default).
-3. Nothing is installed, so there is nothing to uninstall.
+3. Close both Helicoid apps and delete their extracted folders and the extracted
+   server folder. These builds install no service and need no administrator uninstall.
 
 ## Troubleshooting
 
 | Symptom | What to check |
 | --- | --- |
+| Double-clicking the `.ps1` opens an editor or its window closes | Use `start-development.cmd`, or run `./start-development.ps1` from an existing PowerShell window so errors stay visible. |
 | Script will not run | Execution policy may block it. Inspect the script and use the manual CLI steps, or your org's approved way to run a local script. Do not use `-ExecutionPolicy Bypass` for this fixture. |
 | `hs-server.exe not found` | Put `hs-server.exe` beside `start-development.ps1`, or pass `-ServerExe` |
 | `Refusing existing database` | The directory/DB must be new. Choose a different `-ParentDirectory` or delete the leftover yourself after confirming it is disposable |
