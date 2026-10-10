@@ -1,0 +1,34 @@
+[package]
+name = "hs-server"
+version = "0.1.0"
+edition = "2021"
+description = "HS coordination server foundation (local accounts, manager enrollment, scoped inventory)"
+license = "LicenseRef-TBD"
+publish = false
+
+[dependencies]
+argon2 = "0.6"
+axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+rand = "0.10"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "io-util", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.dev]
+# Keep local proof runs responsive; production profile is not a proof gate.
+opt-level = 0
