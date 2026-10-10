@@ -1,16 +1,16 @@
 # BUILD-REPORT — Helicoid `hs-server` foundation
 
-Owned path: `modules/server/**` only.  
-Product: **Helicoid** (Helicoid Systems). Organization: **Helicoid-Systems**.  
-Working names: HS Manager / HS Computer.  
-Build date: 10 October 2026 (review-fix pass).  
-Toolchain: rustc 1.99.0 / cargo 1.99.0 (`/tmp/hs-toolchain`).  
+Owned path: `modules/server/**` only.
+Product: **Helicoid** (Helicoid Systems). Organization: **Helicoid-Systems**.
+Apps: **Helicoid Manager** / **Helicoid Computer**.
+Build date: 10 October 2026 (review-fix pass).
+Toolchain: rustc 1.99.0 / cargo 1.99.0 (`/tmp/hs-toolchain`).
 Dedicated target dir: `/tmp/hs-build/server-target`.
 
 ## Outcome
 
 **VERIFIED** for the development foundation and all five coordinator review
-findings (unit + integration tests + clippy/fmt + CLI refusal + loopback health).  
+findings (unit + integration tests + clippy/fmt + CLI refusal + loopback health).
 **NOT VERIFIED:** production identity/cryptographic manager keys, LAN authority,
 remote desktop, MFA, file jobs, recovery/cutover, real multi-process soak.
 
@@ -126,3 +126,97 @@ are refused at start (CLI), not a JSON field.
 1. B03/E07 production identities, MFA, delegation ceilings, replay fencing.
 2. S01 native clients on `contracts/http-v1.md`.
 3. File jobs / recovery / cutover per `docs/spec/build-map.md`.
+
+---
+
+# BUILD-REPORT — Windows 11 x64 development-server download
+
+Date: 10 October 2026.
+Owned paths this pass: `modules/server/.github/workflows/**`,
+`modules/server/scripts/**`, `modules/server/README.md`, `modules/server/BUILD-REPORT.md`.
+No Rust `src`/`tests`/`contracts`/`Cargo.lock` changes. No git/push/deletes.
+Server not started on this Mac.
+
+## Outcome
+
+**VERIFIED (this Mac, content-level):** workflow YAML structure, script/tester
+artifact paths, fixture contract text (fresh unique disposable DB, literal
+loopback, no service/elevation/ExecutionPolicy bypass/firewall, password on
+stdin not argv, token in memory / env not argv, fixed `dev-manager-key`, no
+auto scope creation, no auto-delete of test directory).
+**NOT VERIFIED (this Mac):** Windows PowerShell execution of
+`start-development.ps1`, native `windows-latest` Rust build/test of this crate,
+artifact download by a Windows 11 tester. **CI Windows must establish the
+Windows Rust build after coordinator publishes. Do not treat that gate as
+passed from Mac.**
+
+## Fresh proof commands (this turn)
+
+| Command | Result |
+| --- | --- |
+| `ls modules/server/scripts modules/server/.github/workflows` | `start-development.ps1`, `windows-tester.md`, `ci.yml` present |
+| `ruby -ryaml -e "...YAML.load_file(...ci.yml)..."` | **clean parse**; jobs `verify,windows`; Linux verify steps preserved (Checkout/Toolchain/Cache/Format/Test/Clippy); windows steps Test/Build release/Stage/Upload |
+| `git status --short` in `modules/server` | only `.github/workflows/ci.yml`, `README.md`, `BUILD-REPORT.md` modified + `scripts/` added; no Rust/src/tests/contracts/lock changes |
+| `command -v pwsh` / `powershell` | **not installed on this Mac** — script not executed here |
+| Server binary start | **not run** (explicitly out of scope on this Mac) |
+| Python structural scan of `start-development.ps1` | brace/paren balance 0; required markers present (`Read-Host -AsSecureString`, `--password-stdin`, `HS_BOOTSTRAP_TOKEN`, `dev-manager-key`, `127.0.0.1:8787`, `ZeroFreeBSTR`, `serve --bind`); no `Write-Host` of password/token variables |
+
+## Deliverables
+
+| Path | Role |
+| --- | --- |
+| `.github/workflows/ci.yml` | Linux `verify` job unchanged (`fmt` / `test --locked` / `clippy`); new `windows` job: `cargo test --locked`, `cargo build --locked --release`, upload `hs-server-windows-x64-dev` |
+| `scripts/start-development.ps1` | Disposable fixture launcher (Windows PowerShell 5.1+) |
+| `scripts/windows-tester.md` | Tester instructions + exact manual CLI steps |
+| `README.md` | Windows download section; app names set to **Helicoid Manager** / **Helicoid Computer** |
+| `BUILD-REPORT.md` | This report |
+
+CI artifact `hs-server-windows-x64-dev` stages: `hs-server.exe`,
+`start-development.ps1`, `windows-tester.md`.
+
+## Runtime fixture contract (encoded in script + docs)
+
+| Requirement | Implementation |
+| --- | --- |
+| Fresh unique disposable DB directory | `helicoid-hs-server-<timestamp>-<guid8>` under temp or `-ParentDirectory`; **refuses** existing directory and any existing DB file |
+| Literal loopback | `serve --bind 127.0.0.1:8787` only; server itself refuses non-loopback |
+| No service / elevation / ExecutionPolicy bypass / firewall / network exposure | Script never does these; docs tell testers not to use `-ExecutionPolicy Bypass` |
+| Password >= 12, prompted securely | `Read-Host -AsSecureString`; length checked before bootstrap |
+| Password via stdin not argv | `--password-stdin` + pipeline; `--password` flag never used |
+| Init token in memory only | Captured from `init` stdout; not printed; passed as `HS_BOOTSTRAP_TOKEN` for bootstrap only (not argv, not a file) |
+| Bootstrap approves fixed `dev-manager-key` | `--manager-public-identity dev-manager-key` (same value Manager sends at login) |
+| Foreground serve, Ctrl+C stops | Direct `& hs-server.exe serve` (no service) |
+| User-visible address / identity / username | Printed before serve; password/token/bearer **never** logged |
+| No auto-create scopes/authority | No HTTP admin calls after bootstrap; docs state inventory stays empty |
+| Never delete test directory | Script leaves the disposable directory in place |
+
+## Script syntax / tool availability / limitations (recorded)
+
+| Item | Status |
+| --- | --- |
+| Target dialect | Windows PowerShell **5.1** (`#Requires -Version 5.1`); also intended for PowerShell 7+ |
+| `$PSScriptRoot`, `Read-Host -AsSecureString`, `Marshal.SecureStringToBSTR` / `ZeroFreeBSTR` | Used; available in 5.1 |
+| `ProcessStartInfo.ArgumentList` | **Not used** (not in .NET Framework / PS 5.1) |
+| UTF-8 stdin for `--password-stdin` | `$OutputEncoding` set to UTF-8 no BOM for the bootstrap call (PS 5.1 native pipe encoding quirk) |
+| Managed-string zeroization | **Not possible.** Variables cleared and `[GC]::Collect()` requested as best effort only. Report and tester doc say this explicitly — no zeroization claim |
+| Local `pwsh` / `powershell` on build Mac | **Absent.** Script not syntax-executed here |
+| Windows CI Rust build/test | **Pending coordinator publish.** `windows-latest` job is the proof gate |
+
+## Manager launch flags (verified against source)
+
+Actual Windows Helicoid Manager switches (`DevelopmentLaunchOptions.cs`):
+
+- `--development-server` (optional `=http://127.0.0.1:8787`)
+- `--development-manager-identity dev-manager-key`
+
+Handoff prose mentioned `--development-server-address` / `--manager-public-identity`
+(those names are the macOS manager surface). Tester docs use the **Windows**
+switches above so sign-in actually works. Identity value remains `dev-manager-key`.
+
+## Explicit non-goals (this pass)
+
+Production installer/authority/remote-engine claims, LAN exposure, service
+install, scope auto-grant, secret zeroization claims, starting the server on
+this Mac, asserting Windows CI green from Mac.
+
+Coordinator review changed bootstrap to a child-only environment and explicit UTF-8 stdin, preserving the calling PowerShell environment/encoding and applying a 15-second deadline. Windows CI parses the actual launcher with Windows PowerShell, calls its real init/bootstrap helpers, authenticates the Unicode password, checks caller environment preservation and refuses reused bootstrap. Results remain pending until that native job completes.

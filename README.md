@@ -10,9 +10,9 @@ security-state-unavailable behavior.
 | --- | --- |
 | Product | **Helicoid** (Helicoid Systems) |
 | Organization | Helicoid-Systems |
-| Working app names | HS Manager (operator console), HS Computer (managed endpoint) |
+| Apps | **Helicoid Manager** (operator console), **Helicoid Computer** (managed endpoint) |
 
-Durable release IDs and remote repository URLs remain pending.
+Repository: https://github.com/Helicoid-Systems/server. Durable release identifiers remain pending.
 
 ## What this foundation is
 
@@ -51,7 +51,10 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Independent GitHub Actions workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-runs the same three checks for this crate as its own repository root.
+runs the three Linux checks for this crate as its own repository root, plus a
+native `windows-latest` job (`cargo test --locked`, `cargo build --locked --release`)
+that uploads a disposable development download bundle (`hs-server.exe`,
+`scripts/start-development.ps1`, `scripts/windows-tester.md`).
 
 ## Operate (development)
 
@@ -72,6 +75,38 @@ hs-server --data ./hs-server.db serve --bind 127.0.0.1:8787
 without starting HTTP and immediately discards the ephemeral session.
 
 Never log or print `password`, `token`, `bootstrap_token`, or `Authorization`.
+
+## Windows 11 x64 development download
+
+CI artifact `hs-server-windows-x64-dev` (from the `windows-latest` job) contains:
+
+| File | Purpose |
+| --- | --- |
+| `hs-server.exe` | Release build of this server |
+| [`scripts/start-development.ps1`](scripts/start-development.ps1) | Disposable literal-loopback fixture launcher |
+| [`scripts/windows-tester.md`](scripts/windows-tester.md) | Tester instructions and manual CLI steps |
+
+`start-development.ps1` creates a fresh unique disposable database directory
+(refuses any existing DB), prompts for a password of at least 12 characters
+(hidden), passes that password to `hs-server` only via stdin, captures the init
+bootstrap token in memory only, approves exactly `dev-manager-key` at bootstrap,
+and serves on `http://127.0.0.1:8787` in the foreground until Ctrl+C.
+
+It does **not** install a service, elevate, bypass execution policy, open
+firewall ports, bind non-loopback, auto-create access scopes, or delete the
+disposable directory. PowerShell cannot guarantee managed-string zeroization;
+see `windows-tester.md` for the honest residual-risk table.
+
+Connect **Helicoid Manager** in development-server mode:
+
+```powershell
+.\Helicoid.Manager.exe --development-server --development-manager-identity dev-manager-key
+# or: .\Helicoid.Manager.exe --development-server=http://127.0.0.1:8787 --development-manager-identity dev-manager-key
+```
+
+Fixture values: address `http://127.0.0.1:8787`, manager identity `dev-manager-key`
+(loopback development fixture, not a production cryptographic identity),
+username `admin` (password is whatever you entered at the prompt).
 
 ## API contract
 
