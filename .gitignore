@@ -1,0 +1,25 @@
+# Build artifacts
+/target/
+/tmp/
+
+# Local runtime / tooling
+.mimocode/
+.runtime/
+runtime/
+
+# Local databases and operator material (never commit)
+*.db
+*.db-wal
+*.db-shm
+hs-server.db
+bootstrap-token*
+session-token*
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# OS noise
+.DS_Store
