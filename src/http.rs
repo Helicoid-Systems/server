@@ -30,6 +30,14 @@ pub fn router(service: SharedService) -> Router {
         .route("/v1/mfa/status", get(mfa_status))
         .route("/v1/files/jobs", post(file_jobs_unavailable))
         .route("/v1/security/recovery", post(security_recovery_unavailable))
+        // Auth v2: MFA enrollment, device-key challenge, recovery-only.
+        .route("/v2/bootstrap", post(bootstrap_v2))
+        .route("/v2/mfa/enroll/confirm", post(mfa_enroll_confirm))
+        .route("/v2/mfa/enroll/cancel", post(mfa_enroll_cancel))
+        .route("/v2/auth/challenge", post(auth_challenge_begin))
+        .route("/v2/auth/challenge/complete", post(auth_challenge_complete))
+        .route("/v2/auth/recovery/begin", post(factor_recovery_begin))
+        .route("/v2/auth/recovery/complete", post(factor_recovery_complete))
         .with_state(service)
 }
 
@@ -156,7 +164,87 @@ async fn grant_access(
 }
 
 async fn mfa_status() -> Json<MfaStatus> {
-    Json(MfaStatus::unavailable())
+    Json(MfaStatus {
+        required: true,
+        available: true,
+        reason: "totp_recovery_device_key_v2",
+    })
+}
+
+// ----- auth v2 -----
+
+async fn bootstrap_v2(
+    State(service): State<SharedService>,
+    Json(req): Json<BootstrapV2Request>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let response = service.bootstrap_v2(req)?;
+    // Secrets are returned once in the response body and never logged.
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "account_id": response.account_id,
+            "username": response.username,
+            "mfa_enrollment_id": response.mfa_enrollment_id,
+            "totp_secret_base32": response.totp_secret_base32,
+            "recovery_codes": response.recovery_codes,
+            "manager_public_key": response.manager_public_key,
+            "account_state": response.account_state,
+            "server_state": response.server_state,
+        })),
+    ))
+}
+
+async fn mfa_enroll_confirm(
+    State(service): State<SharedService>,
+    Json(req): Json<MfaConfirmRequest>,
+) -> AppResult<Json<MfaConfirmResponse>> {
+    Ok(Json(service.confirm_mfa_enrollment(req)?))
+}
+
+async fn mfa_enroll_cancel(
+    State(service): State<SharedService>,
+    Json(req): Json<MfaEnrollCancelRequest>,
+) -> AppResult<StatusCode> {
+    service.cancel_mfa_enrollment(&req.mfa_enrollment_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn auth_challenge_begin(
+    State(service): State<SharedService>,
+    Json(req): Json<AuthChallengeBeginRequest>,
+) -> AppResult<(StatusCode, Json<AuthChallengeBeginResponse>)> {
+    let response = service.begin_auth_challenge(req)?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn auth_challenge_complete(
+    State(service): State<SharedService>,
+    Json(req): Json<AuthChallengeCompleteRequest>,
+) -> AppResult<Json<LoginResponse>> {
+    Ok(Json(service.complete_auth_challenge(req)?))
+}
+
+async fn factor_recovery_begin(
+    State(service): State<SharedService>,
+    Json(req): Json<FactorRecoveryBeginRequest>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let response = service.begin_factor_recovery(req)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "mfa_enrollment_id": response.mfa_enrollment_id,
+            "totp_secret_base32": response.totp_secret_base32,
+            "account_id": response.account_id,
+            "purpose": response.purpose,
+        })),
+    ))
+}
+
+async fn factor_recovery_complete(
+    State(service): State<SharedService>,
+    Json(req): Json<MfaConfirmRequest>,
+) -> AppResult<Json<MfaConfirmResponse>> {
+    Ok(Json(service.complete_factor_recovery(req)?))
 }
 
 #[derive(Serialize)]

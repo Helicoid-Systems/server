@@ -32,6 +32,13 @@ struct Cli {
 enum Command {
     /// Create the database schema if missing and print a single-use bootstrap token.
     Init,
+    /// Explicit schema-versioned migration with a consistent pre-migration backup.
+    /// Never runs automatically on startup.
+    Migrate {
+        /// Directory for the pre-migration database backup.
+        #[arg(long, default_value = "./hs-server-backups")]
+        backup_dir: PathBuf,
+    },
     /// Consume the single-use bootstrap token to create the first administrator.
     Bootstrap {
         /// Bootstrap token from `hs-server init` (or HS_BOOTSTRAP_TOKEN).
@@ -51,6 +58,52 @@ enum Command {
         #[arg(long)]
         manager_friendly_name: Option<String>,
     },
+    /// Bootstrap with real TOTP MFA (local CLI). Admin stays inactive until
+    /// MFA confirmation and independently stored recovery material.
+    BootstrapV2 {
+        /// Bootstrap token from `hs-server init` (or HS_BOOTSTRAP_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        username: String,
+        /// Read the password from stdin.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Exact initiating manager Ed25519 public key (hex, 32 bytes).
+        #[arg(long)]
+        manager_public_key: Option<String>,
+        /// Hex Ed25519 proof over hs-bootstrap-v2|deployment:<id>|token:<hash>|manager:<key>.
+        /// Read from a file path to keep the signature out of argv when possible.
+        #[arg(long)]
+        manager_proof_file: Option<PathBuf>,
+        /// Inline manager proof (avoid; prefer --manager-proof-file).
+        #[arg(long)]
+        manager_proof: Option<String>,
+        #[arg(long)]
+        manager_friendly_name: Option<String>,
+        /// Write recovery codes to this private file (0600) instead of stdout.
+        #[arg(long)]
+        recovery_file: Option<PathBuf>,
+    },
+    /// Confirm a pending v2 MFA enrollment (TOTP + recovery stored attestation).
+    ConfirmMfa {
+        #[arg(long)]
+        enrollment_id: String,
+        /// Read the 6-digit TOTP code from stdin.
+        #[arg(long)]
+        totp_stdin: bool,
+        /// Inline TOTP code (avoid; prefer --totp-stdin).
+        #[arg(long)]
+        totp_code: Option<String>,
+        /// Required attestation that recovery codes were stored independently.
+        #[arg(long)]
+        recovery_stored: bool,
+    },
+    /// Cancel a pending v2 MFA enrollment (bootstrap cancellation).
+    CancelMfa {
+        #[arg(long)]
+        enrollment_id: String,
+    },
     /// Verify credentials against the local database without starting HTTP.
     CheckLogin {
         #[arg(long)]
@@ -67,6 +120,52 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
     },
+    /// Guided Linux installer backend. Reads bounded versioned JSON from stdin.
+    Installer {
+        #[command(subcommand)]
+        action: InstallerAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum InstallerAction {
+    /// Read-only preflight checks (OS, arch, privileges, storage, ports, paths).
+    Preflight,
+    /// Generate an install plan from preflight + verified package.
+    Plan {
+        /// Path to extracted release package directory.
+        #[arg(long)]
+        package_dir: String,
+        /// Ed25519 verifying key (hex, 32 bytes).
+        #[arg(long)]
+        verify_key: String,
+    },
+    /// Execute the reviewed plan with phase journal.
+    Apply {
+        /// Path to the installer state directory.
+        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        state_dir: String,
+        /// Path to the extracted release package directory.
+        #[arg(long)]
+        package_dir: Option<String>,
+        /// Ed25519 verifying key (hex, 32 bytes) for re-verification.
+        #[arg(long)]
+        verify_key: Option<String>,
+    },
+    /// Resume an interrupted apply.
+    Resume {
+        /// Path to the installer state directory.
+        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        state_dir: String,
+    },
+    /// Read current installation state.
+    Inspect {
+        /// Path to the installer state directory.
+        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        state_dir: String,
+    },
+    /// Remove installation (data preserved by default).
+    Remove,
 }
 
 fn main() {
@@ -104,6 +203,16 @@ fn run(cli: Cli) -> AppResult<()> {
             );
             Ok(())
         }
+        Command::Migrate { backup_dir } => {
+            let report = db::migrate(&cli.data, &backup_dir)?;
+            println!(
+                "migrated schema v{} -> v{}",
+                report.from_version, report.to_version
+            );
+            println!("backup: {}", report.backup_path.display());
+            println!("database ready: {}", cli.data.display());
+            Ok(())
+        }
         Command::Bootstrap {
             token,
             username,
@@ -138,6 +247,104 @@ fn run(cli: Cli) -> AppResult<()> {
             println!("next: hs-server --data {} serve", cli.data.display());
             Ok(())
         }
+        Command::BootstrapV2 {
+            token,
+            username,
+            password_stdin,
+            manager_public_key,
+            manager_proof_file,
+            manager_proof,
+            manager_friendly_name,
+            recovery_file,
+        } => {
+            let token = resolve_secret(token, "HS_BOOTSTRAP_TOKEN")?;
+            let password = read_password_stdin()?;
+            let _ = password_stdin;
+            let proof = match (manager_proof_file, manager_proof) {
+                (Some(path), _) => {
+                    let bytes = std::fs::read_to_string(&path).map_err(|err| {
+                        hs_server::AppError::bad_request(format!("read manager proof file: {err}"))
+                    })?;
+                    bytes.trim().to_string()
+                }
+                (None, Some(inline)) => inline,
+                (None, None) => String::new(),
+            };
+            let service = open_service(&cli.data)?;
+            let response = service.bootstrap_v2(hs_server::models::BootstrapV2Request {
+                bootstrap_token: token,
+                username,
+                password,
+                manager_public_key,
+                manager_proof: if proof.is_empty() { None } else { Some(proof) },
+                manager_friendly_name,
+            })?;
+            println!("bootstrap v2 enrollment created (admin inactive until MFA confirm)");
+            println!(
+                "account: {} ({}) state={}",
+                response.username, response.account_id, response.account_state
+            );
+            println!("mfa_enrollment_id: {}", response.mfa_enrollment_id);
+            println!();
+            println!("totp_secret (enter into authenticator once, never log):");
+            println!("{}", response.totp_secret_base32);
+            println!();
+            let recovery_body = format!("{}\n", response.recovery_codes.join("\n"));
+            match recovery_file {
+                Some(path) => {
+                    write_private_file(&path, recovery_body.as_bytes())?;
+                    println!("recovery codes written to private file: {}", path.display());
+                    println!("store this file offline; the server keeps only hashes");
+                }
+                None => {
+                    println!("recovery_codes (store independently, never log):");
+                    println!("{}", recovery_body.trim_end());
+                }
+            }
+            if let Some(key) = response.manager_public_key {
+                println!();
+                println!("manager device key bound: {key}");
+            }
+            println!();
+            println!(
+                "next: hs-server --data {} confirm-mfa --enrollment-id {} --totp-stdin --recovery-stored",
+                cli.data.display(),
+                response.mfa_enrollment_id
+            );
+            Ok(())
+        }
+        Command::ConfirmMfa {
+            enrollment_id,
+            totp_stdin,
+            totp_code,
+            recovery_stored,
+        } => {
+            let code = if totp_stdin {
+                read_line_stdin("totp code")?
+            } else {
+                totp_code.ok_or_else(|| {
+                    hs_server::AppError::bad_request("pass --totp-stdin or --totp-code")
+                })?
+            };
+            let service = open_service(&cli.data)?;
+            let response =
+                service.confirm_mfa_enrollment(hs_server::models::MfaConfirmRequest {
+                    mfa_enrollment_id: enrollment_id,
+                    totp_code: code,
+                    recovery_material_stored: recovery_stored,
+                })?;
+            println!(
+                "mfa confirmed: account={} state={} mfa={}",
+                response.account_id, response.account_state, response.mfa_status
+            );
+            Ok(())
+        }
+        Command::CancelMfa { enrollment_id } => {
+            let service = open_service(&cli.data)?;
+            service.cancel_mfa_enrollment(&enrollment_id)?;
+            println!("mfa enrollment cancelled: {enrollment_id}");
+            Ok(())
+        }
         Command::CheckLogin {
             username,
             password_stdin,
@@ -166,6 +373,7 @@ fn run(cli: Cli) -> AppResult<()> {
             let service = open_service(&cli.data)?;
             serve_blocking(addr, service)
         }
+        Command::Installer { action } => run_installer(action),
     }
 }
 
@@ -192,6 +400,128 @@ fn serve_blocking(addr: SocketAddr, service: Arc<Service>) -> AppResult<()> {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn run_installer(_action: InstallerAction) -> AppResult<()> {
+    Err(hs_server::AppError::unprocessable(format!(
+        "installer requires a Linux host (running on {})",
+        std::env::consts::OS
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn run_installer(action: InstallerAction) -> AppResult<()> {
+    use hs_server::installer::machine;
+    use hs_server::installer::models::*;
+
+    // Bounded versioned JSON: refuse unbounded stdin before parsing.
+    const MAX_INSTALLER_STDIN_BYTES: u64 = 8 * 1024 * 1024;
+    let mut stdin_buf = String::new();
+    let mut handle = std::io::stdin().take(MAX_INSTALLER_STDIN_BYTES + 1);
+    handle
+        .read_to_string(&mut stdin_buf)
+        .map_err(|err| hs_server::AppError::bad_request(format!("read stdin: {err}")))?;
+    if stdin_buf.len() as u64 > MAX_INSTALLER_STDIN_BYTES {
+        return Err(hs_server::AppError::bad_request(format!(
+            "installer input exceeds {MAX_INSTALLER_STDIN_BYTES} bytes"
+        )));
+    }
+
+    let adapter = hs_server::installer::adapter::LinuxAdapter;
+
+    let output: serde_json::Value = match action {
+        InstallerAction::Preflight => {
+            let input: PreflightInput = serde_json::from_str(&stdin_buf).map_err(|err| {
+                hs_server::AppError::bad_request(format!("invalid preflight input: {err}"))
+            })?;
+            let result = machine::preflight(&adapter, &input)?;
+            serde_json::to_value(result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize preflight result: {err}"))
+            })?
+        }
+        InstallerAction::Plan {
+            package_dir,
+            verify_key,
+        } => {
+            let mut input: PlanInput = serde_json::from_str(&stdin_buf).map_err(|err| {
+                hs_server::AppError::bad_request(format!("invalid plan input: {err}"))
+            })?;
+            input.package_dir = package_dir;
+            let key_bytes = hex_decode_32(&verify_key)?;
+            let result = machine::plan(&adapter, &input, Some(&key_bytes))?;
+            serde_json::to_value(result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize plan result: {err}"))
+            })?
+        }
+        InstallerAction::Apply {
+            state_dir,
+            package_dir,
+            verify_key,
+        } => {
+            let mut input: ApplyInput = serde_json::from_str(&stdin_buf).map_err(|err| {
+                hs_server::AppError::bad_request(format!("invalid apply input: {err}"))
+            })?;
+            if package_dir.is_some() {
+                input.package_dir = package_dir;
+            }
+            if verify_key.is_some() {
+                input.verify_key = verify_key;
+            }
+            let result = machine::apply(&adapter, &input, std::path::Path::new(&state_dir))?;
+            serde_json::to_value(result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize apply result: {err}"))
+            })?
+        }
+        InstallerAction::Resume { state_dir } => {
+            let input: ApplyInput = serde_json::from_str(&stdin_buf).map_err(|err| {
+                hs_server::AppError::bad_request(format!("invalid resume input: {err}"))
+            })?;
+            let result = machine::resume(&adapter, &input, std::path::Path::new(&state_dir))?;
+            serde_json::to_value(result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize resume result: {err}"))
+            })?
+        }
+        InstallerAction::Inspect { state_dir } => {
+            let mut input: InspectInput = serde_json::from_str(&stdin_buf).map_err(|err| {
+                hs_server::AppError::bad_request(format!("invalid inspect input: {err}"))
+            })?;
+            input.state_dir = state_dir;
+            let result = machine::inspect(&adapter, &input)?;
+            serde_json::to_value(result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize inspect result: {err}"))
+            })?
+        }
+        InstallerAction::Remove => {
+            let input: RemoveInput = serde_json::from_str(&stdin_buf).map_err(|err| {
+                hs_server::AppError::bad_request(format!("invalid remove input: {err}"))
+            })?;
+            let result = machine::remove(&adapter, &input)?;
+            serde_json::to_value(result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize remove result: {err}"))
+            })?
+        }
+    };
+
+    let json = serde_json::to_string_pretty(&output)
+        .map_err(|err| hs_server::AppError::internal(format!("serialize output: {err}")))?;
+    println!("{json}");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn hex_decode_32(hex_str: &str) -> AppResult<[u8; 32]> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|err| hs_server::AppError::bad_request(format!("invalid hex key: {err}")))?;
+    if bytes.len() != 32 {
+        return Err(hs_server::AppError::bad_request(format!(
+            "verifying key must be 32 bytes (got {})",
+            bytes.len()
+        )));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
 fn resolve_secret(cli_value: Option<String>, env_key: &str) -> AppResult<String> {
     if let Some(value) = cli_value {
         return Ok(value);
@@ -208,19 +538,7 @@ fn resolve_secret(cli_value: Option<String>, env_key: &str) -> AppResult<String>
 
 fn resolve_password(cli_value: Option<String>, password_stdin: bool) -> AppResult<String> {
     if password_stdin {
-        let mut buffer = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buffer)
-            .map_err(|err| {
-                hs_server::AppError::bad_request(format!("read password stdin: {err}"))
-            })?;
-        let password = buffer.trim_end_matches(['\n', '\r']).to_string();
-        if password.is_empty() {
-            return Err(hs_server::AppError::bad_request(
-                "password on stdin was empty",
-            ));
-        }
-        return Ok(password);
+        return read_password_stdin();
     }
     if let Some(password) = cli_value {
         return Ok(password);
@@ -228,4 +546,60 @@ fn resolve_password(cli_value: Option<String>, password_stdin: bool) -> AppResul
     Err(hs_server::AppError::bad_request(
         "missing password: use --password-stdin or --password",
     ))
+}
+
+/// Read a password from stdin without echoing secrets into argv or logs.
+fn read_password_stdin() -> AppResult<String> {
+    let mut buffer = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buffer)
+        .map_err(|err| hs_server::AppError::bad_request(format!("read password stdin: {err}")))?;
+    let password = buffer.trim_end_matches(['\n', '\r']).to_string();
+    if password.is_empty() {
+        return Err(hs_server::AppError::bad_request(
+            "password on stdin was empty",
+        ));
+    }
+    Ok(password)
+}
+
+/// Read a single trimmed line from stdin (TOTP codes, short factors).
+fn read_line_stdin(what: &str) -> AppResult<String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    handle
+        .read_line(&mut line)
+        .map_err(|err| hs_server::AppError::bad_request(format!("read {what} stdin: {err}")))?;
+    let value = line.trim().to_string();
+    if value.is_empty() {
+        return Err(hs_server::AppError::bad_request(format!(
+            "{what} on stdin was empty"
+        )));
+    }
+    Ok(value)
+}
+
+/// Write a server-owned private file (0600). Used for recovery material.
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> AppResult<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                hs_server::AppError::bad_request(format!("create recovery dir: {err}"))
+            })?;
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| hs_server::AppError::bad_request(format!("open recovery file: {err}")))?;
+    file.write_all(contents)
+        .map_err(|err| hs_server::AppError::bad_request(format!("write recovery file: {err}")))?;
+    Ok(())
 }

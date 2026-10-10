@@ -1,3 +1,72 @@
+# BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
+
+Owned path: `modules/server/**` only (installer adapter worker source untouched).
+Product: **Helicoid** (Helicoid Systems). Organization: **Helicoid-Systems**.
+Apps: **Helicoid Manager** / **Helicoid Computer**.
+Build date: 10 October 2026 (auth v2 + coordinator disposition pass).
+Toolchain: rustc 1.99.0 / cargo 1.99.0 (`/tmp/hs-toolchain`).
+Target: `/tmp/hs-build/server-target`.
+
+## Outcome
+
+**VERIFIED** for the bounded auth prerequisite after coordinator findings:
+atomic challenge completion, deployment-bound proofs, durable bounded rate
+state, explicit v1 wire/storage version split, storage caps, mandatory admin
+MFA. **NOT VERIFIED / incomplete by design:** TLS, public route mounting, LAN
+authority, production manager keys/signing, endpoint admission, native
+installed proofs, configured operator MFA policy, media/control/file jobs,
+security delegation/reset, real multi-process soak.
+
+## Fresh proof commands (this turn)
+
+```
+cargo fmt -- --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt -- --check` | **clean** |
+| `cargo test --locked` | **158 passed, 0 failed** (21 lib + 23 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter + 12 installer_review + 17 review_findings) |
+| `cargo clippy --locked --all-targets -- -D warnings` | **clean** |
+
+### Coordinator findings disposition
+
+| Finding | Fix | Tests |
+| --- | --- | --- |
+| v1 clients require `schema_version == 1` | `schema_version` = frozen wire v1; new `storage_schema_version` | `v1_health_wire_schema_version_stays_one` |
+| Split transactions in complete | One final IMMEDIATE tx: recheck + consume + session | `revoked_manager_race_denies_inside_final_transaction`, `disabled_account_race_denies_inside_final_transaction`, `totp_consumption_failure_denies_without_session` |
+| Proof excluded deployment | `deployment_key` in challenge + signed message (server-owned) | `wrong_deployment_proof_denies`, `proof_messages_are_domain_separated_and_deployment_bound` |
+| In-memory throttle resets | Durable `challenge_throttle` + capacity caps | `durable_challenge_throttle_survives_service_recreation` |
+| Unbounded challenge/TOTP rows | `MAX_AUTH_CHALLENGE_ROWS`, `MAX_TOTP_CONSUMPTIONS_PER_ACCOUNT` + prune | `auth_challenges_and_totp_rows_are_capacity_bounded` |
+| MFA/recovery no sessions | Enforced + tests | `bootstrap_v2_creates_inactive_until_mfa_confirmed`, `recovery_requires_password_and_is_not_a_session` |
+| Mandatory admin MFA | Documented; operator policy explicitly unavailable | `contracts/http-v2.md` MFA policy |
+
+### Client delta (coordinator)
+
+**None required** for `/health.schema_version` (stays `1`).
+Optional additive field: `storage_schema_version` (currently `2`).
+
+## Auth v2 summary
+
+- **Crypto (maintained crates only):** argon2 passwords, totp-rs 5.5.1 with
+  transactional time-step consumption, ed25519-dalek `verify_strict`
+  deployment-bound device proofs, SHA-256-hashed single-use recovery codes.
+- **Atomic completion:** crypto verify → one IMMEDIATE transaction
+  (recheck account/manager/MFA/deployment binding, consume TOTP + challenge,
+  insert session). Failure before commit issues no token.
+- **Durable bounded rate state** and storage caps for challenges/TOTP ledger.
+- **Schema v2** with explicit `migrate` + backup; startup never auto-migrates.
+- **Unchanged:** v1 loopback wire shapes (schema_version stays 1);
+  production media/control/file=false; loopback bind refusal; no insecure
+  listener; installer adapter safety methods untouched.
+
+Full details: `contracts/http-v1.md`, `contracts/http-v2.md`, and
+`/tmp/hs-production-20261010/server-auth-report.md`.
+
+---
+
 # BUILD-REPORT — Helicoid `hs-server` foundation
 
 Owned path: `modules/server/**` only.
@@ -231,3 +300,21 @@ which invokes the same script without elevation or policy override and pauses
 after its child exits, preserving visible error diagnostics. The launcher
 keeps the exact foreground loopback behavior and does not install a service.
 Actual double-click behavior on the user's PC still needs their test.
+
+## Coordinator reproduction and installer boundary
+
+The coordinator independently reproduced all 158 runtime tests, formatting and
+clippy, built the exact server binary, and passed 21 loopback integration checks
+using both actual native client libraries. The three vendored v1 contracts match
+SHA-256 `3e9f5de05569618cc1746513e4da70e789888bca4d42b73628864e7335a1ac02`
+(12,354 bytes).
+
+The Linux installer candidate verifies an independently pinned Ed25519 release
+manifest, recomputes plan ownership, journals before mutation and bounds repair/
+removal to product resources. The shared Unix atomic writer uses descriptor-
+relative no-follow traversal, exclusive private temporary files, rename and
+file/directory synchronization. Listener and service queries fail closed on
+errors. Its 29 adapter regressions run against actual files on macOS; native
+Linux installation on an occupied host is Not Verified. Windows/macOS local
+service installers, encrypted backup, quarantined recovery and signed updates
+remain unfinished. No resources were installed on the supplied Ubuntu VM.
