@@ -95,7 +95,7 @@ async fn health_reports_foundation_features() {
     assert_eq!(body["bootstrap_completed"], false);
     assert_eq!(body["accepting_authorized_operations"], false);
     assert_eq!(body["features"]["local_accounts"], true);
-    assert_eq!(body["features"]["mfa"], false);
+    assert_eq!(body["features"]["mfa"], true);
     assert_eq!(body["features"]["file_jobs"], false);
     assert_eq!(body["features"]["security_recovery"], false);
     assert_eq!(body["features"]["remote_control"], false);
@@ -341,7 +341,9 @@ async fn file_jobs_and_recovery_are_explicitly_unavailable() {
 
     let (status, body) = send(&app, "GET", "/v1/mfa/status", None, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["available"], false);
+    // Real TOTP MFA is implemented behind auth v2; v1 status reports availability.
+    assert_eq!(body["available"], true);
+    assert_eq!(body["required"], true);
 }
 
 #[tokio::test]

@@ -163,7 +163,7 @@ impl Service {
         }
     }
 
-    fn require_security_ok(&self) -> AppResult<()> {
+    pub(crate) fn require_security_ok(&self) -> AppResult<()> {
         if self.security_state() != SecurityState::Ok {
             return Err(AppError::security_state_unavailable(
                 "required trusted persistence cannot be read or committed reliably; new authority is paused",
@@ -209,7 +209,7 @@ impl Service {
     /// Required trust read on the connection. Lock acquisition errors are part
     /// of the guarded result (IIFE) so they cannot skip `finish_storage`.
     /// The Db mutex is released before the guard runs.
-    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> AppResult<T>) -> AppResult<T> {
+    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> AppResult<T>) -> AppResult<T> {
         let result = (|| -> AppResult<T> {
             let conn = self.db.lock()?;
             f(&conn)
@@ -221,7 +221,7 @@ impl Service {
     /// Applies `finish_storage` after the transaction lock is released.
     /// `Db::transaction` lock failures surface as `Internal` and are mapped to
     /// uncertainty by `finish_storage` (same policy as `with_conn`).
-    fn with_tx<T>(&self, f: impl FnOnce(&Connection) -> AppResult<T>) -> AppResult<T> {
+    pub(crate) fn with_tx<T>(&self, f: impl FnOnce(&Connection) -> AppResult<T>) -> AppResult<T> {
         let result = self.db.transaction(f);
         self.finish_storage(result)
     }
@@ -253,7 +253,8 @@ impl Service {
         let degraded = |bootstrap_completed: bool| HealthResponse {
             status: "degraded",
             accepting_authorized_operations: false,
-            schema_version: crate::db::SCHEMA_VERSION,
+            schema_version: crate::models::WIRE_CONTRACT_V1_VERSION,
+            storage_schema_version: crate::db::SCHEMA_VERSION,
             bootstrap_completed,
             features: FeatureAvailability::foundation(),
         };
@@ -272,7 +273,8 @@ impl Service {
                     Ok(HealthResponse {
                         status: "ok",
                         accepting_authorized_operations: true,
-                        schema_version: crate::db::SCHEMA_VERSION,
+                        schema_version: crate::models::WIRE_CONTRACT_V1_VERSION,
+                        storage_schema_version: crate::db::SCHEMA_VERSION,
                         bootstrap_completed: true,
                         features: FeatureAvailability::foundation(),
                     })
@@ -1138,7 +1140,7 @@ impl Service {
         Ok((scope_all, explicit))
     }
 
-    fn load_account_view(&self, account_id: &str) -> AppResult<AccountView> {
+    pub(crate) fn load_account_view(&self, account_id: &str) -> AppResult<AccountView> {
         self.with_conn(|conn| {
             let row = conn.query_row(
                 "SELECT id, username, state, can_operate, can_manage_enrollment, can_manage_access,
@@ -1151,7 +1153,7 @@ impl Service {
         })
     }
 
-    fn load_manager_view(&self, manager_id: &str) -> AppResult<ManagerView> {
+    pub(crate) fn load_manager_view(&self, manager_id: &str) -> AppResult<ManagerView> {
         self.with_conn(|conn| {
             let row = conn.query_row(
                 "SELECT id, public_identity, friendly_name, lifecycle_state, approved_at
@@ -1206,7 +1208,7 @@ impl Service {
         })
     }
 
-    fn check_login_throttle(&self, username: &str) -> AppResult<()> {
+    pub(crate) fn check_login_throttle(&self, username: &str) -> AppResult<()> {
         let key = normalize_login_key(username);
         let now = now_unix();
         let mut guard = self
@@ -1231,7 +1233,7 @@ impl Service {
         Ok(())
     }
 
-    fn record_login_failure(&self, username: &str) {
+    pub(crate) fn record_login_failure(&self, username: &str) {
         let key = normalize_login_key(username);
         let now = now_unix();
         let mut guard = self
@@ -1256,7 +1258,7 @@ impl Service {
         }
     }
 
-    fn clear_login_failures(&self, username: &str) {
+    pub(crate) fn clear_login_failures(&self, username: &str) {
         let key = normalize_login_key(username);
         let mut guard = self
             .login_throttle
@@ -1266,7 +1268,7 @@ impl Service {
     }
 }
 
-fn validate_username(username: &str) -> AppResult<()> {
+pub(crate) fn validate_username(username: &str) -> AppResult<()> {
     let name = username.trim();
     if name.len() < 3 || name.len() > 64 {
         return Err(AppError::bad_request("username must be 3–64 characters"));
@@ -1282,7 +1284,7 @@ fn validate_username(username: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_password(password: &str) -> AppResult<()> {
+pub(crate) fn validate_password(password: &str) -> AppResult<()> {
     if password.len() < 12 {
         return Err(AppError::bad_request(
             "password must be at least 12 characters",
@@ -1296,7 +1298,7 @@ fn validate_password(password: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn map_unique(err: rusqlite::Error, message: &str) -> AppError {
+pub(crate) fn map_unique(err: rusqlite::Error, message: &str) -> AppError {
     match &err {
         rusqlite::Error::SqliteFailure(inner, _)
             if inner.code == rusqlite::ErrorCode::ConstraintViolation =>

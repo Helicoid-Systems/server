@@ -5,10 +5,12 @@
 //! and explicit security-state-unavailable behavior. Loopback-only by default;
 //! no production LAN/control/media authority (see BUILD-REPORT.md).
 
+pub mod auth_v2;
 pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod http;
+pub mod installer;
 pub mod models;
 pub mod service;
 

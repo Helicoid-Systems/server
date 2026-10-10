@@ -24,17 +24,29 @@ Repository: https://github.com/Helicoid-Systems/server. Durable release identifi
 | D20 deny-before-approval | Implemented (pending manager cannot bind/login) |
 | Per-computer access scopes | Implemented (explicit IDs or scope-all) |
 | Bounded inventory reads | Implemented (hard cap 100) |
-| Schema init | Explicit; refuses unrelated nonempty DBs; no auto-migration |
+| Schema init / migration | Storage schema 2; explicit init or migration with consistent backup; never migrates on open |
 | Security State Unavailable | Durable latch; restart never resets it; no auto-recovery |
 | Required read/commit failures | Latch + `503 security_state_unavailable` (not bare 500) |
-| MFA / file jobs / security recovery | Explicitly unavailable (`501`), not fake success |
+| v2 administrator MFA | TOTP enrollment, Ed25519 device proof and atomic challenge completion implemented for loopback development |
+| v2 recovery credentials | Bounded, single-use factor recovery only; cannot issue normal sessions |
+| Configurable operator MFA / scoped delegation | Unavailable; production policy still gated |
+| File jobs / authority recovery and cutover | Explicitly unavailable (`501`) |
 | Remote control / screen observation | Not present (B02/B03/RD03 proofs pending) |
 | Bind policy | **Literal loopback only** (`127.0.0.1` / `::1`); other binds refused |
-| Login throttle | Bounded in-memory map (1024 keys); fails closed when saturated |
+| Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
+| Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
+| Windows/macOS host installation | Unavailable in this server build |
 
-Manager `public_identity` values are **not** cryptographic production identities.
+Legacy v1 Manager `public_identity` values are **not** cryptographic production identities.
 They are development fixtures for local/loopback integration until B03 freezes
 signed endpoint/manager identity formats. Do not invent grant formats.
+
+The [v2 development contract](contracts/http-v2.md) describes deployment-bound
+Ed25519 challenges, administrator enrollment, transaction boundaries and recovery
+limits. TLS, independently pinned production trust and public routes are absent.
+The v1 HTTP wire contract remains version 1; health separately reports storage
+schema version 2. Coordinator acceptance: **158 tests**, formatting and clippy
+pass; this does not establish production readiness.
 
 ## Build and test
 
@@ -135,7 +147,7 @@ HTTP wire shape is unchanged from that version-1 file.
 
 ## Out of scope here
 
-Broader plan work (file jobs, MFA factors, recovery/cutover, remote desktop,
+Broader plan work (file jobs, production MFA policy, recovery/cutover, remote desktop,
 native apps, production installers) remains required and unfinished. See
 `BUILD-REPORT.md` for tested versus unproven boundaries.
 
