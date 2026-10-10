@@ -58,3 +58,41 @@ if (-not $rejected) { throw 'Repeated bootstrap was accepted.' }
 $script:BootstrapToken = $null
 $password = $null
 Write-Host 'Windows PowerShell: launcher parse, Unicode stdin bootstrap, caller environment and single-use denial PASS.'
+# Exercise the actual batch launcher against a failing local child. This proves
+# exit propagation and retained diagnostics; interactive Explorer behavior is
+# still a user-PC check. The copied child contains no credentials or server.
+$batchDirectory = New-DisposableDatabaseDirectory
+$batch = Join-Path $batchDirectory 'start-development.cmd'
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'start-development.cmd') -Destination $batch
+[IO.File]::WriteAllText((Join-Path $batchDirectory 'start-development.ps1'),
+    "Write-Output 'HELICOID_FIXTURE_CHILD_FAILURE'`r`nexit 7`r`n", [Text.Encoding]::ASCII)
+$batchInfo = New-Object Diagnostics.ProcessStartInfo
+$batchInfo.FileName = $env:ComSpec
+$batchInfo.Arguments = '/d /c ""{0}""' -f $batch
+$batchInfo.UseShellExecute = $false
+$batchInfo.RedirectStandardInput = $true
+$batchInfo.RedirectStandardOutput = $true
+$batchInfo.RedirectStandardError = $true
+$batchProcess = New-Object Diagnostics.Process
+$batchProcess.StartInfo = $batchInfo
+try {
+    if (-not $batchProcess.Start()) { throw 'Could not start batch launcher proof.' }
+    $batchOut = $batchProcess.StandardOutput.ReadToEndAsync()
+    $batchErr = $batchProcess.StandardError.ReadToEndAsync()
+    $batchProcess.StandardInput.WriteLine('x')
+    $batchProcess.StandardInput.Close()
+    if (-not $batchProcess.WaitForExit(15000)) {
+        $batchProcess.Kill()
+        throw 'Batch launcher proof exceeded its deadline.'
+    }
+    $visible = $batchOut.GetAwaiter().GetResult()
+    $null = $batchErr.GetAwaiter().GetResult()
+    if ($batchProcess.ExitCode -ne 7 -or
+        -not $visible.Contains('HELICOID_FIXTURE_CHILD_FAILURE') -or
+        -not $visible.Contains('exit 7') -or
+        -not $visible.Contains('Press any key')) {
+        throw 'Batch launcher lost child failure diagnostics or its exit code.'
+    }
+}
+finally { $batchProcess.Dispose() }
+Write-Host 'Windows CMD: real launcher child failure, retained diagnostics and exit-code propagation PASS.'
