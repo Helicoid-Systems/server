@@ -9,10 +9,13 @@ publish = false
 [dependencies]
 argon2 = "0.6"
 axum = { version = "0.8", features = ["json"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 rand = "0.10"
 rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs", "logging"] }
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ed25519-dalek = { version = "2", features = ["serde"] }
@@ -32,8 +35,12 @@ zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["serde"] }
 http-body-util = "0.1"
 rand = "0.10"
+rcgen = "0.13"
 rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs", "logging"] }
+rustls-pki-types = "1"
 tempfile = "3"
+tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.dev]

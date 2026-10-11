@@ -14,6 +14,7 @@ pub mod installer;
 pub mod models;
 pub mod private_file;
 pub mod service;
+pub mod tls;
 
 pub use error::{AppError, AppResult};
 pub use service::{AuthContext, SecurityState, Service};

@@ -120,6 +120,24 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
     },
+    /// Serve the HTTPS API over real TLS. Literal loopback only.
+    ///
+    /// Requires a certificate PEM chain and a private key PEM in a
+    /// product-owned private parent/file. This is HTTPS transport only;
+    /// a public listener stays unavailable until auth/device/channel/route
+    /// gates pass. Windows is explicitly unsupported.
+    ServeTls {
+        /// Bind address. Default 127.0.0.1:8920. Nonloopback is refused
+        /// before any credential, data, or listener effect.
+        #[arg(long, default_value = "127.0.0.1:8920")]
+        bind: String,
+        /// Path to PEM certificate chain (private file, at most 8 certs).
+        #[arg(long)]
+        tls_cert: PathBuf,
+        /// Path to PEM private key (private file, exactly one key).
+        #[arg(long)]
+        tls_key: PathBuf,
+    },
     /// Guided Linux installer backend. Reads bounded versioned JSON from stdin.
     Installer {
         #[command(subcommand)]
@@ -387,6 +405,16 @@ fn run(cli: Cli) -> AppResult<()> {
             hs_server::require_loopback_bind(addr)?;
             let service = open_service(&cli.data)?;
             serve_blocking(addr, service)
+        }
+        Command::ServeTls {
+            bind,
+            tls_cert,
+            tls_key,
+        } => {
+            // Order is the trust boundary: reject nonloopback and unsupported
+            // platforms, and reject malformed TLS material, BEFORE any
+            // credential/data file open, DB creation, or listener bind.
+            hs_server::tls::run_serve_tls(&cli.data, &bind, &tls_cert, &tls_key)
         }
         Command::Installer { action } => run_installer(action),
     }

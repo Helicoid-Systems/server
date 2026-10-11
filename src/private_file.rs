@@ -229,6 +229,54 @@ pub fn create_private_store_file(path: &Path) -> AppResult<()> {
     }
 }
 
+/// Read an existing private file through a validated held descriptor.
+///
+/// Opens `O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK` relative to a validated
+/// private parent, verifies owner/type/mode/link/ACL **on that descriptor**,
+/// then reads from the same fd with a hard cap of `max_bytes` (reads at most
+/// `max_bytes + 1` so oversize input is detected). Never reopens by path
+/// after verification (TOCTOU) and never mutates permissions on existing
+/// files. The returned buffer is [`zeroize::Zeroizing`] so partial secret
+/// bytes are cleared on every drop, including oversize/error paths. Windows
+/// and other platforms refuse before any read.
+pub fn read_existing_private_file(
+    path: &Path,
+    max_bytes: usize,
+) -> AppResult<zeroize::Zeroizing<Vec<u8>>> {
+    if !private_file_supported() {
+        return Err(AppError::not_implemented(
+            "reading an existing private file is not implemented on this platform; \
+             refusing TLS material reads without a native-verified private credential boundary",
+        ));
+    }
+    if max_bytes == 0 {
+        return Err(AppError::bad_request("private file read bound is zero"));
+    }
+    if max_bytes > MAX_PRIVATE_PAYLOAD_BYTES {
+        return Err(AppError::bad_request(format!(
+            "private file read bound exceeds {MAX_PRIVATE_PAYLOAD_BYTES} bytes"
+        )));
+    }
+    let abs = resolve_output_path(path)?;
+
+    #[cfg(unix)]
+    {
+        unix_read_existing_private(&abs, max_bytes)
+    }
+    #[cfg(windows)]
+    {
+        let _ = (abs, max_bytes);
+        Err(windows_unsupported_private_store("file read"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (abs, max_bytes);
+        Err(AppError::not_implemented(
+            "reading an existing private file is not implemented on this platform",
+        ))
+    }
+}
+
 /// Presence of a preexisting store path after a no-follow metadata probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorePathPresence {
@@ -464,6 +512,77 @@ fn unix_create_private_store_file(abs: &Path) -> AppResult<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn unix_read_existing_private(
+    abs: &Path,
+    max_bytes: usize,
+) -> AppResult<zeroize::Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let parent = unix_parent_of(abs)?;
+    let file_name = abs
+        .file_name()
+        .ok_or_else(|| AppError::bad_request("private file must have a file name"))?;
+    let file_c = std::ffi::CString::new(file_name.as_bytes())
+        .map_err(|_| AppError::bad_request("private file name contains NUL"))?;
+    let dir_fd = open_dir_nofollow(parent, DirUse::RecoveryParent)?;
+
+    // O_NONBLOCK keeps a FIFO (or other blocking special) from hanging the
+    // open; the fd-based type check below then refuses it without reading.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            file_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(AppError::bad_request(format!("open private file: {err}")));
+    }
+    // SAFETY: fd is an open descriptor we now own; File closes it on drop.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+
+    // Owner / type / mode / ACL on the SAME descriptor we will read.
+    verify_existing_object_private(file.as_raw_fd())?;
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(AppError::bad_request(format!("fstat private file: {err}")));
+    }
+    if st.st_nlink != 1 {
+        return Err(AppError::bad_request(
+            "private file link count is not 1; refusing to read",
+        ));
+    }
+
+    // Allocate the complete bounded buffer before reading any secret bytes.
+    // It never grows or reallocates, so an old allocation cannot retain a
+    // partial secret after Vec growth. One extra byte detects oversize input.
+    let mut buf = zeroize::Zeroizing::new(vec![0; max_bytes + 1]);
+    let mut file = file;
+    let mut filled = 0;
+    while filled < buf.len() {
+        let count = file
+            .read(&mut buf[filled..])
+            .map_err(|err| AppError::bad_request(format!("read private file: {err}")))?;
+        if count == 0 {
+            break;
+        }
+        filled += count;
+    }
+    if filled > max_bytes {
+        return Err(AppError::bad_request(format!(
+            "private file exceeds {max_bytes} bytes"
+        )));
+    }
+    buf.truncate(filled);
+    Ok(buf)
 }
 
 // Windows has no native-verified owner/SYSTEM/admin private store in this

@@ -758,7 +758,6 @@ fn totp_consumption_failure_denies_without_session() {
     let service = service();
     let enrolled = bootstrap_enrolled(&service);
     let dep = deployment_id(&service);
-    let code = fresh_totp(&enrolled.totp_secret);
 
     let challenge = service
         .begin_auth_challenge(AuthChallengeBeginRequest {
@@ -776,10 +775,17 @@ fn totp_consumption_failure_denies_without_session() {
         &enrolled.public_key,
     );
 
-    // Pre-consume the time step that the challenge completion will use
-    // (next step, matching fresh_totp) so the complete path hits a storage
-    // conflict inside the transaction — no session may be issued.
-    let step = totp_time_step(unix_now()) + 1;
+    // Code and consumed step share one timestamp sampled after the slow
+    // challenge/signature work, so a 30s boundary crossing during setup
+    // cannot desynchronize them.
+    let code_time = unix_now() + 30;
+    let code =
+        totp_generate_at(&enrolled.totp_secret, code_time).expect("generate bound test code");
+    let step = totp_time_step(code_time);
+
+    // Pre-consume the time step that the challenge completion will use so
+    // the complete path hits a storage conflict inside the transaction —
+    // no session may be issued.
     {
         let db = service.db_handle();
         let conn = db.lock().expect("lock");
@@ -799,6 +805,32 @@ fn totp_consumption_failure_denies_without_session() {
     assert!(
         complete.is_err(),
         "failure before commit must deny and not issue a token"
+    );
+
+    // Rollback must be complete: no session issued, challenge unconsumed.
+    let db = service.db_handle();
+    let conn = db.lock().expect("lock");
+    let sessions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE account_id = ?1",
+            rusqlite::params![enrolled.account_id],
+            |r| r.get(0),
+        )
+        .expect("session count");
+    assert_eq!(
+        sessions, 0,
+        "no session may be issued on totp consumption conflict"
+    );
+    let consumed_at: Option<i64> = conn
+        .query_row(
+            "SELECT consumed_at FROM auth_challenges WHERE id = ?1",
+            rusqlite::params![challenge.challenge_id],
+            |r| r.get(0),
+        )
+        .expect("challenge consumed_at");
+    assert!(
+        consumed_at.is_none(),
+        "challenge must remain unconsumed after rollback"
     );
 }
 

@@ -33,6 +33,7 @@ Repository: https://github.com/Helicoid-Systems/server. Durable release identifi
 | File jobs / authority recovery and cutover | Explicitly unavailable (`501`) |
 | Remote control / screen observation | Not present (B02/B03/RD03 proofs pending) |
 | Bind policy | **Literal loopback only** (`127.0.0.1` / `::1`); other binds refused |
+| HTTPS transport | `serve-tls`, default `127.0.0.1:8920`, maintained rustls TLS1.2/1.3 and private held-descriptor material reads; Unix only; public routes remain closed |
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
 | Windows/macOS host installation | Unavailable in this server build |
@@ -51,12 +52,12 @@ native refusal tests retain both the original database bytes and no-output check
 
 The [v2 development contract](contracts/http-v2.md) describes deployment-bound
 Ed25519 challenges, administrator enrollment, transaction boundaries and recovery
-limits. TLS, independently pinned production trust and public routes are absent.
+limits. Unix HTTPS transport is implemented as a loopback prerequisite. Production trust adoption, public authentication and public routes remain unavailable.
 The v1 HTTP wire contract remains version 1; health separately reports storage
-schema version 2. Coordinator acceptance on macOS: **209 tests**
+schema version 2. Reviewed authority baseline `3656c22` passed **209 tests** on macOS
 (61 lib + 24 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter +
 12 installer_review + 6 mfa_legacy_boundary + 21 review_findings), formatting and clippy pass; this
-does not establish production readiness.
+does not establish production readiness. The HTTPS candidate adds 29 tests; coordinator acceptance is **238 Mac tests**, formatting, clippy and build. Native Linux/Windows HTTPS-candidate CI is pending.
 
 Platform-split of `tests/installer_adapter.rs` (29 total): **19 portable**
 (listener/parser/systemctl decode, read bounds, injected query faults) run on
@@ -65,13 +66,15 @@ regressions cover the descriptor-relative atomic writer (`write_file_atomic`).
 There is no Windows native service installer and no Windows atomic writer —
 host installation on Windows/macOS remains unavailable.
 
-Platform split of the full suite (macOS run = 209; native counts need fresh CI):
+Verified authority baseline `3656c22` ([CI 38139828063](https://github.com/Helicoid-Systems/server/actions/runs/38139828063)); HTTPS-candidate native counts remain pending:
 
-| Platform | Expected total | Notes |
+| Platform | Verified total | Notes |
 | --- | --- | --- |
 | macOS | **209** (observed) | includes 5 Darwin-only extended-ACL tests |
-| Linux | **204** | 209 − 5 Darwin-only |
+| Linux | **203** | excludes 5 Darwin ACL tests and one Mac-only installer check |
 | Windows | **182** | portable + 10 Windows denial/legacy tests; excludes Unix-only FS and Darwin ACL tests |
+
+`hs-server --data /private-product-directory/hs-server.db serve-tls --tls-cert /private-product-directory/server.crt --tls-key /private-product-directory/server.key` requires operator-supplied certificate/key files. Each file is bounded at64KiB, owner-only, regular, singly linked and read through its verified held descriptor. It refuses malformed/mismatched material before opening data. Public binds and Windows TLS hosting refuse before reading material or creating data. Bootstrap remains local-only or inside verified SSH tunnels. These checks do not establish installation or enrollment readiness.
 
 In-memory (nonpersistent) auth v2 tests run on **every** platform including
 Windows and exercise real TOTP/Ed25519/recovery crypto. They are **not** a
