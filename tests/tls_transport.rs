@@ -256,17 +256,23 @@ fn held_file_missing_path_is_refused() {
 
 #[cfg(windows)]
 #[test]
-fn windows_held_file_read_is_refused_before_any_read() {
+fn windows_held_file_read_refuses_public_file_and_reads_private() {
     let (_dir, base) = private_tempdir();
-    let path = base.join("material.pem");
-    std::fs::write(&path, b"SECRET").expect("seed");
-    let err = read_existing_private_file(&path, 1024).expect_err("must deny on Windows");
+    let public_path = base.join("public.pem");
+    std::fs::write(&public_path, b"PUBLIC").expect("seed");
+    let err =
+        read_existing_private_file(&public_path, 1024).expect_err("must refuse non-private file");
     let msg = err.to_string();
     assert!(
-        msg.contains("not implemented") || msg.contains("refusing"),
+        msg.contains("not owned") || msg.contains("refusing") || msg.contains("private"),
         "msg={msg}"
     );
-    assert!(!msg.contains("SECRET"));
+    assert!(!msg.contains("PUBLIC"));
+
+    let private_path = base.join("material.pem");
+    create_new_private_file(&private_path, b"PRIVATE-MATERIAL").expect("create private");
+    let got = read_existing_private_file(&private_path, 1024).expect("read private");
+    assert_eq!(got.as_slice(), b"PRIVATE-MATERIAL");
 }
 
 // ----- TLS PEM bounds and binding (before any listener/DB) -----

@@ -37,7 +37,7 @@ Repository: https://github.com/Helicoid-Systems/server. Durable release identifi
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
 | Windows/macOS host installation | Unavailable in this server build |
-| Windows persistent v2 MFA | **Unsupported** (no native-verified private credential store). Legacy v1 loopback development remains available. In-memory tests still exercise real crypto |
+| Windows persistent v2 MFA | **Candidate / native Not Verified**: held no-follow handles, exact owner/SYSTEM/Administrators ACL and trusted file-child inheritance. Full native CI must pass before integration adoption |
 
 Legacy v1 Manager `public_identity` values are **not** cryptographic production identities.
 They are development fixtures for local/loopback integration until B03 freezes
@@ -46,8 +46,7 @@ signed endpoint/manager identity formats. Do not invent grant formats.
 MFA-enrolled accounts refuse legacy password-only login through the service,
 HTTP route and CLI. The final session transaction rechecks MFA state, account
 state, the verified password hash and manager approval. Legacy accounts without
-MFA remain an explicitly loopback-only development path. Windows explicit
-migration also refuses before mutation until private credential storage exists;
+MFA remain an explicitly loopback-only development path. The Windows private-store candidate requires private current-user ownership and trusted child inheritance before explicit migration;
 native refusal tests retain both the original database bytes and no-output checks.
 
 The [v2 development contract](contracts/http-v2.md) describes deployment-bound

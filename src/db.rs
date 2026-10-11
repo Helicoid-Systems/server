@@ -13,11 +13,10 @@
 //! `symlink_metadata` **before** any SQLite open/pragma so a dangling or live
 //! symlink is never followed, created, or truncated.
 //!
-//! Windows legacy development: a persistent store without a native-verified
-//! private boundary may still be opened for v1 loopback development. That
-//! mode refuses pre-existing persisted MFA rows (no unverified confidential
-//! store, no exposure of existing v2 authority via legacy paths) and denies
-//! NEW persisted v2 MFA writes. Production hosting is unavailable.
+//! Windows: the same private boundary as Unix (see `private_file`). A
+//! persistent store is `PersistentPrivate` when the native DACL allowlist
+//! holds. Platforms without a verified private boundary keep
+//! `PersistentUnverified` (v1 loopback development only).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -1127,70 +1126,31 @@ mod tests {
         assert!(err.to_string().contains("already"), "err={err}");
     }
 
-    // ----- Windows: explicit migration denial before any mutation -----
-    //
-    // Production `migrate` refuses before any SQLite open or backup when
-    // native verified private files are unsupported. Denial must leave the
-    // existing store byte-identical and create no backup directory/sidecars.
+    // ----- Windows: migrate uses the native private boundary (positive) -----
 
     #[cfg(windows)]
     #[test]
-    fn migrate_denies_v1_store_before_mutation_without_private_boundary() {
+    fn migrate_upgrades_v1_store_on_windows_private_boundary() {
         let (_dir, base) = real_tempdir();
         let path = base.join("v1.db");
         let backup_dir = base.join("backups");
         seed_v1_schema_file(&path);
-        let before = std::fs::read(&path).expect("v1 bytes");
 
-        let err = match migrate(&path, &backup_dir) {
-            Ok(_) => panic!("migrate must deny without a verified private store"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.code(),
-            crate::error::ErrorCode::NotImplemented,
-            "err={err}"
-        );
-        assert_eq!(
-            std::fs::read(&path).expect("v1 bytes after"),
-            before,
-            "v1 store must remain byte-identical"
-        );
-        assert!(
-            !backup_dir.exists(),
-            "no backup directory may be created on denial"
-        );
-        assert_no_sqlite_sidecars(&path);
+        let report = migrate(&path, &backup_dir).expect("migrate with private boundary");
+        assert_eq!(report.from_version, 1);
+        assert_eq!(report.to_version, SCHEMA_VERSION);
+        assert!(report.backup_path.exists());
     }
 
     #[cfg(windows)]
     #[test]
-    fn migrate_denies_current_store_before_mutation_without_private_boundary() {
+    fn migrate_refuses_already_current_store_without_backup() {
         let (_dir, base) = real_tempdir();
         let path = base.join("current.db");
         let backup_dir = base.join("backups");
         seed_current_schema_file(&path);
-        let before = std::fs::read(&path).expect("current bytes");
-
-        let err = match migrate(&path, &backup_dir) {
-            Ok(_) => panic!("migrate must deny without a verified private store"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.code(),
-            crate::error::ErrorCode::NotImplemented,
-            "err={err}"
-        );
-        assert_eq!(
-            std::fs::read(&path).expect("current bytes after"),
-            before,
-            "current store must remain byte-identical"
-        );
-        assert!(
-            !backup_dir.exists(),
-            "no backup directory may be created on denial"
-        );
-        assert_no_sqlite_sidecars(&path);
+        let err = migrate(&path, &backup_dir).expect_err("must refuse current");
+        assert!(err.to_string().contains("already"), "err={err}");
     }
 
     #[cfg(unix)]

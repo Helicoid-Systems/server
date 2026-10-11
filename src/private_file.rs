@@ -14,10 +14,12 @@
 //! Owner/type/mode (and Darwin extended ACLs) are verified **before** any
 //! secret bytes are written.
 //!
-//! Windows: private recovery output and new persisted MFA secrets are
-//! unavailable until an owner/SYSTEM/administrators DACL implementation has
-//! native verification. Legacy loopback development uses an explicitly
-//! unverified store and refuses pre-existing MFA rows.
+//! Windows: two policies on held handles (see `private_file_windows`):
+//! ancestors use namespace integrity (trusted owner, no unknown
+//! name-mutation/delete-child/write-DACL); final product objects use a strict
+//! protected owner-only allowlist. Exclusive create-new supplies the protected
+//! DACL atomically via kernel `SECURITY_DESCRIPTOR`. Reparse/link/ADS/UNC/`..`
+//! fail closed. Existing objects are never re-ACL'd.
 //!
 //! Other platforms: explicit `unavailable` **before any file or data
 //! mutation**.
@@ -31,21 +33,17 @@ pub const MAX_PRIVATE_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// True when this platform can securely create a new private file.
 ///
-/// Windows is false in this build: there is no native-verified
-/// owner/SYSTEM/administrators DACL path (see module docs). Callers must
-/// refuse NEW persisted v2 MFA credentials and recovery material rather than
-/// claim private Windows store support from Unix mode tests.
+/// Unix and Windows implement the boundary (held-handle, no-follow,
+/// owner-private DACL/mode). Callers must still verify each operation.
 pub fn private_file_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// True when NEW persisted v2 MFA credentials may be written to the store.
 ///
-/// Same capability as [`private_file_supported`]: Unix private store is
-/// enforced at the real on-disk boundary; Windows denies before the
-/// bootstrap/enrollment transaction and keeps truthful v1 loopback development.
+/// Same capability as [`private_file_supported`].
 pub fn persisted_v2_credentials_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// Create a new private file at `path` with `contents`.
@@ -78,7 +76,7 @@ pub fn create_new_private_file(path: &Path, contents: &[u8]) -> AppResult<()> {
     }
     #[cfg(windows)]
     {
-        windows_create_new_private(&abs, contents)
+        crate::private_file_windows::windows_create_new_private(&abs, contents)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -117,7 +115,7 @@ pub fn preflight_new_private_file(path: &Path) -> AppResult<()> {
     }
     #[cfg(windows)]
     {
-        windows_preflight_new_private(&abs, file_name)
+        crate::private_file_windows::windows_preflight_new_private(&abs, file_name)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -176,7 +174,7 @@ pub fn ensure_private_store_dir(path: &Path) -> AppResult<PathBuf> {
     }
     #[cfg(windows)]
     {
-        windows_ensure_private_store_dir(&abs)
+        crate::private_file_windows::windows_ensure_private_store_dir(&abs)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -197,7 +195,7 @@ pub fn verify_private_store_file(path: &Path) -> AppResult<()> {
     }
     #[cfg(windows)]
     {
-        windows_verify_private_store_file(&abs)
+        crate::private_file_windows::windows_verify_private_store_file(&abs)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -219,7 +217,7 @@ pub fn create_private_store_file(path: &Path) -> AppResult<()> {
     }
     #[cfg(windows)]
     {
-        windows_create_private_store_file(&abs)
+        crate::private_file_windows::windows_create_private_store_file(&abs)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -265,8 +263,7 @@ pub fn read_existing_private_file(
     }
     #[cfg(windows)]
     {
-        let _ = (abs, max_bytes);
-        Err(windows_unsupported_private_store("file read"))
+        crate::private_file_windows::windows_read_existing_private(&abs, max_bytes)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -294,25 +291,32 @@ pub enum StorePathPresence {
 /// device), and metadata errors. Absent is `Ok(Absent)`.
 pub fn validate_preexisting_store_shape(path: &Path) -> AppResult<StorePathPresence> {
     let abs = resolve_output_path(path)?;
-    match std::fs::symlink_metadata(&abs) {
-        Ok(meta) => {
-            let ft = meta.file_type();
-            if ft.is_symlink() {
-                return Err(AppError::bad_request(
-                    "store path is a symlink (including dangling); refusing to follow or replace it",
-                ));
+    #[cfg(windows)]
+    {
+        crate::private_file_windows::windows_validate_preexisting_shape(&abs)
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::symlink_metadata(&abs) {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                if ft.is_symlink() {
+                    return Err(AppError::bad_request(
+                        "store path is a symlink (including dangling); refusing to follow or replace it",
+                    ));
+                }
+                if !ft.is_file() {
+                    return Err(AppError::bad_request(
+                        "store path is not a regular file (refusing FIFO/directory/device sidecar)",
+                    ));
+                }
+                Ok(StorePathPresence::RegularFile)
             }
-            if !ft.is_file() {
-                return Err(AppError::bad_request(
-                    "store path is not a regular file (refusing FIFO/directory/device sidecar)",
-                ));
-            }
-            Ok(StorePathPresence::RegularFile)
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(StorePathPresence::Absent),
+            Err(err) => Err(AppError::bad_request(format!(
+                "cannot classify store path: {err}"
+            ))),
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(StorePathPresence::Absent),
-        Err(err) => Err(AppError::bad_request(format!(
-            "cannot classify store path: {err}"
-        ))),
     }
 }
 
@@ -585,46 +589,7 @@ fn unix_read_existing_private(
     Ok(buf)
 }
 
-// Windows has no native-verified owner/SYSTEM/admin private store in this
-// build. An earlier DACL draft was a blacklist (it would have allowed
-// arbitrary other user/group allow-ACEs) and is not kept enabled to claim
-// coverage. NEW persisted v2 MFA credentials and private recovery output are
-// refused before mutation; legacy v1 loopback development remains available.
-//
-// To enable Windows support later: implement an exact allowlist of verified
-// object owner / current principal / SYSTEM / Administrators via
-// GetSecurityInfo on the held HANDLE (not a pathname), validate every path
-// component against replacement, and prove it with native CI tests that also
-// deny arbitrary unrelated SIDs and Authenticated Users ACEs.
-#[cfg(windows)]
-fn windows_unsupported_private_store(what: &str) -> AppError {
-    AppError::not_implemented(format!(
-        "secure private {what} is not implemented on this platform; \
-         refusing NEW persisted v2 MFA credentials and recovery material \
-         without a native-verified owner/SYSTEM/administrators DACL. \
-         Legacy v1 loopback development remains available without MFA claims."
-    ))
-}
-
-#[cfg(windows)]
-fn windows_ensure_private_store_dir(abs: &Path) -> AppResult<PathBuf> {
-    let _ = abs;
-    Err(windows_unsupported_private_store(
-        "credential-store directory",
-    ))
-}
-
-#[cfg(windows)]
-fn windows_verify_private_store_file(abs: &Path) -> AppResult<()> {
-    let _ = abs;
-    Err(windows_unsupported_private_store("credential-store file"))
-}
-
-#[cfg(windows)]
-fn windows_create_private_store_file(abs: &Path) -> AppResult<()> {
-    let _ = abs;
-    Err(windows_unsupported_private_store("credential-store file"))
-}
+// Windows private-store implementation lives in `private_file_windows`.
 
 #[cfg(unix)]
 fn unix_preflight_new_private(abs: &Path, file_name: &std::ffi::OsStr) -> AppResult<()> {
@@ -1314,20 +1279,7 @@ fn validate_dir_fd(fd: i32, use_kind: DirUse, euid: u32, name: &Path) -> AppResu
     }
 }
 
-// Windows: no native-verified private create/store in this build.
-// See windows_unsupported_private_store above. Private recovery output and
-// NEW persisted v2 MFA credentials are refused before mutation.
-
-#[cfg(windows)]
-fn windows_preflight_new_private(_abs: &Path, _file_name: &std::ffi::OsStr) -> AppResult<()> {
-    Err(windows_unsupported_private_store("recovery file"))
-}
-
-#[cfg(windows)]
-fn windows_create_new_private(_abs: &Path, _contents: &[u8]) -> AppResult<()> {
-    // Fail closed BEFORE any mutation. No insecure plain-File fallback.
-    Err(windows_unsupported_private_store("recovery file"))
-}
+// Windows create-new / preflight live in `private_file_windows`.
 
 #[cfg(test)]
 mod tests {
@@ -1983,52 +1935,107 @@ mod tests {
         verify_private_store_file(&path).expect("deny-only ACL must be accepted");
     }
 
-    // ----- Windows: explicit denial only (no success-or-generic branch) -----
+    // ----- Windows: explicit native positive/negative (no generic failure) -----
 
     #[cfg(windows)]
     #[test]
-    fn windows_denies_private_create_with_no_file_or_secret() {
+    fn windows_owneronly_create_new_is_private_and_no_overwrite() {
         let (_dir, base) = tmpdir();
         let path = base.join("recovery.txt");
-        let err = create_new_private_file(&path, b"SECRET-RECOVERY")
-            .expect_err("must deny NEW private create on Windows");
+        create_new_private_file(&path, b"CODE-A\nCODE-B\n").expect("create");
+        assert!(path.exists(), "file created");
+        let read = std::fs::read(&path).expect("read");
+        assert_eq!(read, b"CODE-A\nCODE-B\n");
+        // Second create must refuse and preserve bytes.
+        let err = create_new_private_file(&path, b"SECRET").expect_err("must refuse overwrite");
         let msg = err.to_string();
         assert!(
-            msg.contains("not implemented") || msg.contains("refusing"),
+            msg.contains("already exists") || msg.contains("create_new_only"),
             "msg={msg}"
         );
-        assert!(!path.exists(), "no file may be created");
-        assert!(!msg.contains("SECRET-RECOVERY"), "no secret in error");
+        assert_eq!(std::fs::read(&path).expect("read"), b"CODE-A\nCODE-B\n");
+        assert!(!msg.contains("CODE-A"), "no payload in error");
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_preflight_denies_without_mutation() {
+    fn windows_preexisting_file_preserves_bytes_on_create_refusal() {
         let (_dir, base) = tmpdir();
         let path = base.join("recovery.txt");
-        let err = preflight_new_private_file(&path)
-            .expect_err("must deny on Windows before any mutation");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not implemented") || msg.contains("refusing"),
-            "msg={msg}"
-        );
-        assert!(!path.exists(), "preflight must not create");
+        std::fs::write(&path, b"original-public").expect("seed");
+        let err = create_new_private_file(&path, b"SECRET").expect_err("must refuse preexisting");
+        let _ = err;
+        assert_eq!(std::fs::read(&path).expect("read"), b"original-public");
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_denies_store_helpers_without_claiming_support() {
+    fn windows_store_dir_and_file_create_and_verify() {
         let (_dir, base) = tmpdir();
         let dir = base.join("store");
+        assert!(private_file_supported());
+        assert!(persisted_v2_credentials_supported());
+        ensure_private_store_dir(&dir).expect("store dir");
+        assert!(dir.is_dir());
+        let db = dir.join("hs-server.db");
+        create_private_store_file(&db).expect("store file");
+        verify_private_store_file(&db).expect("verify");
+        // Create-new of an existing store file refuses without overwrite.
+        let err = create_private_store_file(&db).expect_err("no overwrite");
         assert!(
-            !private_file_supported(),
-            "must not claim Windows private store"
+            err.to_string().contains("already exists")
+                || err.to_string().contains("create_new_only"),
+            "err={err}"
         );
-        assert!(!persisted_v2_credentials_supported());
-        ensure_private_store_dir(&dir).expect_err("must deny store dir");
-        assert!(!dir.exists(), "no directory created");
-        create_private_store_file(&dir.join("hs-server.db")).expect_err("must deny store file");
-        assert!(!dir.join("hs-server.db").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_existing_private_roundtrip() {
+        let (_dir, base) = tmpdir();
+        let path = base.join("material.pem");
+        create_new_private_file(&path, b"PRIVATE-MATERIAL").expect("create");
+        let got = read_existing_private_file(&path, 1024).expect("read");
+        assert_eq!(got.as_slice(), b"PRIVATE-MATERIAL");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unsafe_path_forms_refused_without_create() {
+        let (_dir, base) = tmpdir();
+        // ADS
+        let ads = base.join("recovery.txt:stream");
+        let err = create_new_private_file(&ads, b"SECRET").expect_err("refuse ADS");
+        assert!(
+            err.to_string().contains("colon")
+                || err.to_string().contains("stream")
+                || err.to_string().contains("refusing"),
+            "err={err}"
+        );
+        // Reserved device name
+        let nul = base.join("NUL");
+        let err = create_new_private_file(&nul, b"SECRET").expect_err("refuse NUL");
+        assert!(
+            err.to_string().contains("reserved") || err.to_string().contains("refusing"),
+            "err={err}"
+        );
+        // Parent-dir escape
+        let dotdot = base.join("..").join("escape.txt");
+        let err = create_new_private_file(&dotdot, b"SECRET").expect_err("refuse ..");
+        assert!(
+            err.to_string().contains("parent-directory") || err.to_string().contains("refusing"),
+            "err={err}"
+        );
+        assert!(!base.join("escape.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_failure_produces_no_secret_file() {
+        let (_dir, base) = tmpdir();
+        let path = base.join("missing").join("r.txt");
+        let err = create_new_private_file(&path, b"TOP-SECRET").expect_err("refuse");
+        let _ = err;
+        assert!(!path.exists(), "no file on failed create");
     }
 }

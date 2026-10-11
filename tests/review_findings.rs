@@ -762,11 +762,12 @@ fn legacy_loopback_init_and_bootstrap_still_work() {
     assert!(out.status.success(), "legacy check-login");
 }
 
-/// Windows CLI must refuse NEW persisted v2 MFA before creating a database
-/// or printing any secret.
+/// Windows CLI bootstrap-v2 with an invalid token must refuse without
+/// creating a recovery file or printing secrets. The private store boundary
+/// is native; auth still rejects a dummy token before any secret material.
 #[cfg(windows)]
 #[test]
-fn windows_cli_bootstrap_v2_denies_without_db_or_secret() {
+fn windows_cli_bootstrap_v2_denies_invalid_token_without_recovery_file() {
     let (_dir, base) = private_tempdir();
     let db_path = base.join("hs-server.db");
     let recovery = base.join("recovery.txt");
@@ -785,7 +786,7 @@ fn windows_cli_bootstrap_v2_denies_without_db_or_secret() {
         .stderr(std::process::Stdio::piped())
         .output()
         .expect("run");
-    assert!(!out.status.success(), "must deny bootstrap-v2 on Windows");
+    assert!(!out.status.success(), "must deny invalid bootstrap token");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -793,61 +794,23 @@ fn windows_cli_bootstrap_v2_denies_without_db_or_secret() {
         "no secrets on denial: {stdout}"
     );
     assert!(
-        stderr.contains("not supported") || stderr.contains("refusing"),
+        stderr.contains("token") || stderr.contains("refusing") || stderr.contains("unauthorized"),
         "stderr={stderr}"
     );
     assert!(!recovery.exists(), "no recovery file written");
 }
 
-/// Pre-existing persisted MFA rows must refuse legacy open (no unverified
-/// confidential store, no exposure of existing v2 authority via legacy paths).
+/// Windows private store: a fresh persistent open is PersistentPrivate and
+/// allows NEW persisted v2 MFA (the native DACL boundary holds).
 #[cfg(windows)]
 #[test]
-fn windows_open_refuses_preexisting_mfa_rows() {
+fn windows_private_store_allows_persisted_v2_credentials() {
     let (_dir, base) = private_tempdir();
     let path = base.join("hs-server.db");
-    // Seed with rusqlite directly: one MFA row is enough to refuse.
-    {
-        let conn = rusqlite::Connection::open(&path).expect("seed");
-        // Minimal v2-shaped schema with one MFA row.
-        conn.execute_batch(
-            "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL);
-             INSERT INTO schema_meta VALUES (1, 2);
-             CREATE TABLE account_mfa (
-                account_id TEXT PRIMARY KEY,
-                totp_secret TEXT NOT NULL,
-                totp_confirmed_at INTEGER,
-                recovery_stored_at INTEGER,
-                status TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-             );
-             INSERT INTO account_mfa VALUES ('a1', 'SECRET', NULL, NULL, 'pending', 1, 1);
-             CREATE TABLE recovery_codes (
-                id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
-                code_hash TEXT NOT NULL, used_at INTEGER, created_at INTEGER NOT NULL
-             );
-             CREATE TABLE mfa_enrollments (
-                id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
-                totp_secret TEXT NOT NULL, recovery_committed INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER
-             );",
-        )
-        .expect("seed mfa");
-    }
-    let err = match db::open(&path) {
-        Err(err) => err,
-        Ok(_) => panic!("must refuse pre-existing MFA rows"),
-    };
-    let msg = err.to_string();
-    assert!(
-        msg.contains("persisted MFA") || msg.contains("preexisting_mfa"),
-        "msg={msg}"
+    let db = db::open(&path).expect("open private store");
+    assert_eq!(
+        db.store_capability(),
+        db::StoreCapability::PersistentPrivate
     );
-    // Existing MFA row preserved (no implicit migration / rewrite).
-    let conn = rusqlite::Connection::open(&path).expect("reopen");
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM account_mfa", [], |r| r.get(0))
-        .expect("count");
-    assert_eq!(count, 1);
+    assert!(db.persisted_v2_credentials_allowed());
 }
