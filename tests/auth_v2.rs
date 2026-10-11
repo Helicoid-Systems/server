@@ -1277,10 +1277,10 @@ fn in_memory_store_exercises_real_crypto_on_every_platform() {
     assert!(!enrolled.recovery_codes.is_empty());
 }
 
-/// Windows private store: persistent open is PersistentPrivate and allows
-/// NEW persisted v2 MFA through the native boundary.
-#[cfg(windows)]
-mod windows_persistent_private {
+/// Persistent private stores allow MFA bootstrap and retain it across reopen.
+/// Run portable behavior on Unix and Windows; Windows ACL corruption is native.
+#[cfg(any(windows, unix))]
+mod persistent_private_mfa {
     use super::*;
 
     fn persistent_service() -> (tempfile::TempDir, Arc<Service>) {
@@ -1296,7 +1296,7 @@ mod windows_persistent_private {
     }
 
     #[test]
-    fn bootstrap_v2_persists_on_windows_private_store() {
+    fn bootstrap_v2_persists_on_private_store() {
         let (_dir, service) = persistent_service();
         let token = service.create_bootstrap_token().expect("token");
         let response = service
@@ -1309,7 +1309,7 @@ mod windows_persistent_private {
                 manager_friendly_name: None,
             })
             .expect("bootstrap v2 on private store");
-        assert!(!response.totp_secret.is_empty());
+        assert!(!response.totp_secret_base32.is_empty());
         assert!(!response.recovery_codes.is_empty());
     }
 
@@ -1335,7 +1335,7 @@ mod windows_persistent_private {
                     manager_friendly_name: None,
                 })
                 .expect("bootstrap v2 on private store");
-            assert!(!response.totp_secret.is_empty());
+            assert!(!response.totp_secret_base32.is_empty());
             assert!(!response.recovery_codes.is_empty());
             enrollment_id = response.mfa_enrollment_id.clone();
             assert!(!enrollment_id.is_empty());
@@ -1384,6 +1384,7 @@ mod windows_persistent_private {
 
     /// Corrupted private boundary (unknown SID grant) refuses an existing MFA
     /// store and preserves bytes before any transaction.
+    #[cfg(windows)]
     #[test]
     fn corrupted_private_boundary_refuses_existing_mfa_and_preserves_bytes() {
         let (_dir, base) = private_tempdir();
@@ -1402,7 +1403,7 @@ mod windows_persistent_private {
                     manager_friendly_name: None,
                 })
                 .expect("bootstrap");
-            assert!(!response.totp_secret.is_empty());
+            assert!(!response.totp_secret_base32.is_empty());
         }
         let before = std::fs::read(&path).expect("db bytes");
         grant_unknown_sid_read_on_store(&path);
