@@ -257,6 +257,21 @@ fn run(cli: Cli) -> AppResult<()> {
             manager_friendly_name,
             recovery_file,
         } => {
+            // Validate ALL output/platform preconditions BEFORE opening or
+            // mutating the database and BEFORE printing any secret. A
+            // recovery_file request requires a working private writer; on
+            // unsupported platforms this fails closed with no side effects.
+            if let Some(path) = &recovery_file {
+                hs_server::private_file::preflight_new_private_file(path)?;
+            }
+            if !hs_server::private_file::persisted_v2_credentials_supported() {
+                return Err(hs_server::AppError::not_implemented(
+                    "NEW persisted v2 MFA credentials are not supported on this platform \
+                     (no native-verified private credential store); refusing before \
+                     bootstrap/enrollment. Legacy v1 loopback development remains available.",
+                ));
+            }
+
             let token = resolve_secret(token, "HS_BOOTSTRAP_TOKEN")?;
             let password = read_password_stdin()?;
             let _ = password_stdin;
@@ -581,25 +596,11 @@ fn read_line_stdin(what: &str) -> AppResult<String> {
     Ok(value)
 }
 
-/// Write a server-owned private file (0600). Used for recovery material.
+/// Write recovery material to a new private file (create-new only).
+///
+/// Delegates to [`hs_server::private_file::create_new_private_file`], which
+/// never overwrites, never follows symlinks, and fails closed on platforms
+/// without a verified secure create-new path. Secrets are not printed on error.
 fn write_private_file(path: &std::path::Path, contents: &[u8]) -> AppResult<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                hs_server::AppError::bad_request(format!("create recovery dir: {err}"))
-            })?;
-        }
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|err| hs_server::AppError::bad_request(format!("open recovery file: {err}")))?;
-    file.write_all(contents)
-        .map_err(|err| hs_server::AppError::bad_request(format!("write recovery file: {err}")))?;
-    Ok(())
+    hs_server::private_file::create_new_private_file(path, contents)
 }

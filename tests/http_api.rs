@@ -85,6 +85,18 @@ fn bootstrap_admin(service: &Service) -> hs_server::service::AuthContext {
     service.authenticate_token(&login.token).expect("auth")
 }
 
+/// Tempdir forced owner-private (0700) so `db::open` store policy accepts it.
+fn private_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().canonicalize().expect("canonicalize");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    (dir, path)
+}
+
 #[tokio::test]
 async fn health_reports_foundation_features() {
     let app = app();
@@ -348,8 +360,8 @@ async fn file_jobs_and_recovery_are_explicitly_unavailable() {
 
 #[tokio::test]
 async fn refuses_unrelated_database_file() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("unrelated.db");
+    let (_dir, base) = private_tempdir();
+    let path = base.join("unrelated.db");
     {
         let conn = rusqlite::Connection::open(&path).expect("open");
         conn.execute_batch("CREATE TABLE notes (id INTEGER PRIMARY KEY)")
@@ -368,8 +380,8 @@ async fn refuses_unrelated_database_file() {
 
 #[tokio::test]
 async fn fresh_database_initializes_schema() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("fresh.db");
+    let (_dir, base) = private_tempdir();
+    let path = base.join("fresh.db");
     let db = db::open(&path).expect("fresh open");
     let conn = db.lock().expect("lock");
     let version: i64 = conn

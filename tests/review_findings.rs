@@ -1,6 +1,7 @@
 //! Regression tests for coordinator review findings (guard + health pass).
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
 use hs_server::db;
@@ -24,12 +25,24 @@ fn bootstrap_service(service: &Service) {
         .expect("bootstrap");
 }
 
+/// Tempdir forced owner-private (0700) so `db::open` store policy accepts it.
+fn private_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().canonicalize().expect("canonicalize");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    (dir, path)
+}
+
 // ----- Finding 1: durable latch hydration -----
 
 #[test]
 fn security_latch_survives_file_reopen() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("store.db");
+    let (_dir, base) = private_tempdir();
+    let path = base.join("store.db");
     {
         let db = db::open(&path).expect("open");
         let service = Service::new(db);
@@ -62,8 +75,8 @@ fn security_latch_survives_file_reopen() {
 
 #[test]
 fn security_latch_survives_service_recreation_same_db() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("store.db");
+    let (_dir, base) = private_tempdir();
+    let path = base.join("store.db");
     let db = db::open(&path).expect("open file");
     let service = Service::new(db);
     service.latch_security_state_unavailable("recreate");
@@ -277,8 +290,8 @@ fn refuses_non_loopback_bind_addresses() {
 #[test]
 fn cli_serve_refuses_wildcard_bind() {
     let bin = env!("CARGO_BIN_EXE_hs-server");
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("store.db");
+    let (_dir, base) = private_tempdir();
+    let path = base.join("store.db");
     let output = std::process::Command::new(bin)
         .args([
             "--data",
@@ -505,4 +518,329 @@ fn throttle_prunes_expired_idle_entries() {
         manager_public_identity: None,
     });
     assert!(ok.is_ok(), "success clears throttle for that key: {ok:?}");
+}
+
+// ----- CLI recovery-path preconditions (no DB mutation, no secret output) -----
+
+fn hs_server_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_hs-server")
+}
+
+#[test]
+fn cli_bootstrap_v2_invalid_recovery_path_does_not_mutate_db() {
+    let (_dir, base) = private_tempdir();
+    let db_path = base.join("hs-server.db");
+    let missing_parent = base.join("no-such-dir").join("recovery.txt");
+    let output = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("bootstrap-v2")
+        .arg("--token")
+        .arg("dummy-token-for-preflight")
+        .arg("--username")
+        .arg("admin")
+        .arg("--recovery-file")
+        .arg(&missing_parent)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut child = output;
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"long-enough-password\n")
+            .expect("write password");
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert!(!out.status.success(), "must fail preflight");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // No secrets and no account/enrollment output on refusal.
+    assert!(
+        !stdout.contains("totp_secret") && !stdout.contains("mfa_enrollment_id"),
+        "stdout must not print secrets: {stdout}"
+    );
+    assert!(
+        stderr.contains("refusing")
+            || stderr.contains("does not exist")
+            || stderr.contains("error"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !db_path.exists(),
+        "database must not be created when recovery preflight fails"
+    );
+}
+
+#[test]
+fn cli_bootstrap_v2_existing_recovery_file_does_not_mutate_db() {
+    let (_dir, base) = private_tempdir();
+    let db_path = base.join("hs-server.db");
+    let recovery_path = base.join("recovery.txt");
+    std::fs::write(&recovery_path, b"original").expect("seed");
+    let output = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("bootstrap-v2")
+        .arg("--token")
+        .arg("dummy-token-for-preflight")
+        .arg("--username")
+        .arg("admin")
+        .arg("--recovery-file")
+        .arg(&recovery_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut child = output;
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"long-enough-password\n")
+            .expect("write password");
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert!(!out.status.success(), "must refuse existing recovery file");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("totp_secret") && !stdout.contains("mfa_enrollment_id"),
+        "stdout={stdout}"
+    );
+    assert!(!db_path.exists(), "no database mutation on refusal");
+    assert_eq!(
+        std::fs::read(&recovery_path).expect("read"),
+        b"original",
+        "existing recovery file untouched"
+    );
+}
+
+#[test]
+fn cli_bootstrap_v2_relative_recovery_path_resolves_against_cwd() {
+    let (_dir, base) = private_tempdir();
+    let db_path = base.join("hs-server.db");
+    // Use a relative recovery path with a missing parent: the error must
+    // reference the relative name, never a root-relative path.
+    let output = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("bootstrap-v2")
+        .arg("--token")
+        .arg("dummy-token-for-preflight")
+        .arg("--username")
+        .arg("admin")
+        .arg("--recovery-file")
+        .arg("no-such-rel-dir/recovery.txt")
+        .current_dir(&base)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut child = output;
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"long-enough-password\n")
+            .expect("write password");
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert!(!out.status.success());
+    assert!(!db_path.exists(), "no database mutation");
+    assert!(
+        !Path::new("/no-such-rel-dir").exists(),
+        "must never create a root-relative path"
+    );
+    assert!(
+        !base.join("no-such-rel-dir").exists(),
+        "preflight must not create the missing parent"
+    );
+}
+
+// ----- Windows: legacy loopback startup + explicit v2 denial (native CI) -----
+
+/// Legacy v1 loopback development must open a DB and run init/bootstrap even
+/// when persistent v2 MFA is unsupported. The PowerShell fixture uses this
+/// path. No MFA rows means open is allowed; NEW v2 writes stay denied.
+#[cfg(windows)]
+#[test]
+fn windows_legacy_loopback_init_and_bootstrap_still_work() {
+    let (_dir, base) = private_tempdir();
+    let db_path = base.join("hs-server.db");
+
+    // init: creates schema + single-use bootstrap token.
+    let init = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("init")
+        .output()
+        .expect("init");
+    assert!(
+        init.status.success(),
+        "legacy init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let init_out = String::from_utf8_lossy(&init.stdout);
+    // Extract the bootstrap token line.
+    let token = init_out
+        .lines()
+        .find_map(|l| l.strip_prefix("bootstrap_token: "))
+        .expect("token line")
+        .trim()
+        .to_string();
+    assert!(!token.is_empty());
+
+    // bootstrap (v1): first administrator, no MFA.
+    let mut bootstrap = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("bootstrap")
+        .arg("--token")
+        .arg(&token)
+        .arg("--username")
+        .arg("admin")
+        .arg("--password-stdin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn bootstrap");
+    {
+        use std::io::Write;
+        bootstrap
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"legacy-windows-password\n")
+            .expect("write password");
+    }
+    let out = bootstrap.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "legacy bootstrap must work: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // check-login: credentials authenticate without starting HTTP.
+    let mut login = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("check-login")
+        .arg("--username")
+        .arg("admin")
+        .arg("--password-stdin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn login");
+    {
+        use std::io::Write;
+        login
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"legacy-windows-password\n")
+            .expect("write password");
+    }
+    let out = login.wait_with_output().expect("wait");
+    assert!(out.status.success(), "legacy check-login");
+}
+
+/// Windows CLI must refuse NEW persisted v2 MFA before creating a database
+/// or printing any secret.
+#[cfg(windows)]
+#[test]
+fn windows_cli_bootstrap_v2_denies_without_db_or_secret() {
+    let (_dir, base) = private_tempdir();
+    let db_path = base.join("hs-server.db");
+    let recovery = base.join("recovery.txt");
+    let out = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("bootstrap-v2")
+        .arg("--token")
+        .arg("dummy-token")
+        .arg("--username")
+        .arg("admin")
+        .arg("--recovery-file")
+        .arg(&recovery)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("run");
+    assert!(!out.status.success(), "must deny bootstrap-v2 on Windows");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("totp_secret") && !stdout.contains("mfa_enrollment_id"),
+        "no secrets on denial: {stdout}"
+    );
+    assert!(
+        stderr.contains("not supported") || stderr.contains("refusing"),
+        "stderr={stderr}"
+    );
+    assert!(!recovery.exists(), "no recovery file written");
+}
+
+/// Pre-existing persisted MFA rows must refuse legacy open (no unverified
+/// confidential store, no exposure of existing v2 authority via legacy paths).
+#[cfg(windows)]
+#[test]
+fn windows_open_refuses_preexisting_mfa_rows() {
+    let (_dir, base) = private_tempdir();
+    let path = base.join("hs-server.db");
+    // Seed with rusqlite directly: one MFA row is enough to refuse.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("seed");
+        // Minimal v2-shaped schema with one MFA row.
+        conn.execute_batch(
+            "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL);
+             INSERT INTO schema_meta VALUES (1, 2);
+             CREATE TABLE account_mfa (
+                account_id TEXT PRIMARY KEY,
+                totp_secret TEXT NOT NULL,
+                totp_confirmed_at INTEGER,
+                recovery_stored_at INTEGER,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             );
+             INSERT INTO account_mfa VALUES ('a1', 'SECRET', NULL, NULL, 'pending', 1, 1);
+             CREATE TABLE recovery_codes (
+                id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
+                code_hash TEXT NOT NULL, used_at INTEGER, created_at INTEGER NOT NULL
+             );
+             CREATE TABLE mfa_enrollments (
+                id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
+                totp_secret TEXT NOT NULL, recovery_committed INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER
+             );",
+        )
+        .expect("seed mfa");
+    }
+    let err = db::open(&path).expect_err("must refuse pre-existing MFA rows");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("persisted MFA") || msg.contains("preexisting_mfa"),
+        "msg={msg}"
+    );
+    // Existing MFA row preserved (no implicit migration / rewrite).
+    let conn = rusqlite::Connection::open(&path).expect("reopen");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM account_mfa", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(count, 1);
 }

@@ -1,22 +1,31 @@
 //! Isolated real-filesystem and parser tests for the installer adapter.
 //!
-//! Covers fail-closed `/proc` and `systemctl show` parsing, exclusive
-//! private temp writes, malicious tmp symlink preservation, atomic
-//! old-file preservation, and injected query failures. Does not touch
-//! auth, main, or contracts.
+//! Portable on every OS: fail-closed `/proc` and `systemctl show` parsing,
+//! read bounds, and injected query failures (`TestAdapter`).
+//!
+//! Unix-only (gated `#[cfg(unix)]`): descriptor-relative `write_file_atomic`
+//! real-filesystem regressions (symlink / mode / exclusive-create). Those
+//! cover the production Unix/Linux atomic writer. There is no Windows
+//! native service installer and no Windows atomic writer — do not invent one.
+//!
+//! Does not touch auth, main, or contracts.
 
 use hs_server::installer::adapter::{
-    parse_proc_net_table, parse_systemctl_show_presence, read_file_capped, write_file_atomic,
-    CommandAdapter, TestAdapter, MAX_PROC_NET_BYTES,
+    parse_proc_net_table, parse_systemctl_show_presence, read_file_capped, CommandAdapter,
+    TestAdapter, MAX_PROC_NET_BYTES,
 };
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use hs_server::installer::adapter::write_file_atomic;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
 /// Private tempdir plus its canonical path. On macOS `/var` →
 /// `/private/var`; the production nofollow walk refuses symlink
 /// components, so tests must use a fully real path. Linux product
 /// paths (`/opt`, `/var/lib`, `/etc`) are real directories and are
-/// walked strictly from `/`.
+/// walked strictly from `/`. Portable: tempfile + `canonicalize`.
 fn real_tempdir() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().canonicalize().unwrap();
@@ -24,7 +33,7 @@ fn real_tempdir() -> (tempfile::TempDir, PathBuf) {
 }
 
 // ---------------------------------------------------------------------------
-// Strict bounded proc-net parser
+// Strict bounded proc-net parser (portable)
 // ---------------------------------------------------------------------------
 
 const TCP_HEADER: &str =
@@ -96,6 +105,10 @@ fn proc_net_malformed_port_field_fails_closed() {
     assert!(err.contains("malformed"), "bad port hex must fail: {err}");
 }
 
+// ---------------------------------------------------------------------------
+// read_file_capped bounds (portable)
+// ---------------------------------------------------------------------------
+
 #[test]
 fn read_file_capped_rejects_oversize() {
     let (_dir, base) = real_tempdir();
@@ -118,7 +131,7 @@ fn read_file_capped_missing_file_is_an_error() {
 }
 
 // ---------------------------------------------------------------------------
-// systemctl show presence parser
+// systemctl show presence parser (portable)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -170,190 +183,7 @@ fn systemctl_show_empty_load_state_blocks() {
 }
 
 // ---------------------------------------------------------------------------
-// Real filesystem: atomic write
-// ---------------------------------------------------------------------------
-
-#[test]
-fn write_file_atomic_creates_new_file() {
-    let (_dir, base) = real_tempdir();
-    let dest = base.join("product.bin");
-    write_file_atomic(&dest, b"hello").unwrap();
-    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
-}
-
-#[test]
-fn write_file_atomic_creates_missing_parents() {
-    let (_dir, base) = real_tempdir();
-    let dest = base.join("a/b/c/file.txt");
-    write_file_atomic(&dest, b"nested").unwrap();
-    assert_eq!(std::fs::read(&dest).unwrap(), b"nested");
-}
-
-#[test]
-fn write_file_atomic_replaces_old_file_atomically() {
-    let (_dir, base) = real_tempdir();
-    let dest = base.join("product.bin");
-    std::fs::write(&dest, b"old-contents").unwrap();
-    write_file_atomic(&dest, b"new-contents").unwrap();
-    assert_eq!(std::fs::read(&dest).unwrap(), b"new-contents");
-    let leftovers: Vec<_> = std::fs::read_dir(&base)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains(".tmp."))
-        .collect();
-    assert!(
-        leftovers.is_empty(),
-        "temp files must not survive: {leftovers:?}"
-    );
-}
-
-#[test]
-fn write_file_atomic_preserves_old_file_when_destination_is_symlink() {
-    let (_dir, base) = real_tempdir();
-    let foreign = base.join("foreign");
-    std::fs::write(&foreign, b"precious").unwrap();
-    let dest = base.join("product.bin");
-    symlink(&foreign, &dest).unwrap();
-
-    let err = write_file_atomic(&dest, b"new").unwrap_err();
-    assert!(
-        err.contains("symlink"),
-        "destination symlink must be refused: {err}"
-    );
-    assert_eq!(
-        std::fs::read(&foreign).unwrap(),
-        b"precious",
-        "foreign target must never be truncated"
-    );
-}
-
-#[test]
-fn write_file_atomic_preserves_foreign_target_via_malicious_tmp_symlink() {
-    let (_dir, base) = real_tempdir();
-    let foreign = base.join("foreign");
-    std::fs::write(&foreign, b"precious").unwrap();
-    let dest = base.join("product.bin");
-
-    // Plant symlinks at the old predictable tmp.PID pattern and nearby
-    // names File::create might have followed.
-    let old_tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
-    symlink(&foreign, &old_tmp).unwrap();
-    for i in 0..16u32 {
-        let name = format!("product.tmp.{}.{}", std::process::id(), i);
-        let _ = symlink(&foreign, base.join(name));
-        let name = format!("product.bin.tmp.{}.{}", std::process::id(), i);
-        let _ = symlink(&foreign, base.join(name));
-    }
-
-    write_file_atomic(&dest, b"new").unwrap();
-    assert_eq!(
-        std::fs::read(&foreign).unwrap(),
-        b"precious",
-        "precreated tmp symlink must never truncate its target"
-    );
-    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
-}
-
-#[test]
-fn exclusive_create_refuses_existing_symlink_without_truncation() {
-    use std::os::unix::fs::OpenOptionsExt;
-    let (_dir, base) = real_tempdir();
-    let foreign = base.join("foreign");
-    std::fs::write(&foreign, b"precious").unwrap();
-    let link = base.join("x.tmp.1");
-    symlink(&foreign, &link).unwrap();
-
-    let result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&link);
-    assert!(result.is_err(), "O_EXCL must refuse an existing name");
-    assert_eq!(std::fs::read(&foreign).unwrap(), b"precious");
-}
-
-#[test]
-fn write_file_atomic_refuses_symlink_parent_and_preserves_old_file() {
-    let (_dir, base) = real_tempdir();
-    let real = base.join("real");
-    std::fs::create_dir(&real).unwrap();
-    std::fs::write(real.join("f"), b"old").unwrap();
-    let link_parent = base.join("linkparent");
-    symlink(&real, &link_parent).unwrap();
-
-    let err = write_file_atomic(&link_parent.join("f"), b"new").unwrap_err();
-    assert!(
-        err.contains("symlink") || err.contains("openat"),
-        "symlinked parent must be refused: {err}"
-    );
-    assert_eq!(
-        std::fs::read(real.join("f")).unwrap(),
-        b"old",
-        "old file under the real parent must survive"
-    );
-}
-
-#[test]
-fn write_file_atomic_refuses_world_writable_parent_and_leaves_no_temp() {
-    use std::os::unix::fs::PermissionsExt;
-    let (_dir, base) = real_tempdir();
-    let wd = base.join("wd");
-    std::fs::create_dir(&wd).unwrap();
-    let mut perms = std::fs::metadata(&wd).unwrap().permissions();
-    perms.set_mode(0o777);
-    std::fs::set_permissions(&wd, perms).unwrap();
-
-    let err = write_file_atomic(&wd.join("f"), b"x").unwrap_err();
-    assert!(
-        err.contains("world-writable"),
-        "attacker-writable parent must be refused: {err}"
-    );
-    let entries: Vec<_> = std::fs::read_dir(&wd)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .collect();
-    assert!(entries.is_empty(), "no temp may remain: {entries:?}");
-}
-
-#[test]
-fn write_file_atomic_private_mode_on_temp_then_contents() {
-    use std::os::unix::fs::PermissionsExt;
-    let (_dir, base) = real_tempdir();
-    let dest = base.join("secret");
-    write_file_atomic(&dest, b"data").unwrap();
-    let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "temp must be created private (0o600)");
-}
-
-#[test]
-fn write_file_atomic_survives_preplanted_temp_names() {
-    // Plant names in the exclusive-create namespace; the write must
-    // still succeed without touching planted symlink targets.
-    let (_dir, base) = real_tempdir();
-    let foreign = base.join("foreign");
-    std::fs::write(&foreign, b"precious").unwrap();
-    let dest = base.join("cfg.json");
-
-    let mut planted = 0;
-    let pid = std::process::id();
-    for b in 0..256u32 {
-        let name = format!(".cfg.json.tmp.{pid}.{b:08x}");
-        if symlink(&foreign, base.join(name)).is_ok() {
-            planted += 1;
-        }
-    }
-    let old = dest.with_extension(format!("tmp.{pid}"));
-    let _ = symlink(&foreign, &old);
-    assert!(planted > 0);
-
-    write_file_atomic(&dest, b"{}").unwrap();
-    assert_eq!(std::fs::read(&foreign).unwrap(), b"precious");
-    assert_eq!(std::fs::read(&dest).unwrap(), b"{}");
-}
-
-// ---------------------------------------------------------------------------
-// Injected query failures must never mean free / absent
+// Injected query failures must never mean free / absent (portable)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -402,4 +232,194 @@ fn injected_write_failure_is_reported() {
         .insert("write_file".into(), "disk full".into());
     let result = adapter.write_file(Path::new("/opt/helicoid/x"), b"y");
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Unix-only real filesystem: descriptor-relative atomic write.
+// These gate on the production `write_file_atomic` (openat/renameat).
+// Windows has no equivalent API in this crate — do not add a fake writer.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod unix_atomic_write {
+    use super::{real_tempdir, symlink, write_file_atomic};
+
+    #[test]
+    fn write_file_atomic_creates_new_file() {
+        let (_dir, base) = real_tempdir();
+        let dest = base.join("product.bin");
+        write_file_atomic(&dest, b"hello").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn write_file_atomic_creates_missing_parents() {
+        let (_dir, base) = real_tempdir();
+        let dest = base.join("a/b/c/file.txt");
+        write_file_atomic(&dest, b"nested").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"nested");
+    }
+
+    #[test]
+    fn write_file_atomic_replaces_old_file_atomically() {
+        let (_dir, base) = real_tempdir();
+        let dest = base.join("product.bin");
+        std::fs::write(&dest, b"old-contents").unwrap();
+        write_file_atomic(&dest, b"new-contents").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-contents");
+        let leftovers: Vec<_> = std::fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files must not survive: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn write_file_atomic_preserves_old_file_when_destination_is_symlink() {
+        let (_dir, base) = real_tempdir();
+        let foreign = base.join("foreign");
+        std::fs::write(&foreign, b"precious").unwrap();
+        let dest = base.join("product.bin");
+        symlink(&foreign, &dest).unwrap();
+
+        let err = write_file_atomic(&dest, b"new").unwrap_err();
+        assert!(
+            err.contains("symlink"),
+            "destination symlink must be refused: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            b"precious",
+            "foreign target must never be truncated"
+        );
+    }
+
+    #[test]
+    fn write_file_atomic_preserves_foreign_target_via_malicious_tmp_symlink() {
+        let (_dir, base) = real_tempdir();
+        let foreign = base.join("foreign");
+        std::fs::write(&foreign, b"precious").unwrap();
+        let dest = base.join("product.bin");
+
+        // Plant symlinks at the old predictable tmp.PID pattern and nearby
+        // names File::create might have followed.
+        let old_tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
+        symlink(&foreign, &old_tmp).unwrap();
+        for i in 0..16u32 {
+            let name = format!("product.tmp.{}.{}", std::process::id(), i);
+            let _ = symlink(&foreign, base.join(name));
+            let name = format!("product.bin.tmp.{}.{}", std::process::id(), i);
+            let _ = symlink(&foreign, base.join(name));
+        }
+
+        write_file_atomic(&dest, b"new").unwrap();
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            b"precious",
+            "precreated tmp symlink must never truncate its target"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    }
+
+    #[test]
+    fn exclusive_create_refuses_existing_symlink_without_truncation() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let (_dir, base) = real_tempdir();
+        let foreign = base.join("foreign");
+        std::fs::write(&foreign, b"precious").unwrap();
+        let link = base.join("x.tmp.1");
+        symlink(&foreign, &link).unwrap();
+
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&link);
+        assert!(result.is_err(), "O_EXCL must refuse an existing name");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"precious");
+    }
+
+    #[test]
+    fn write_file_atomic_refuses_symlink_parent_and_preserves_old_file() {
+        let (_dir, base) = real_tempdir();
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("f"), b"old").unwrap();
+        let link_parent = base.join("linkparent");
+        symlink(&real, &link_parent).unwrap();
+
+        let err = write_file_atomic(&link_parent.join("f"), b"new").unwrap_err();
+        assert!(
+            err.contains("symlink") || err.contains("openat"),
+            "symlinked parent must be refused: {err}"
+        );
+        assert_eq!(
+            std::fs::read(real.join("f")).unwrap(),
+            b"old",
+            "old file under the real parent must survive"
+        );
+    }
+
+    #[test]
+    fn write_file_atomic_refuses_world_writable_parent_and_leaves_no_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, base) = real_tempdir();
+        let wd = base.join("wd");
+        std::fs::create_dir(&wd).unwrap();
+        let mut perms = std::fs::metadata(&wd).unwrap().permissions();
+        perms.set_mode(0o777);
+        std::fs::set_permissions(&wd, perms).unwrap();
+
+        let err = write_file_atomic(&wd.join("f"), b"x").unwrap_err();
+        assert!(
+            err.contains("world-writable"),
+            "attacker-writable parent must be refused: {err}"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&wd)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(entries.is_empty(), "no temp may remain: {entries:?}");
+    }
+
+    #[test]
+    fn write_file_atomic_private_mode_on_temp_then_contents() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, base) = real_tempdir();
+        let dest = base.join("secret");
+        write_file_atomic(&dest, b"data").unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "temp must be created private (0o600)");
+    }
+
+    #[test]
+    fn write_file_atomic_survives_preplanted_temp_names() {
+        // Plant names in the exclusive-create namespace; the write must
+        // still succeed without touching planted symlink targets.
+        let (_dir, base) = real_tempdir();
+        let foreign = base.join("foreign");
+        std::fs::write(&foreign, b"precious").unwrap();
+        let dest = base.join("cfg.json");
+
+        let mut planted = 0;
+        let pid = std::process::id();
+        for b in 0..256u32 {
+            let name = format!(".cfg.json.tmp.{pid}.{b:08x}");
+            if symlink(&foreign, base.join(name)).is_ok() {
+                planted += 1;
+            }
+        }
+        let old = dest.with_extension(format!("tmp.{pid}"));
+        let _ = symlink(&foreign, &old);
+        assert!(planted > 0);
+
+        write_file_atomic(&dest, b"{}").unwrap();
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"precious");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"{}");
+    }
 }

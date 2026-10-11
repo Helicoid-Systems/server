@@ -172,6 +172,21 @@ impl Service {
         Ok(())
     }
 
+    /// Deny NEW persisted v2 MFA credentials when this store cannot keep
+    /// them confidential. Capability is owned by the [`Db`] (never
+    /// request-supplied): nonpersistent in-memory test stores still exercise
+    /// real crypto; persistent unverified stores deny before the transaction.
+    pub(crate) fn require_persisted_v2_credentials(&self) -> AppResult<()> {
+        if !self.db.persisted_v2_credentials_allowed() {
+            return Err(AppError::not_implemented(
+                "NEW persisted v2 MFA credentials are not supported on this store \
+                 (no native-verified private credential store); refusing before transaction. \
+                 Legacy v1 loopback development remains available without MFA claims.",
+            ));
+        }
+        Ok(())
+    }
+
     /// Apply the security-state policy to a completed storage result.
     ///
     /// Call only after releasing any Db mutex so the latch persist cannot deadlock.
