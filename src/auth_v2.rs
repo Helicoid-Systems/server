@@ -184,6 +184,12 @@ impl Service {
     /// An optional manager key is bound only after its Ed25519 proof over the
     /// bootstrap token hash — never from a claimed identity alone.
     pub fn bootstrap_v2(&self, req: BootstrapV2Request) -> AppResult<BootstrapV2Response> {
+        // Deny NEW persisted v2 MFA credentials BEFORE the transaction when
+        // this store cannot enforce a private credential store. Capability is
+        // Db-owned: nonpersistent in-memory test stores still exercise real
+        // crypto; persistent unverified stores deny. Legacy v1 loopback
+        // development is unaffected; no TOTP is printed here.
+        self.require_persisted_v2_credentials()?;
         self.require_security_ok()?;
         crate::service::validate_username(&req.username)?;
         crate::service::validate_password(&req.password)?;
@@ -360,6 +366,10 @@ impl Service {
     /// Activates the administrator. The enrollment is single-use and bounded.
     /// This path never mints an ordinary session — confirmation only.
     pub fn confirm_mfa_enrollment(&self, req: MfaConfirmRequest) -> AppResult<MfaConfirmResponse> {
+        // Enrollment confirm activates/copies reusable TOTP material into the
+        // durable account_mfa row. Same store gate as creation: deny before
+        // the transaction on a persistent unverified store.
+        self.require_persisted_v2_credentials()?;
         self.require_security_ok()?;
         validate_totp_code(&req.totp_code)?;
         if !req.recovery_material_stored {
@@ -915,6 +925,8 @@ impl Service {
         &self,
         req: FactorRecoveryBeginRequest,
     ) -> AppResult<FactorRecoveryBeginResponse> {
+        // Recovery writes a new persisted TOTP secret; same Db-owned store gate.
+        self.require_persisted_v2_credentials()?;
         self.require_security_ok()?;
         crate::service::validate_username(&req.username)?;
         if req.password.is_empty() || req.password.len() > 256 {

@@ -27,7 +27,7 @@ Repository: https://github.com/Helicoid-Systems/server. Durable release identifi
 | Schema init / migration | Storage schema 2; explicit init or migration with consistent backup; never migrates on open |
 | Security State Unavailable | Durable latch; restart never resets it; no auto-recovery |
 | Required read/commit failures | Latch + `503 security_state_unavailable` (not bare 500) |
-| v2 administrator MFA | TOTP enrollment, Ed25519 device proof and atomic challenge completion implemented for loopback development |
+| v2 administrator MFA | TOTP enrollment, Ed25519 device proof and atomic challenge completion implemented for loopback development. **Unix private-store only** — see Windows section |
 | v2 recovery credentials | Bounded, single-use factor recovery only; cannot issue normal sessions |
 | Configurable operator MFA / scoped delegation | Unavailable; production policy still gated |
 | File jobs / authority recovery and cutover | Explicitly unavailable (`501`) |
@@ -36,6 +36,7 @@ Repository: https://github.com/Helicoid-Systems/server. Durable release identifi
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
 | Windows/macOS host installation | Unavailable in this server build |
+| Windows persistent v2 MFA | **Unsupported** (no native-verified private credential store). Legacy v1 loopback development remains available. In-memory tests still exercise real crypto |
 
 Legacy v1 Manager `public_identity` values are **not** cryptographic production identities.
 They are development fixtures for local/loopback integration until B03 freezes
@@ -45,8 +46,29 @@ The [v2 development contract](contracts/http-v2.md) describes deployment-bound
 Ed25519 challenges, administrator enrollment, transaction boundaries and recovery
 limits. TLS, independently pinned production trust and public routes are absent.
 The v1 HTTP wire contract remains version 1; health separately reports storage
-schema version 2. Coordinator acceptance: **158 tests**, formatting and clippy
-pass; this does not establish production readiness.
+schema version 2. Coordinator acceptance on macOS: **202 tests**
+(61 lib + 24 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter +
+12 installer_review + 20 review_findings), formatting and clippy pass; this
+does not establish production readiness.
+
+Platform-split of `tests/installer_adapter.rs` (29 total): **19 portable**
+(listener/parser/systemctl decode, read bounds, injected query faults) run on
+every OS including Windows; **10 Unix-only** `cfg(unix)` real-filesystem
+regressions cover the descriptor-relative atomic writer (`write_file_atomic`).
+There is no Windows native service installer and no Windows atomic writer —
+host installation on Windows/macOS remains unavailable.
+
+Platform split of the full suite (macOS run = 202):
+
+| Platform | Expected total | Notes |
+| --- | --- | --- |
+| macOS | **202** (observed) | includes 5 Darwin-only extended-ACL tests |
+| Linux | **197** | 202 − 5 Darwin-only |
+| Windows | **175** | portable + 10 Windows denial/legacy tests; excludes Unix-only FS and Darwin ACL tests |
+
+In-memory (nonpersistent) auth v2 tests run on **every** platform including
+Windows and exercise real TOTP/Ed25519/recovery crypto. They are **not** a
+production confidentiality claim and **not** a persistent-MFA support claim.
 
 ## Build and test
 
@@ -120,6 +142,32 @@ Connect **Helicoid Manager** in development-server mode:
 Fixture values: address `http://127.0.0.1:8787`, manager identity `dev-manager-key`
 (loopback development fixture, not a production cryptographic identity),
 username `admin` (password is whatever you entered at the prompt).
+
+### Windows legacy mode: privacy boundary and hosting limits
+
+On Windows this build opens a **legacy loopback development** store
+(`StoreCapability::PersistentUnverified`):
+
+- **Available:** v1 `init` / `bootstrap` / `check-login` / `serve` on literal
+  loopback (the PowerShell fixture path above).
+- **Denied:** NEW persisted v2 MFA credentials (`bootstrap-v2`, factor
+  recovery, MFA enrollment confirm) — refused before the transaction and
+  before any secret is printed. Recovery-file private creation is also denied.
+- **Refused at open:** a database that already contains persisted MFA rows
+  (`account_mfa`, `recovery_codes`, `mfa_enrollments`). There is no implicit
+  migration and no exposure of existing v2 authority through legacy paths.
+- **Privacy boundary:** the on-disk store is **not** claimed private on
+  Windows (no native-verified owner/SYSTEM/administrators DACL). Treat the
+  disposable development directory as readable by other local principals
+  that can traverse to it. Do not place production credentials there.
+- **Production hosting on Windows is unavailable.** Do not install as a
+  service, do not expose beyond loopback, and do not claim MFA or
+  confidential-storage support. Enabling Windows persistent v2 later
+  requires an exact allowlist DACL verification on the held HANDLE plus
+  native prove-success tests — never a SID blacklist.
+
+In-memory nonpersistent stores still exercise real TOTP/Ed25519/recovery
+crypto on Windows. That is a **narrower** proof than persistent MFA support.
 
 ## API contract
 

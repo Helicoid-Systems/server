@@ -3,7 +3,7 @@
 Owned path: `modules/server/**` only (installer adapter worker source untouched).
 Product: **Helicoid** (Helicoid Systems). Organization: **Helicoid-Systems**.
 Apps: **Helicoid Manager** / **Helicoid Computer**.
-Build date: 10 October 2026 (auth v2 + coordinator disposition pass).
+Build date: 11 October 2026 (auth v2 + filesystem and portability review).
 Toolchain: rustc 1.99.0 / cargo 1.99.0 (`/tmp/hs-toolchain`).
 Target: `/tmp/hs-build/server-target`.
 
@@ -17,19 +17,37 @@ authority, production manager keys/signing, endpoint admission, native
 installed proofs, configured operator MFA policy, media/control/file jobs,
 security delegation/reset, real multi-process soak.
 
+The coordinator reproduced 202 macOS tests, format/clippy, and all 21 native
+client loopback checks. Backup output is now created privately before SQLite
+writes its consistent snapshot; the existing migration regression exercises
+the supported empty-file VACUUM output. Native Linux/Windows acceptance is
+recorded separately after CI; Windows persisted MFA remains unavailable.
+
 ## Fresh proof commands (this turn)
 
 ```
 cargo fmt -- --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
+scripts/live-integration.sh /tmp/hs-build/server-target/debug/hs-server
 ```
 
 | Command | Result |
 | --- | --- |
 | `cargo fmt -- --check` | **clean** |
-| `cargo test --locked` | **158 passed, 0 failed** (21 lib + 23 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter + 12 installer_review + 17 review_findings) |
+| `cargo test --locked` | **202 passed, 0 failed** on macOS (61 lib + 24 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter + 12 installer_review + 20 review_findings) |
 | `cargo clippy --locked --all-targets -- -D warnings` | **clean** |
+| 21 client loopback checks | **21/21 passed** (dotnet ClientProof + swift ClientProof) |
+
+### Portability / pre-open boundary findings (2026-10-11)
+
+| Finding | Fix | Tests |
+| --- | --- | --- |
+| Windows `db::open` always `NotImplemented` (legacy claim false) | Explicit legacy loopback open (`StoreCapability::PersistentUnverified`); refuses pre-existing MFA rows before schema mutation | `windows_legacy_loopback_init_and_bootstrap_still_work`, `open_refuses_preexisting_mfa_rows_when_store_is_unverified`, `windows_open_refuses_preexisting_mfa_rows` |
+| Global platform bool broke in-memory auth_v2 on Windows | Db-owned `StoreCapability`; nonpersistent stores exercise real crypto; persistent unverified deny before transaction | `in_memory_store_exercises_real_crypto_on_every_platform`, `windows_persistent_denial::*` (4 API denials) |
+| `set_current_dir` tests shared process cwd | Removed all chdir tests; relative-path tests use `tempdir_in(cwd)` without mutating cwd | `relative_path_resolves_against_cwd_not_root`, `relative_nested_path_resolves_against_cwd` |
+| Sidecar validation after SQLite open | `symlink_metadata` classification of `-wal`/`-shm`/`-journal` **before** any open/pragma; migrate/backup same | `open_refuses_unsafe_regular_sidecar_and_preserves_state`, `open_refuses_dangling_symlink_sidecar_and_preserves_target`, `open_refuses_live_symlink_sidecar_and_preserves_target`, `migrate_refuses_dangling_symlink_sidecar_and_preserves_state` |
+| `O_RDONLY` open of FIFO can hang | `O_NONBLOCK` + fd type check; shape probe refuses FIFO without opening | `fifo_store_file_is_refused_without_hang_or_write` |
 
 ### Coordinator findings disposition
 
@@ -318,3 +336,26 @@ errors. Its 29 adapter regressions run against actual files on macOS; native
 Linux installation on an occupied host is Not Verified. Windows/macOS local
 service installers, encrypted backup, quarantined recovery and signed updates
 remain unfinished. No resources were installed on the supplied Ubuntu VM.
+
+### Platform-split installer adapter tests
+
+`tests/installer_adapter.rs` is gated by real platform applicability, not by
+skipping portable checks:
+
+| Group | Count | Gate | Runs on Windows |
+| --- | --- | --- | --- |
+| proc-net / systemctl decode + bounds + injected faults | 19 | none (portable) | **yes** |
+| `write_file_atomic` real-FS (symlink, exclusive-create, mode, world-writable parent) | 10 | `#[cfg(unix)]` | no — Unix/Linux writer only |
+| **Total** | **29** | | **19 on Windows** |
+
+The production atomic writer stays `#[cfg(unix)]` / LinuxAdapter
+`#[cfg(target_os = "linux")]`. There is no Windows atomic writer and no
+Windows native service installer; `run_installer` on non-Linux still returns
+"installer requires a Linux host". Do not treat the Windows job as an
+installed-host proof.
+
+Historical suite total before the private-store repair was **158** (21 lib + 23 auth_v2 + 12 http_api + 44
+installer + 29 installer_adapter + 12 installer_review + 17 review_findings).
+The historical portability-only estimate was **148** (158 − 10); current
+platform counts come from the subsequent filesystem/capability checks.
+Coordinator claims native CI; this pass only gates and typechecks.

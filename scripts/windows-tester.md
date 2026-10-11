@@ -182,7 +182,12 @@ same-user session can still read secrets while they are alive.
 - Cryptographic manager or computer identities (`dev-manager-key` is a
   **loopback development fixture**, not a signed endpoint key)
 - Remote control / screen observation / remote engine
-- MFA, file jobs, security recovery, authority cutover
+- **Persisted v2 MFA** (TOTP enrollment, recovery codes): **unsupported** on
+  Windows in this build — `bootstrap-v2` and factor recovery are refused
+  before any secret is printed. The disposable store is **not** claimed
+  private (no native-verified DACL); treat it as readable by other local
+  principals. Production hosting on Windows is unavailable.
+- File jobs, security recovery, authority cutover
 - Automatic access-scope creation (inventory stays empty until you create scopes)
 - Automatic cleanup of the disposable database directory
 

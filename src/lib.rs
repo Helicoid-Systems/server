@@ -12,6 +12,7 @@ pub mod error;
 pub mod http;
 pub mod installer;
 pub mod models;
+pub mod private_file;
 pub mod service;
 
 pub use error::{AppError, AppResult};

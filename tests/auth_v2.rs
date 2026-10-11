@@ -16,6 +16,29 @@ use hs_server::service::Service;
 
 const PASSWORD: &str = "foundation-pass-v2-1";
 
+/// Canonicalized tempfile whose directory is owner-private (0700), matching
+/// the credential-store parent policy. `tempfile` default is 0755 on some
+/// hosts; production `db::open` refuses non-private parents.
+fn private_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().canonicalize().expect("canonicalize");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    (dir, path)
+}
+
+#[cfg(unix)]
+fn force_private_mode(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+#[cfg(not(unix))]
+fn force_private_mode(_path: &std::path::Path) {}
+
 fn service() -> Arc<Service> {
     let db = db::open_in_memory().expect("in-memory db");
     Arc::new(Service::new(db))
@@ -783,9 +806,10 @@ fn totp_consumption_failure_denies_without_session() {
 
 #[test]
 fn startup_never_auto_migrates_existing_db() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("old.db");
+    let (_dir, base) = private_tempdir();
+    let path = base.join("old.db");
     seed_v1_database(&path);
+    force_private_mode(&path);
     // open() must refuse — no silent upgrade on startup.
     let err = match db::open(&path) {
         Ok(_) => panic!("startup must not auto-migrate"),
@@ -797,15 +821,17 @@ fn startup_never_auto_migrates_existing_db() {
 
 #[test]
 fn explicit_migrate_upgrades_with_backup_and_keeps_data() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("old.db");
-    let backup_dir = dir.path().join("backups");
+    let (_dir, base) = private_tempdir();
+    let path = base.join("old.db");
+    let backup_dir = base.join("backups");
     seed_v1_database(&path);
+    force_private_mode(&path);
 
     let report = db::migrate(&path, &backup_dir).expect("migrate");
     assert_eq!(report.from_version, 1);
     assert_eq!(report.to_version, db::SCHEMA_VERSION);
     assert!(report.backup_path.exists());
+    force_private_mode(&report.backup_path);
 
     let service = hs_server::open_service(&path).expect("open after migrate");
     let health = service.health().expect("health");
@@ -994,8 +1020,8 @@ fn disabled_account_race_denies_inside_final_transaction() {
 
 #[test]
 fn durable_challenge_throttle_survives_service_recreation() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("throttle.db");
+    let (_dir, base) = private_tempdir();
+    let path = base.join("throttle.db");
     let db = db::open(&path).expect("open");
     let service = std::sync::Arc::new(Service::new(db));
     let enrolled = bootstrap_enrolled(&service);
@@ -1165,4 +1191,122 @@ fn seed_v1_database(path: &std::path::Path) {
             locked_until INTEGER, updated_at INTEGER NOT NULL);",
     )
     .expect("seed v1");
+}
+
+// ----- Db-owned store capability (finding: global platform bool) -----
+//
+// Nonpersistent in-memory stores exercise real crypto on every platform,
+// including Windows. Persistent stores without a verified private boundary
+// deny NEW persisted v2 MFA before the transaction. Native Windows CI runs
+// the persistent-denial and legacy-startup fixtures below.
+
+#[test]
+fn in_memory_store_exercises_real_crypto_on_every_platform() {
+    let svc = service();
+    assert_eq!(
+        svc.db_handle().store_capability(),
+        db::StoreCapability::NonPersistent
+    );
+    assert!(svc.db_handle().persisted_v2_credentials_allowed());
+    // Real crypto path must succeed (not a skipped suite).
+    let enrolled = bootstrap_enrolled(&svc);
+    assert!(!enrolled.totp_secret.is_empty());
+    assert!(!enrolled.recovery_codes.is_empty());
+}
+
+/// Persistent store on a platform without a verified private boundary must
+/// deny every entry point that creates or copies reusable secrets.
+#[cfg(windows)]
+mod windows_persistent_denial {
+    use super::*;
+
+    fn persistent_service() -> Arc<Service> {
+        let (_dir, base) = private_tempdir();
+        // Leak the tempdir so the path stays valid for the service lifetime.
+        let path = base.join("hs-server.db");
+        std::mem::forget(_dir);
+        let db = db::open(&path).expect("legacy persistent open");
+        assert_eq!(
+            db.store_capability(),
+            db::StoreCapability::PersistentUnverified
+        );
+        assert!(!db.persisted_v2_credentials_allowed());
+        Arc::new(Service::new(db))
+    }
+
+    #[test]
+    fn bootstrap_v2_denies_before_transaction_on_unverified_persistent_store() {
+        let service = persistent_service();
+        let token = service.create_bootstrap_token().expect("token");
+        let err = service
+            .bootstrap_v2(BootstrapV2Request {
+                bootstrap_token: token,
+                username: "admin".into(),
+                password: PASSWORD.into(),
+                manager_public_key: None,
+                manager_proof: None,
+                manager_friendly_name: None,
+            })
+            .expect_err("must deny NEW persisted v2 MFA");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported") || msg.contains("refusing"),
+            "msg={msg}"
+        );
+        // No account was created.
+        let count: i64 = {
+            let conn = service.db_handle().lock().expect("lock");
+            conn.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+                .expect("count")
+        };
+        assert_eq!(count, 0, "denial is before the transaction");
+    }
+
+    #[test]
+    fn begin_factor_recovery_denies_on_unverified_persistent_store() {
+        let service = persistent_service();
+        let err = service
+            .begin_factor_recovery(FactorRecoveryBeginRequest {
+                username: "admin".into(),
+                password: PASSWORD.into(),
+                recovery_code: "dummy-recovery".into(),
+            })
+            .expect_err("must deny recovery (creates new TOTP secret)");
+        assert!(
+            err.to_string().contains("not supported") || err.to_string().contains("refusing"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn confirm_mfa_enrollment_denies_on_unverified_persistent_store() {
+        let service = persistent_service();
+        let err = service
+            .confirm_mfa_enrollment(MfaConfirmRequest {
+                mfa_enrollment_id: "no-such".into(),
+                totp_code: "000000".into(),
+                recovery_material_stored: true,
+            })
+            .expect_err("must deny enrollment confirm (activates reusable secret)");
+        assert!(
+            err.to_string().contains("not supported") || err.to_string().contains("refusing"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn complete_factor_recovery_denies_on_unverified_persistent_store() {
+        let service = persistent_service();
+        let err = service
+            .complete_factor_recovery(MfaConfirmRequest {
+                mfa_enrollment_id: "no-such".into(),
+                totp_code: "000000".into(),
+                recovery_material_stored: true,
+            })
+            .expect_err("must deny recovery complete (same enrollment path)");
+        assert!(
+            err.to_string().contains("not supported") || err.to_string().contains("refusing"),
+            "err={err}"
+        );
+    }
 }
