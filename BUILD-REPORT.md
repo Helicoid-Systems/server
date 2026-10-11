@@ -17,7 +17,7 @@ authority, production manager keys/signing, endpoint admission, native
 installed proofs, configured operator MFA policy, media/control/file jobs,
 security delegation/reset, real multi-process soak.
 
-The coordinator reproduced 208 macOS tests, format/clippy, and all 21 native
+The coordinator reproduced 209 macOS tests, format/clippy, and all 21 native
 client loopback checks. Backup output is now created privately before SQLite
 writes its consistent snapshot; the existing migration regression exercises
 the supported empty-file VACUUM output. Native Linux/Windows acceptance is
@@ -35,7 +35,7 @@ scripts/live-integration.sh /tmp/hs-build/server-target/debug/hs-server
 | Command | Result |
 | --- | --- |
 | `cargo fmt -- --check` | **clean** |
-| `cargo test --locked` | **208 passed, 0 failed** on macOS (61 lib + 24 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter + 12 installer_review + 6 mfa_legacy_boundary + 20 review_findings) |
+| `cargo test --locked` | **209 passed, 0 failed** on macOS (61 lib + 24 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter + 12 installer_review + 6 mfa_legacy_boundary + 21 review_findings) |
 | `cargo clippy --locked --all-targets -- -D warnings` | **clean** |
 | 21 client loopback checks | **21/21 passed** (dotnet ClientProof + swift ClientProof) |
 
@@ -56,7 +56,8 @@ was reviewed, while real multi-process authority integration remains unverified.
 Native Windows migration fixtures now exercise the implemented refusal, keeping
 v1/current stores byte-identical with no backup directory or sidecars. Unix
 private migration success still runs. The coordinator replaced ignored sidecar
-cleanup in the seed fixture with assertions that none were created. Native
+cleanup in the seed fixture with assertions that none were created. The legacy CLI fixture now parses the actual one-time-token header and runs
+on every platform; token output stays captured and unprinted. Native
 Linux/Windows CI must pass before the integration pin moves.
 
 ### Portability / pre-open boundary findings (2026-10-11)

@@ -673,9 +673,8 @@ fn cli_bootstrap_v2_relative_recovery_path_resolves_against_cwd() {
 /// Legacy v1 loopback development must open a DB and run init/bootstrap even
 /// when persistent v2 MFA is unsupported. The PowerShell fixture uses this
 /// path. No MFA rows means open is allowed; NEW v2 writes stay denied.
-#[cfg(windows)]
 #[test]
-fn windows_legacy_loopback_init_and_bootstrap_still_work() {
+fn legacy_loopback_init_and_bootstrap_still_work() {
     let (_dir, base) = private_tempdir();
     let db_path = base.join("hs-server.db");
 
@@ -692,14 +691,19 @@ fn windows_legacy_loopback_init_and_bootstrap_still_work() {
         String::from_utf8_lossy(&init.stderr)
     );
     let init_out = String::from_utf8_lossy(&init.stdout);
-    // Extract the bootstrap token line.
-    let token = init_out
-        .lines()
-        .find_map(|l| l.strip_prefix("bootstrap_token: "))
-        .expect("token line")
+    // Parse the actual CLI header + following value, as the PowerShell
+    // development launcher does. Never print the captured one-time token.
+    let mut lines = init_out.lines();
+    assert!(lines.any(|line| line == "single-use bootstrap token (shown once, stored hashed):"));
+    let token = lines
+        .find(|line| !line.trim().is_empty())
+        .expect("token follows header")
         .trim()
         .to_string();
-    assert!(!token.is_empty());
+    assert_eq!(token.len(), 43, "32-byte base64url token");
+    assert!(token
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'));
 
     // bootstrap (v1): first administrator, no MFA.
     let mut bootstrap = std::process::Command::new(hs_server_bin())

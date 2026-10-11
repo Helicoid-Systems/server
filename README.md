@@ -53,9 +53,9 @@ The [v2 development contract](contracts/http-v2.md) describes deployment-bound
 Ed25519 challenges, administrator enrollment, transaction boundaries and recovery
 limits. TLS, independently pinned production trust and public routes are absent.
 The v1 HTTP wire contract remains version 1; health separately reports storage
-schema version 2. Coordinator acceptance on macOS: **208 tests**
+schema version 2. Coordinator acceptance on macOS: **209 tests**
 (61 lib + 24 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter +
-12 installer_review + 6 mfa_legacy_boundary + 20 review_findings), formatting and clippy pass; this
+12 installer_review + 6 mfa_legacy_boundary + 21 review_findings), formatting and clippy pass; this
 does not establish production readiness.
 
 Platform-split of `tests/installer_adapter.rs` (29 total): **19 portable**
@@ -65,13 +65,13 @@ regressions cover the descriptor-relative atomic writer (`write_file_atomic`).
 There is no Windows native service installer and no Windows atomic writer —
 host installation on Windows/macOS remains unavailable.
 
-Platform split of the full suite (macOS run = 208; native counts need fresh CI):
+Platform split of the full suite (macOS run = 209; native counts need fresh CI):
 
 | Platform | Expected total | Notes |
 | --- | --- | --- |
-| macOS | **208** (observed) | includes 5 Darwin-only extended-ACL tests |
-| Linux | **203** | 208 − 5 Darwin-only |
-| Windows | **181** | portable + 10 Windows denial/legacy tests; excludes Unix-only FS and Darwin ACL tests |
+| macOS | **209** (observed) | includes 5 Darwin-only extended-ACL tests |
+| Linux | **204** | 209 − 5 Darwin-only |
+| Windows | **182** | portable + 10 Windows denial/legacy tests; excludes Unix-only FS and Darwin ACL tests |
 
 In-memory (nonpersistent) auth v2 tests run on **every** platform including
 Windows and exercise real TOTP/Ed25519/recovery crypto. They are **not** a
