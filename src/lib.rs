@@ -13,6 +13,8 @@ pub mod http;
 pub mod installer;
 pub mod models;
 pub mod private_file;
+#[cfg(windows)]
+mod private_file_windows;
 pub mod service;
 pub mod tls;
 

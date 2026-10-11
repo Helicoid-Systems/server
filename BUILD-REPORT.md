@@ -1,5 +1,13 @@
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
+## Windows private-store candidate, 11 October 2026
+
+MiMo Code metadata confirms `xiaomi/mimo-v2.6-pro`. This candidate adds Windows held-handle no-follow traversal, separate ancestor namespace and final private-object policies, exclusive kernel-private create, bounded private reads and protected trusted file-child inheritance for SQLite WAL/SHM/journal recreation. Existing objects are never silently re-ACL'd. Unix behavior, schema/auth protocols, Windows TLS refusal and public listener gates are unchanged.
+
+Coordinator review repaired native pointer/API mismatches, required OBJECT_INHERIT rather than container-only inheritance, live sidecar tests, NT/Win32 path alias refusal, and a dangling absolute security-descriptor Owner SID. The descriptor now retains its owner allocation and aligned storage. Regression tests cover actual private create/read, unknown principals, NULL DACL, inheritance, hard links/reparse, sidecars during live writes/transactions and owner allocation churn.
+
+Coordinator reproduced **238 Mac tests**, formatting, build and Clippy. A real-source Windows-target type harness (including this module's tests) passes Clippy with warnings denied; it excludes full-crate linkage and is **not runtime evidence**. Full native Linux/Windows CI is **Not Verified** at publication. A foreign-user owner test, installed service identity, production security review and recovery remain outstanding. The integration repository retains accepted server `3a20aa0` until native checks pass. This is a candidate, not a release or completed installer.
+
 ## Current HTTPS prerequisite evidence, 11 October 2026
 
 MiMo `xiaomi/mimo-v2.6-pro` implemented Unix loopback `serve-tls` on port8920 using maintained rustls/axum-server, with explicit TLS1.2/1.3, ALPN and bounded handshake/shutdown. The coordinator reviewed and repaired secret-buffer ownership: a fixed bounded held-descriptor read, guarded PEM/DER refusal paths, and borrowed key loading with maintained key/certificate matching. Parser/provider internal allocations are outside the app's zeroization guarantee. Public listeners and Windows TLS hosting remain unavailable.

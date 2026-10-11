@@ -888,43 +888,20 @@ fn explicit_migrate_upgrades_with_backup_and_keeps_data() {
     assert_eq!(username, "admin");
 }
 
-/// Windows: explicit migrate refuses before mutation without a private store.
+/// Windows: explicit migrate uses the native private boundary (positive).
 #[cfg(windows)]
 #[test]
-fn explicit_migrate_denies_before_mutation_without_private_boundary() {
+fn explicit_migrate_upgrades_with_backup_on_windows_private_store() {
     let (_dir, base) = private_tempdir();
     let path = base.join("old.db");
     let backup_dir = base.join("backups");
     seed_v1_database(&path);
     force_private_mode(&path);
-    let before = std::fs::read(&path).expect("v1 bytes");
 
-    let err = match db::migrate(&path, &backup_dir) {
-        Ok(_) => panic!("migrate must deny without a verified private store"),
-        Err(err) => err,
-    };
-    assert_eq!(
-        err.code(),
-        hs_server::error::ErrorCode::NotImplemented,
-        "err={err}"
-    );
-    assert_eq!(
-        std::fs::read(&path).expect("v1 bytes after"),
-        before,
-        "v1 store must remain byte-identical"
-    );
-    assert!(
-        !backup_dir.exists(),
-        "no backup directory may be created on denial"
-    );
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut os = path.as_os_str().to_os_string();
-        os.push(suffix);
-        assert!(
-            !std::path::PathBuf::from(os).exists(),
-            "sidecar {suffix} must not be created"
-        );
-    }
+    let report = db::migrate(&path, &backup_dir).expect("migrate with private boundary");
+    assert_eq!(report.from_version, 1);
+    assert_eq!(report.to_version, db::SCHEMA_VERSION);
+    assert!(report.backup_path.exists());
 }
 
 // ----- coordinator regressions -----
@@ -1272,10 +1249,8 @@ fn seed_v1_database(path: &std::path::Path) {
 
 // ----- Db-owned store capability (finding: global platform bool) -----
 //
-// Nonpersistent in-memory stores exercise real crypto on every platform,
-// including Windows. Persistent stores without a verified private boundary
-// deny NEW persisted v2 MFA before the transaction. Native Windows CI runs
-// the persistent-denial and legacy-startup fixtures below.
+// Nonpersistent in-memory stores exercise real crypto on every platform.
+// Persistent stores on Unix/Windows use the verified private boundary.
 
 #[test]
 fn in_memory_store_exercises_real_crypto_on_every_platform() {
@@ -1291,31 +1266,29 @@ fn in_memory_store_exercises_real_crypto_on_every_platform() {
     assert!(!enrolled.recovery_codes.is_empty());
 }
 
-/// Persistent store on a platform without a verified private boundary must
-/// deny every entry point that creates or copies reusable secrets.
+/// Windows private store: persistent open is PersistentPrivate and allows
+/// NEW persisted v2 MFA through the native boundary.
 #[cfg(windows)]
-mod windows_persistent_denial {
+mod windows_persistent_private {
     use super::*;
 
-    /// Own the TempDir for the service lifetime so the store path cannot
-    /// disappear mid-test and no directory is leaked via `mem::forget`.
     fn persistent_service() -> (tempfile::TempDir, Arc<Service>) {
         let (dir, base) = private_tempdir();
         let path = base.join("hs-server.db");
-        let db = db::open(&path).expect("legacy persistent open");
+        let db = db::open(&path).expect("private persistent open");
         assert_eq!(
             db.store_capability(),
-            db::StoreCapability::PersistentUnverified
+            db::StoreCapability::PersistentPrivate
         );
-        assert!(!db.persisted_v2_credentials_allowed());
+        assert!(db.persisted_v2_credentials_allowed());
         (dir, Arc::new(Service::new(db)))
     }
 
     #[test]
-    fn bootstrap_v2_denies_before_transaction_on_unverified_persistent_store() {
+    fn bootstrap_v2_persists_on_windows_private_store() {
         let (_dir, service) = persistent_service();
         let token = service.create_bootstrap_token().expect("token");
-        let err = service
+        let response = service
             .bootstrap_v2(BootstrapV2Request {
                 bootstrap_token: token,
                 username: "admin".into(),
@@ -1324,71 +1297,21 @@ mod windows_persistent_denial {
                 manager_proof: None,
                 manager_friendly_name: None,
             })
-            // BootstrapV2Response deliberately lacks Debug (secret-bearing);
-            // assert denial without printing a successful response.
-            .err()
-            .expect("must deny NEW persisted v2 MFA");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not supported") || msg.contains("refusing"),
-            "msg={msg}"
-        );
-        // No account was created.
-        let count: i64 = {
-            let conn = service.db_handle().lock().expect("lock");
-            conn.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
-                .expect("count")
-        };
-        assert_eq!(count, 0, "denial is before the transaction");
+            .expect("bootstrap v2 on private store");
+        assert!(!response.totp_secret.is_empty());
+        assert!(!response.recovery_codes.is_empty());
     }
 
     #[test]
-    fn begin_factor_recovery_denies_on_unverified_persistent_store() {
-        let (_dir, service) = persistent_service();
-        let err = service
-            .begin_factor_recovery(FactorRecoveryBeginRequest {
-                username: "admin".into(),
-                password: PASSWORD.into(),
-                recovery_code: "dummy-recovery".into(),
-            })
-            // FactorRecoveryBeginResponse deliberately lacks Debug (secret-bearing).
-            .err()
-            .expect("must deny recovery (creates new TOTP secret)");
-        assert!(
-            err.to_string().contains("not supported") || err.to_string().contains("refusing"),
-            "err={err}"
-        );
-    }
-
-    #[test]
-    fn confirm_mfa_enrollment_denies_on_unverified_persistent_store() {
-        let (_dir, service) = persistent_service();
-        let err = service
-            .confirm_mfa_enrollment(MfaConfirmRequest {
-                mfa_enrollment_id: "no-such".into(),
-                totp_code: "000000".into(),
-                recovery_material_stored: true,
-            })
-            .expect_err("must deny enrollment confirm (activates reusable secret)");
-        assert!(
-            err.to_string().contains("not supported") || err.to_string().contains("refusing"),
-            "err={err}"
-        );
-    }
-
-    #[test]
-    fn complete_factor_recovery_denies_on_unverified_persistent_store() {
-        let (_dir, service) = persistent_service();
-        let err = service
-            .complete_factor_recovery(MfaConfirmRequest {
-                mfa_enrollment_id: "no-such".into(),
-                totp_code: "000000".into(),
-                recovery_material_stored: true,
-            })
-            .expect_err("must deny recovery complete (same enrollment path)");
-        assert!(
-            err.to_string().contains("not supported") || err.to_string().contains("refusing"),
-            "err={err}"
+    fn open_refuses_preexisting_mfa_only_on_unverified_path() {
+        // With the private boundary, pre-existing MFA is allowed. Seed a
+        // private store, open, and confirm capability stays PersistentPrivate.
+        let (_dir, base) = private_tempdir();
+        let path = base.join("hs-server.db");
+        let db = db::open(&path).expect("open");
+        assert_eq!(
+            db.store_capability(),
+            db::StoreCapability::PersistentPrivate
         );
     }
 }
