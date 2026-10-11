@@ -1,5 +1,13 @@
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
+## Windows ancestor-policy repair from native evidence, 11 October 2026
+
+The previous candidate `19f14d0` compiled but [CI38161333976](https://github.com/Helicoid-Systems/server/actions/runs/38161333976) passed24 library tests and failed32 on ancestor ownership. Bounded read-only [diagnostic38162915222](https://github.com/Helicoid-Systems/server/actions/runs/38162915222) then confirmed TrustedInstaller root ownership, Authenticated Users creation-only `0x4`, and inherit-only generic grants. No system ACL changed.
+
+MiMo session metadata confirms only `xiaomi/mimo-v2.6-pro`. The reviewed repair admits exact TrustedInstaller ownership on ancestors only, ignores supported inherit-only ACEs on their current ancestor, and permits read/traverse plus `FILE_ADD_SUBDIRECTORY`. File-add/write-data, deletion and security mutation remain refused. Product owner and trusted principal rules stay strict, including unknown inherit-only grants. SID, token, security-descriptor and test ACL storage is aligned and owned. Held relative opens, no-follow checks and exclusive protected create preserve the existing privacy boundary; installed-service and path-based SQLite security review remain outstanding.
+
+The coordinator corrected owner fixtures to use scoped thread impersonation, checking actual privilege assignment and restoring prior context even on unwind. A native regression checks that process privileges and previous thread context remain unchanged. These test privileges are absent from production code. New native ACL regressions cover creation-only and mutation grants, TrustedInstaller role separation, inherit-only role separation, no overwrite/re-ACL, and live SQLite files. Coordinator checks pass **240 Mac tests**, format, strict Clippy/build and real Windows module/test type checks. Full native Windows execution is **Not Verified at this candidate publication**; main's accepted server remains `3a20aa0`. Windows TLS, public listeners, installed hosting and recovery stay unavailable.
+
 ## Windows private-store candidate, 11 October 2026
 
 MiMo Code metadata confirms `xiaomi/mimo-v2.6-pro`. This candidate adds Windows held-handle no-follow traversal, separate ancestor namespace and final private-object policies, exclusive kernel-private create, bounded private reads and protected trusted file-child inheritance for SQLite WAL/SHM/journal recreation. Existing objects are never silently re-ACL'd. Unix behavior, schema/auth protocols, Windows TLS refusal and public listener gates are unchanged.
