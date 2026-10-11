@@ -1782,15 +1782,128 @@ mod tests {
         PathBuf::from(os)
     }
 
+    /// Bounded native owner classification label. Never prints SIDs,
+    /// account names, or paths — only the declared role bucket.
+    fn classify_owner_label(allow: &AllowSids, sid: PSID) -> &'static str {
+        if sid.is_null() {
+            return "null";
+        }
+        if allow.is_user(sid) {
+            return "currentUser";
+        }
+        if sid_eq(sid, allow.system.as_psid()) {
+            return "SYSTEM";
+        }
+        if sid_eq(sid, allow.admins.as_psid()) {
+            return "Administrators";
+        }
+        if sid_eq(sid, allow.trusted_installer.as_psid()) {
+            return "TrustedInstaller";
+        }
+        "other"
+    }
+
+    /// Process TokenOwner classification (may differ from TokenUser on
+    /// elevated tokens). Bounded: classification only.
+    fn process_token_owner_label(allow: &AllowSids) -> &'static str {
+        use windows_sys::Win32::Security::{TokenOwner, TOKEN_OWNER};
+        let mut token: HANDLE = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return "token-query-failed";
+        }
+        let token = match OwnedHandle::from_raw(token) {
+            Ok(t) => t,
+            Err(_) => return "token-handle-failed",
+        };
+        let mut needed: u32 = 0;
+        unsafe {
+            GetTokenInformation(
+                token.get(),
+                TokenOwner,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+        }
+        if needed == 0 || needed > 4096 {
+            return "token-owner-size-failed";
+        }
+        let mut buf = SidBuf::alloc_bytes(needed as usize);
+        if unsafe {
+            GetTokenInformation(
+                token.get(),
+                TokenOwner,
+                buf.as_mut_psid() as _,
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return "token-owner-query-failed";
+        }
+        if (needed as usize) > buf.storage.len() * std::mem::size_of::<u64>() {
+            return "token-owner-overflow";
+        }
+        let owner = buf.as_psid() as *const TOKEN_OWNER;
+        let sid = unsafe { (*owner).Owner };
+        classify_owner_label(allow, sid)
+    }
+
+    /// Diagnostic line: role + owner classification + TokenOwner class.
+    /// Printed only from test failure seams / the dedicated diagnostic test.
+    fn owner_diagnostic_line(role: &str, handle: HANDLE) -> String {
+        let allow = match AllowSids::current() {
+            Ok(a) => a,
+            Err(_) => return format!("diag role={role} allow-sids-unavailable"),
+        };
+        let owner_label = match fetch_owner_and_dacl(handle) {
+            Ok((owner, _dacl, _sd)) => classify_owner_label(&allow, owner),
+            Err(_) => {
+                return format!(
+                    "diag role={role} object-owner=fetch-failed token-owner={}",
+                    process_token_owner_label(&allow)
+                )
+            }
+        };
+        let token_owner = process_token_owner_label(&allow);
+        let token_user = classify_owner_label(&allow, allow.user.as_psid());
+        format!(
+            "diag role={role} object-owner={owner_label} token-user={token_user} token-owner={token_owner}"
+        )
+    }
+
+    /// Path wrapper for [`owner_diagnostic_line`] (opens read-only, no-follow).
+    fn owner_diagnostic_path(role: &str, path: &Path) -> String {
+        match open_parent_nofollow(path, DirRole::ObjectParent) {
+            Ok((parent, name)) => {
+                match open_relative(
+                    parent.get(),
+                    &name,
+                    false,
+                    false,
+                    None,
+                    OpenRights::FileRead,
+                ) {
+                    Ok(file) => owner_diagnostic_line(role, file.get()),
+                    Err(_) => format!("diag role={role} open-failed"),
+                }
+            }
+            Err(_) => format!("diag role={role} parent-open-failed"),
+        }
+    }
+
     /// Require a live sidecar (present now) and verify it is private.
+    /// On refusal, panic includes bounded owner metadata (classification only).
     fn require_live_private(db_path: &Path, suffix: &str) {
         let p = sidecar(db_path, suffix);
         assert!(
             p.exists(),
             "sidecar {suffix} must exist while SQLite holds the connection after write"
         );
-        verify_private_store_file(&p)
-            .unwrap_or_else(|e| panic!("live sidecar {suffix} must be private: {e}"));
+        if let Err(e) = verify_private_store_file(&p) {
+            let diag = owner_diagnostic_path("sqlite-sidecar", &p);
+            panic!("live sidecar {suffix} must be private: {e}\n{diag}");
+        }
     }
 
     /// SQLite lifecycle: WAL/SHM private **while the connection is live after
@@ -2464,5 +2577,48 @@ mod tests {
             "no secret write over preexisting final"
         );
         assert!(!msg.contains("SECRET"), "no secret in error");
+    }
+
+    /// Bounded native metadata diagnostic for SQLite-created sidecars vs
+    /// explicit create. Panics with role + owner classification (and process
+    /// TokenOwner class) when a SQLite-recreated sidecar is refused by the
+    /// product owner gate — the observed owner-policy boundary under
+    /// diagnosis. No SIDs, account names, or paths in the message.
+    #[test]
+    fn sqlite_recreated_sidecar_owner_class_diagnostic() {
+        let (_dir, base) = tmpdir();
+        let dir = base.join("store");
+        ensure_private_store_dir(&dir).expect("store dir");
+        let db_path = dir.join("hs-server.db");
+        create_private_store_file(&db_path).expect("create db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("wal");
+            conn.execute_batch("CREATE TABLE t(x TEXT); INSERT INTO t VALUES ('X');")
+                .expect("write");
+            conn.close().expect("close");
+        }
+        // Close checkpoints and deletes WAL/SHM; reopen recreates them with
+        // the process default owner (hypothesis: TokenOwner, not TokenUser).
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("wal");
+            conn.execute("INSERT INTO t VALUES ('Y')", [])
+                .expect("more");
+            // Collect both live objects before closing SQLite or reporting
+            // a refusal. Closing may remove the objects being diagnosed.
+            let mut diagnostics = Vec::new();
+            let mut refused = false;
+            for suffix in ["-wal", "-shm"] {
+                let p = sidecar(&db_path, suffix);
+                let role = format!("sqlite-recreated-{suffix}");
+                diagnostics.push(owner_diagnostic_path(&role, &p));
+                refused |= verify_private_store_file(&p).is_err();
+            }
+            conn.close().expect("close2");
+            assert!(!refused, "{}", diagnostics.join("\n"));
+        }
     }
 }
