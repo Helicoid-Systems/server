@@ -1024,7 +1024,11 @@ fn durable_challenge_throttle_survives_service_recreation() {
     let path = base.join("throttle.db");
     let db = db::open(&path).expect("open");
     let service = std::sync::Arc::new(Service::new(db));
-    let enrolled = bootstrap_enrolled(&service);
+    // begin_auth_challenge validates key format, then throttle, then
+    // credentials — manager approval is later. Failure/lockout paths therefore
+    // need only a valid public key, not enrollment (Windows persistence
+    // refuses NEW MFA until a verified private DACL exists).
+    let (_, public_key) = keypair();
 
     // Drive failures until lockout for a fixed key.
     for i in 0..6 {
@@ -1032,7 +1036,7 @@ fn durable_challenge_throttle_survives_service_recreation() {
             username: "no-such-user".into(),
             password: format!("wrong-{i}"),
             operation: "session".into(),
-            manager_public_key: enrolled.public_key.clone(),
+            manager_public_key: public_key.clone(),
         });
         assert!(result.is_err());
     }
@@ -1044,7 +1048,7 @@ fn durable_challenge_throttle_survives_service_recreation() {
         username: "no-such-user".into(),
         password: "still-wrong".into(),
         operation: "session".into(),
-        manager_public_key: enrolled.public_key.clone(),
+        manager_public_key: public_key.clone(),
     });
     let err = locked.expect_err("throttle must survive restart");
     let msg = err.to_string();
@@ -1220,23 +1224,23 @@ fn in_memory_store_exercises_real_crypto_on_every_platform() {
 mod windows_persistent_denial {
     use super::*;
 
-    fn persistent_service() -> Arc<Service> {
-        let (_dir, base) = private_tempdir();
-        // Leak the tempdir so the path stays valid for the service lifetime.
+    /// Own the TempDir for the service lifetime so the store path cannot
+    /// disappear mid-test and no directory is leaked via `mem::forget`.
+    fn persistent_service() -> (tempfile::TempDir, Arc<Service>) {
+        let (dir, base) = private_tempdir();
         let path = base.join("hs-server.db");
-        std::mem::forget(_dir);
         let db = db::open(&path).expect("legacy persistent open");
         assert_eq!(
             db.store_capability(),
             db::StoreCapability::PersistentUnverified
         );
         assert!(!db.persisted_v2_credentials_allowed());
-        Arc::new(Service::new(db))
+        (dir, Arc::new(Service::new(db)))
     }
 
     #[test]
     fn bootstrap_v2_denies_before_transaction_on_unverified_persistent_store() {
-        let service = persistent_service();
+        let (_dir, service) = persistent_service();
         let token = service.create_bootstrap_token().expect("token");
         let err = service
             .bootstrap_v2(BootstrapV2Request {
@@ -1247,7 +1251,10 @@ mod windows_persistent_denial {
                 manager_proof: None,
                 manager_friendly_name: None,
             })
-            .expect_err("must deny NEW persisted v2 MFA");
+            // BootstrapV2Response deliberately lacks Debug (secret-bearing);
+            // assert denial without printing a successful response.
+            .err()
+            .expect("must deny NEW persisted v2 MFA");
         let msg = err.to_string();
         assert!(
             msg.contains("not supported") || msg.contains("refusing"),
@@ -1264,14 +1271,16 @@ mod windows_persistent_denial {
 
     #[test]
     fn begin_factor_recovery_denies_on_unverified_persistent_store() {
-        let service = persistent_service();
+        let (_dir, service) = persistent_service();
         let err = service
             .begin_factor_recovery(FactorRecoveryBeginRequest {
                 username: "admin".into(),
                 password: PASSWORD.into(),
                 recovery_code: "dummy-recovery".into(),
             })
-            .expect_err("must deny recovery (creates new TOTP secret)");
+            // FactorRecoveryBeginResponse deliberately lacks Debug (secret-bearing).
+            .err()
+            .expect("must deny recovery (creates new TOTP secret)");
         assert!(
             err.to_string().contains("not supported") || err.to_string().contains("refusing"),
             "err={err}"
@@ -1280,7 +1289,7 @@ mod windows_persistent_denial {
 
     #[test]
     fn confirm_mfa_enrollment_denies_on_unverified_persistent_store() {
-        let service = persistent_service();
+        let (_dir, service) = persistent_service();
         let err = service
             .confirm_mfa_enrollment(MfaConfirmRequest {
                 mfa_enrollment_id: "no-such".into(),
@@ -1296,7 +1305,7 @@ mod windows_persistent_denial {
 
     #[test]
     fn complete_factor_recovery_denies_on_unverified_persistent_store() {
-        let service = persistent_service();
+        let (_dir, service) = persistent_service();
         let err = service
             .complete_factor_recovery(MfaConfirmRequest {
                 mfa_enrollment_id: "no-such".into(),
