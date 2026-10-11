@@ -1274,6 +1274,7 @@ mod tests {
     // ----- sidecar prevalidation (before any SQLite open/pragma) -----
 
     /// Snapshot of on-disk names + bytes for a refusal-preservation assert.
+    #[cfg(unix)]
     fn snapshot_dir(base: &Path) -> Vec<(PathBuf, Vec<u8>, bool)> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(base).expect("readdir").flatten() {
