@@ -212,3 +212,6 @@ native apps, production installers) remains required and unfinished. See
 On Windows, double-click `start-development.cmd` or run the PowerShell script
 from an existing terminal. The CMD launcher keeps errors visible after the
 child process stops and preserves the configured execution policy.
+
+
+Current HTTPS prerequisite code `ccaf29a` passed **238 Mac, 231 Linux and189 native Windows tests**, formatting/Clippy/build and the actual Windows PowerShell development fixture. [Native CI38143445740](https://github.com/Helicoid-Systems/server/actions/runs/38143445740) provides the [Windows x64 development server](https://github.com/Helicoid-Systems/server/actions/runs/38143445740/artifacts/11703299972). Windows exercises explicit TLS/private-MFA refusal; it does not support HTTPS hosting in this revision. Public connections, installed services and production recovery remain unavailable.
