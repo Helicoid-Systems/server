@@ -819,6 +819,8 @@ fn startup_never_auto_migrates_existing_db() {
     assert!(msg.contains("migrate"), "msg={msg}");
 }
 
+/// Unix: verified private store allows explicit migrate with backup + data keep.
+#[cfg(unix)]
 #[test]
 fn explicit_migrate_upgrades_with_backup_and_keeps_data() {
     let (_dir, base) = private_tempdir();
@@ -852,6 +854,45 @@ fn explicit_migrate_upgrades_with_backup_and_keeps_data() {
         })
         .expect("account");
     assert_eq!(username, "admin");
+}
+
+/// Windows: explicit migrate refuses before mutation without a private store.
+#[cfg(windows)]
+#[test]
+fn explicit_migrate_denies_before_mutation_without_private_boundary() {
+    let (_dir, base) = private_tempdir();
+    let path = base.join("old.db");
+    let backup_dir = base.join("backups");
+    seed_v1_database(&path);
+    force_private_mode(&path);
+    let before = std::fs::read(&path).expect("v1 bytes");
+
+    let err = match db::migrate(&path, &backup_dir) {
+        Ok(_) => panic!("migrate must deny without a verified private store"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.code(),
+        hs_server::error::ErrorCode::NotImplemented,
+        "err={err}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("v1 bytes after"),
+        before,
+        "v1 store must remain byte-identical"
+    );
+    assert!(
+        !backup_dir.exists(),
+        "no backup directory may be created on denial"
+    );
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut os = path.as_os_str().to_os_string();
+        os.push(suffix);
+        assert!(
+            !std::path::PathBuf::from(os).exists(),
+            "sidecar {suffix} must not be created"
+        );
+    }
 }
 
 // ----- coordinator regressions -----
