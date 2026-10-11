@@ -872,6 +872,21 @@ mod tests {
     #[cfg(not(unix))]
     fn force_private_mode(_path: &Path) {}
 
+    /// Create a genuine private pre-existing DB file with the protected
+    /// create API **before** SQLite opens it. Never lets SQLite create a
+    /// default-owned/mode file and then re-ACL it. Empty `-wal`/`-shm`
+    /// placeholders from the create API are dropped so the seed remains a
+    /// clean single file (fixtures assert no leftover sidecars).
+    fn create_private_db_for_seed(path: &Path) {
+        crate::private_file::create_private_store_file(path).expect("private db create");
+        for suffix in ["-wal", "-shm"] {
+            let side = sidecar_path(path, suffix);
+            if side.exists() {
+                std::fs::remove_file(&side).expect("drop empty pre-created sidecar");
+            }
+        }
+    }
+
     #[test]
     fn schema_installs_once_on_fresh_db() {
         let db = open_in_memory().expect("open");
@@ -974,6 +989,7 @@ mod tests {
     fn open_refuses_older_schema_without_auto_migrate() {
         let (_dir, base) = real_tempdir();
         let path = base.join("old.db");
+        create_private_db_for_seed(&path);
         {
             let conn = Connection::open(&path).expect("open");
             conn.execute_batch(
@@ -991,7 +1007,6 @@ mod tests {
             )
             .expect("seed v1");
         }
-        force_private_mode(&path);
         let err = match open(&path) {
             Ok(_) => panic!("must refuse older schema"),
             Err(err) => err,
@@ -1006,6 +1021,7 @@ mod tests {
 
     /// Seed a full v1-schema database file and leave it as a clean single file.
     fn seed_v1_schema_file(path: &Path) {
+        create_private_db_for_seed(path);
         {
             let conn = Connection::open(path).expect("open");
             conn.execute_batch(
@@ -1070,17 +1086,16 @@ mod tests {
             )
             .expect("seed v1");
         }
-        force_private_mode(path);
         assert_no_sqlite_sidecars(path);
     }
 
     /// Seed a current-schema database file and leave it as a clean single file.
     fn seed_current_schema_file(path: &Path) {
+        create_private_db_for_seed(path);
         {
             let conn = Connection::open(path).expect("open");
             ensure_schema(&conn).expect("install");
         }
-        force_private_mode(path);
         assert_no_sqlite_sidecars(path);
     }
 

@@ -1,5 +1,13 @@
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
+## SQLite fixture ownership and native diagnosis, 11 October 2026
+
+[Native CI 38165068195](https://github.com/Helicoid-Systems/server/actions/runs/38165068195) at `ff98740` passes Linux and 64 Windows library tests but fails four database/sidecar owner checks. Ancestor-policy and scoped-privilege regressions pass. Three seed helpers let SQLite create the database before verification; the reviewed repair creates a private file through the protected API before SQLite opens it. It retains the actual old/current schemas, no-overwrite and byte-preservation checks.
+
+MiMo exported metadata confirms `xiaomi/mimo-v2.6-pro`. Test-only diagnostics classify held object owners and the process default owner as current user, SYSTEM, Administrators, TrustedInstaller or other. The coordinator removed external error prose from diagnostic lines and collects both live sidecar roles before closing SQLite. No paths, account names, SIDs or file contents enter those lines. The hypothesis that elevated default ownership differs from the current user awaits actual Windows evidence; production owner acceptance remains unchanged.
+
+Fresh coordinator checks pass **240 Mac tests**, formatting, strict all-target Clippy, build and the real Windows source/test type harness. The complete Windows store gate remains **Not Verified**. Main retains `3a20aa0`; the next native run must supply the sidecar ownership classifications before any compatibility change. Windows TLS, public listeners, installed hosting and recovery remain unavailable.
+
 ## Windows ancestor-policy repair from native evidence, 11 October 2026
 
 The previous candidate `19f14d0` compiled but [CI38161333976](https://github.com/Helicoid-Systems/server/actions/runs/38161333976) passed24 library tests and failed32 on ancestor ownership. Bounded read-only [diagnostic38162915222](https://github.com/Helicoid-Systems/server/actions/runs/38162915222) then confirmed TrustedInstaller root ownership, Authenticated Users creation-only `0x4`, and inherit-only generic grants. No system ACL changed.
