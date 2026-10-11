@@ -16,18 +16,29 @@ use hs_server::service::Service;
 
 const PASSWORD: &str = "foundation-pass-v2-1";
 
-/// Canonicalized tempfile whose directory is owner-private (0700), matching
-/// the credential-store parent policy. `tempfile` default is 0755 on some
-/// hosts; production `db::open` refuses non-private parents.
+/// Tempdir whose `base` is store-parent ready: Unix owner-private (0700);
+/// Windows a genuine private product child via `ensure_private_store_dir`
+/// (no silent re-ACL of TempDir or ancestors).
 fn private_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().canonicalize().expect("canonicalize");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
-    (dir, path)
+    #[cfg(windows)]
+    let base = {
+        let child = dir.path().join("hs-store");
+        hs_server::private_file::ensure_private_store_dir(&child)
+            .expect("windows private product child");
+        child
+    };
+    #[cfg(not(windows))]
+    let base = {
+        let path = dir.path().canonicalize().expect("canonicalize");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        path
+    };
+    (dir, base)
 }
 
 #[cfg(unix)]
@@ -1302,16 +1313,161 @@ mod windows_persistent_private {
         assert!(!response.recovery_codes.is_empty());
     }
 
+    /// Persisted bootstrap_v2 → close Service/Db → reopen → MFA/recovery rows
+    /// retained on a confidential private DB (live WAL/SHM while open).
     #[test]
-    fn open_refuses_preexisting_mfa_only_on_unverified_path() {
-        // With the private boundary, pre-existing MFA is allowed. Seed a
-        // private store, open, and confirm capability stays PersistentPrivate.
+    fn persisted_bootstrap_v2_mfa_rows_survive_reopen() {
         let (_dir, base) = private_tempdir();
         let path = base.join("hs-server.db");
-        let db = db::open(&path).expect("open");
+        let enrollment_id;
+        {
+            let db = db::open(&path).expect("open private store");
+            let service = Service::new(db);
+            let token = service.create_bootstrap_token().expect("token");
+            // BootstrapV2Response deliberately lacks Debug (secret-bearing).
+            let response = service
+                .bootstrap_v2(BootstrapV2Request {
+                    bootstrap_token: token,
+                    username: "admin".into(),
+                    password: PASSWORD.into(),
+                    manager_public_key: None,
+                    manager_proof: None,
+                    manager_friendly_name: None,
+                })
+                .expect("bootstrap v2 on private store");
+            assert!(!response.totp_secret.is_empty());
+            assert!(!response.recovery_codes.is_empty());
+            enrollment_id = response.mfa_enrollment_id.clone();
+            assert!(!enrollment_id.is_empty());
+            // Live WAL/SHM must exist while the service holds the DB after the
+            // bootstrap write (no vacuous "if exists" pass) and be private.
+            for suffix in ["-wal", "-shm"] {
+                let mut os = path.as_os_str().to_os_string();
+                os.push(suffix);
+                let p = std::path::PathBuf::from(os);
+                assert!(
+                    p.exists(),
+                    "live {suffix} must exist while service holds the DB after bootstrap write"
+                );
+                hs_server::private_file::verify_private_store_file(&p)
+                    .unwrap_or_else(|e| panic!("live {suffix} private: {e}"));
+            }
+            // Drop service + Db (close).
+        }
+
+        // Reopen: pending MFA, recovery, and enrollment rows retained.
+        let db = db::open(&path).expect("reopen private store");
         assert_eq!(
             db.store_capability(),
             db::StoreCapability::PersistentPrivate
         );
+        {
+            let conn = db.lock().expect("lock");
+            let mfa_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM account_mfa", [], |r| r.get(0))
+                .expect("account_mfa");
+            assert_eq!(mfa_count, 1, "pending MFA row retained");
+            let rec_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM recovery_codes", [], |r| r.get(0))
+                .expect("recovery_codes");
+            assert!(rec_count > 0, "recovery rows retained");
+            let enroll: String = conn
+                .query_row(
+                    "SELECT id FROM mfa_enrollments WHERE id = ?1",
+                    [enrollment_id.as_str()],
+                    |r| r.get(0),
+                )
+                .expect("enrollment row retained");
+            assert_eq!(enroll, enrollment_id);
+        }
+    }
+
+    /// Corrupted private boundary (unknown SID grant) refuses an existing MFA
+    /// store and preserves bytes before any transaction.
+    #[test]
+    fn corrupted_private_boundary_refuses_existing_mfa_and_preserves_bytes() {
+        let (_dir, base) = private_tempdir();
+        let path = base.join("hs-server.db");
+        {
+            let db = db::open(&path).expect("open");
+            let service = Service::new(db);
+            let token = service.create_bootstrap_token().expect("token");
+            let response = service
+                .bootstrap_v2(BootstrapV2Request {
+                    bootstrap_token: token,
+                    username: "admin".into(),
+                    password: PASSWORD.into(),
+                    manager_public_key: None,
+                    manager_proof: None,
+                    manager_friendly_name: None,
+                })
+                .expect("bootstrap");
+            assert!(!response.totp_secret.is_empty());
+        }
+        let before = std::fs::read(&path).expect("db bytes");
+        grant_unknown_sid_read_on_store(&path);
+        // Db has no Debug (secret-bearing); do not use expect_err on Ok(Db).
+        let err = match db::open(&path) {
+            Err(err) => err,
+            Ok(_) => panic!("must refuse corrupted private boundary"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing") || msg.contains("private") || msg.contains("allowlist"),
+            "msg={msg}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("bytes after"),
+            before,
+            "existing MFA store bytes preserved before transaction"
+        );
+    }
+
+    /// Windows fixture: add an unknown SID (Everyone) read grant so the store
+    /// is no longer private. `SetNamedSecurityInfoW` takes an ACL only — no
+    /// SECURITY_DESCRIPTOR. Aligned `Vec<u64>` storage; buffers live through
+    /// the call.
+    #[cfg(windows)]
+    fn grant_unknown_sid_read_on_store(path: &std::path::Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            AddAccessAllowedAceEx, CreateWellKnownSid, InitializeAcl, WinWorldSid, ACL_REVISION,
+            DACL_SECURITY_INFORMATION, PSID,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+
+        // Aligned SID buffer (pointer-aligned).
+        let mut world_storage = [0u64; 9];
+        let mut world_len = std::mem::size_of_val(&world_storage) as u32;
+        let world_ps: PSID = world_storage.as_mut_ptr() as PSID;
+        assert!(
+            unsafe {
+                CreateWellKnownSid(WinWorldSid, std::ptr::null_mut(), world_ps, &mut world_len)
+            } != 0
+        );
+
+        // ACL only, 8-byte aligned, live through SetNamedSecurityInfoW.
+        let mut acl_storage = [0u64; 32];
+        let acl_ptr = acl_storage.as_mut_ptr() as *mut windows_sys::Win32::Security::ACL;
+        let acl_len = std::mem::size_of_val(&acl_storage) as u32;
+        unsafe {
+            assert!(InitializeAcl(acl_ptr, acl_len, ACL_REVISION) != 0);
+            assert!(
+                AddAccessAllowedAceEx(acl_ptr, ACL_REVISION, 0, FILE_GENERIC_READ, world_ps) != 0
+            );
+            let mut wpath: Vec<u16> = path.as_os_str().encode_wide().collect();
+            wpath.push(0);
+            let rc = SetNamedSecurityInfoW(
+                wpath.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl_ptr,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(rc, 0, "corrupt DACL rc={rc}");
+        }
     }
 }

@@ -30,13 +30,11 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::Duration;
 
-use hs_server::private_file::read_existing_private_file;
+use hs_server::private_file::{create_new_private_file, read_existing_private_file};
 #[allow(unused_imports)]
 use hs_server::tls::tls_transport_supported;
 use hs_server::tls::{self, run_serve_tls};
 
-#[cfg(unix)]
-use hs_server::private_file::create_new_private_file;
 #[cfg(unix)]
 use hs_server::tls::{
     load_server_config, MAX_TLS_CERT_CHAIN, MAX_TLS_PEM_BYTES, TLS_HANDSHAKE_TIMEOUT,
@@ -45,16 +43,29 @@ use hs_server::tls::{
 #[cfg(unix)]
 use std::sync::Arc;
 
-/// Tempdir forced owner-private (0700) so private-store policy accepts it.
+/// Tempdir whose `base` is a genuine private product child on Windows
+/// (created via `ensure_private_store_dir` — no silent re-ACL of TempDir or
+/// ancestors) and owner-private (0700) on Unix.
 fn private_tempdir() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().canonicalize().expect("canonicalize");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
-    (dir, path)
+    #[cfg(windows)]
+    let base = {
+        let child = dir.path().join("hs-store");
+        hs_server::private_file::ensure_private_store_dir(&child)
+            .expect("windows private product child");
+        child
+    };
+    #[cfg(not(windows))]
+    let base = {
+        let path = dir.path().canonicalize().expect("canonicalize");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        path
+    };
+    (dir, base)
 }
 
 #[cfg(unix)]
@@ -254,17 +265,71 @@ fn held_file_missing_path_is_refused() {
     let _ = err;
 }
 
+/// Grant an unknown SID (Everyone) read access so the file is genuinely
+/// non-private. `SetNamedSecurityInfoW` takes an ACL only. Aligned `Vec<u64>`
+/// / array storage; buffers live through the call.
+#[cfg(windows)]
+fn make_public_file(path: &std::path::Path, contents: &[u8]) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        AddAccessAllowedAceEx, CreateWellKnownSid, InitializeAcl, WinWorldSid, ACL_REVISION,
+        DACL_SECURITY_INFORMATION, PSID,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_LIST_DIRECTORY};
+    std::fs::write(path, contents).expect("write public fixture");
+
+    let mut world_storage = [0u64; 9];
+    let mut world_len = std::mem::size_of_val(&world_storage) as u32;
+    let world_ps: PSID = world_storage.as_mut_ptr() as PSID;
+    assert!(
+        unsafe { CreateWellKnownSid(WinWorldSid, std::ptr::null_mut(), world_ps, &mut world_len) }
+            != 0
+    );
+
+    let mut acl_storage = [0u64; 32];
+    let acl_ptr = acl_storage.as_mut_ptr() as *mut windows_sys::Win32::Security::ACL;
+    let acl_len = std::mem::size_of_val(&acl_storage) as u32;
+    unsafe {
+        assert!(InitializeAcl(acl_ptr, acl_len, ACL_REVISION) != 0);
+        assert!(
+            AddAccessAllowedAceEx(
+                acl_ptr,
+                ACL_REVISION,
+                0,
+                FILE_GENERIC_READ | FILE_LIST_DIRECTORY,
+                world_ps
+            ) != 0
+        );
+        let mut wpath: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wpath.push(0);
+        let rc = SetNamedSecurityInfoW(
+            wpath.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl_ptr,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, 0, "SetNamedSecurityInfoW public DACL rc={rc}");
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_held_file_read_refuses_public_file_and_reads_private() {
     let (_dir, base) = private_tempdir();
     let public_path = base.join("public.pem");
-    std::fs::write(&public_path, b"PUBLIC").expect("seed");
+    make_public_file(&public_path, b"PUBLIC");
     let err =
         read_existing_private_file(&public_path, 1024).expect_err("must refuse non-private file");
     let msg = err.to_string();
     assert!(
-        msg.contains("not owned") || msg.contains("refusing") || msg.contains("private"),
+        msg.contains("not owned")
+            || msg.contains("refusing")
+            || msg.contains("private")
+            || msg.contains("allowlist"),
         "msg={msg}"
     );
     assert!(!msg.contains("PUBLIC"));

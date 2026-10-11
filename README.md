@@ -14,6 +14,9 @@ security-state-unavailable behavior.
 
 Repository: https://github.com/Helicoid-Systems/server. Durable release identifiers remain pending.
 
+Native [CI38147363684](https://github.com/Helicoid-Systems/server/actions/runs/38147363684) at candidate `3741506515399750289edf727ffc8d1184a8d5d2` failed before Windows runtime: `create_new_private_file` was imported only on Unix in a Windows test. The reviewed repair fixes that import, creates genuine private product children before fixture writes, and tests real persisted MFA close/reopen plus corrupt-boundary byte preservation. WAL/SHM must exist while the DB is live; public negative fixtures receive explicit unknown-principal grants in aligned native ACL storage. Coordinator checks pass 238 Mac tests, format, strict Clippy and build. Windows-native acceptance remains **Not Verified** until the repaired candidate passes full CI; the module-only type harness excludes integration tests and runtime. Windows TLS stays unavailable and the accepted integration pin remains `3a20aa0`.
+
+
 ## What this foundation is
 
 | Area | Status in this build |

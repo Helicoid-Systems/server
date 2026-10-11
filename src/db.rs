@@ -835,19 +835,30 @@ CREATE TABLE challenge_throttle (
 mod tests {
     use super::*;
 
-    /// Canonicalized tempdir (macOS TMPDIR sits under /var -> /private/var).
-    /// Forced `0700` so the store parent policy accepts it (`tempfile`
-    /// default is `0755` on some hosts).
+    /// Tempdir whose `base` is store-parent ready: Unix owner-private (0700);
+    /// Windows a genuine private product child via `ensure_private_store_dir`
+    /// (no silent re-ACL of TempDir or ancestors).
     fn real_tempdir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().canonicalize().expect("canonicalize");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                .expect("chmod tmpdir");
-        }
-        (dir, path)
+        #[cfg(windows)]
+        let base = {
+            let child = dir.path().join("hs-store");
+            crate::private_file::ensure_private_store_dir(&child)
+                .expect("windows private product child");
+            child
+        };
+        #[cfg(not(windows))]
+        let base = {
+            let path = dir.path().canonicalize().expect("canonicalize");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod tmpdir");
+            }
+            path
+        };
+        (dir, base)
     }
 
     /// Seed helper: create a file at `path` then force 0600 so the private
