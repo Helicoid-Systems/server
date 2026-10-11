@@ -3,22 +3,33 @@
 //! Two distinct policies on held handles:
 //!
 //! 1. **Ancestor namespace integrity** (traversed directories): owner is
-//!    current user / SYSTEM / Administrators; no unknown principal holds
-//!    name-mutation / delete-child / write-DACL / write-owner / delete
-//!    grants (including INHERIT_ONLY); no reparse; object/callback/unknown
-//!    ACE types fail closed. Legitimate read/traverse grants for
-//!    Everyone/Users are allowed.
+//!    current user / SYSTEM / Administrators, or the exact maintained
+//!    Windows TrustedInstaller service SID (`S-1-5-80-956008885-…`) —
+//!    **ancestor owner only**, never a product owner and never a product
+//!    DACL principal. Unknown principals may hold existing read/traverse
+//!    plus **FILE_ADD_SUBDIRECTORY only** (create-new subdirectory name;
+//!    not a replacement of an existing name). File-add / write-data
+//!    (bit `0x2`), delete, delete-child, write-DACL, write-owner,
+//!    generic-write/ALL, write attributes/EA remain refused. INHERIT_ONLY
+//!    ACEs grant nothing on the ancestor itself: after validating supported
+//!    ACE type/flags the current-directory mask is ignored (children are
+//!    opened relative a retained parent handle no-follow and independently
+//!    verified; created product SDs are protected so ancestor ACEs never
+//!    propagate into product). Object/callback/unknown ACE types, unknown
+//!    ACE flags, NULL DACL, and reparse fail closed.
 //! 2. **Final product object** (store dirs, recovery files, DB/sidecars):
-//!    owner is the current process user; every ACCESS_ALLOWED ACE SID
-//!    (including INHERITED and INHERIT_ONLY) is exactly current user /
-//!    SYSTEM / Administrators. **Create-new** of our own files/dirs uses an
-//!    explicit **protected** DACL. **SQLite-created children** (WAL/SHM/
-//!    journal) carry **inherited trusted ACEs** from a product directory
-//!    with a protected DACL and trusted OBJECT_INHERIT ACEs — they are not
-//!    given their own protected DACL; verification accepts validated
-//!    inherited trusted ACEs. TokenDefaultDacl is never assumed. Product
-//!    dirs must prove a trusted OBJECT_INHERIT ACE exists; unknown SID /
-//!    NULL DACL / foreign owner fail closed.
+//!    owner is the current process user (TrustedInstaller is **not**
+//!    accepted); every ACCESS_ALLOWED ACE SID (including INHERITED and
+//!    INHERIT_ONLY) is exactly current user / SYSTEM / Administrators.
+//!    **Create-new** of our own files/dirs uses an explicit **protected**
+//!    DACL. **SQLite-created children** (WAL/SHM/journal) carry
+//!    **inherited trusted ACEs** from a product directory with a protected
+//!    DACL and trusted OBJECT_INHERIT ACEs — they are not given their own
+//!    protected DACL; verification accepts validated inherited trusted
+//!    ACEs. TokenDefaultDacl is never assumed. Product dirs must prove a
+//!    trusted OBJECT_INHERIT ACE exists; unknown SID / NULL DACL / foreign
+//!    owner fail closed. Existing product dirs keep the strict all-unknown
+//!    refusal (including INHERIT_ONLY) because SQLite children inherit.
 //!
 //! Create-new supplies the protected DACL atomically via
 //! `OBJECT_ATTRIBUTES.SecurityDescriptor` — no brief public window and no
@@ -26,14 +37,24 @@
 //! only the created object identity. NTSTATUS is matched by value (never by
 //! error Display text).
 //!
+//! Held-handle / no-overwrite safety (the proof seam for ancestor
+//! FILE_ADD_SUBDIRECTORY and for rename survival):
+//! - Each component is opened relative a **retained** `NtCreateFile`
+//!   `RootDirectory` handle with `FILE_OPEN_REPARSE_POINT` (no-follow).
+//!   Ancestor renames after a child handle is held do not retarget the walk.
+//! - Final product create uses `FILE_CREATE` (exclusive) with the protected
+//!   SD; a preexisting name is never overwritten or re-ACL'd, and no secret
+//!   is written on refusal.
+//! - The new product object is verified on the held handle before any
+//!   payload write.
+//!
 //! Path safety: refuse UNC, device namespaces, ADS, `..`, reserved device
-//! names. Traverse each component with `NtCreateFile(..., FILE_OPEN_REPARSE_
-//! POINT)` so junction/symlink components are opened as the reparse object
-//! and then refused. Minimum rights are used for traversed directories so
-//! unprivileged preflight/read still work. SQLite path-based open is pinned
-//! by the ancestor namespace policy (unknown principals cannot replace the
-//! name) plus the product-dir child-inheritance boundary and private sidecar
-//! checks in `db`.
+//! names. Minimum rights are used for traversed directories so unprivileged
+//! preflight/read still work. SQLite path-based open is pinned by the
+//! ancestor namespace policy (unknown principals cannot replace the name)
+//! plus the product-dir child-inheritance boundary and private sidecar
+//! checks in `db`. Remaining installed-service / recovery-path review is
+//! unchanged by this ancestor-role distinction.
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
@@ -44,8 +65,8 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, GENERIC_ALL, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    NTSTATUS, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    CloseHandle, GetLastError, LocalFree, GENERIC_EXECUTE, GENERIC_READ, HANDLE,
+    INVALID_HANDLE_VALUE, NTSTATUS, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
     STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
@@ -62,9 +83,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES,
-    FILE_WRITE_DATA, FILE_WRITE_EA, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+    FILE_DISPOSITION_INFO, FILE_EXECUTE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_READ_EA, FILE_TRAVERSE,
+    FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -75,19 +96,48 @@ use crate::private_file::{StorePathPresence, MAX_PRIVATE_PAYLOAD_BYTES};
 
 const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 
-/// Rights granted to unknown principals on traversed ancestors: read/traverse
-/// only. Name mutation, delete-child, and security rights are forbidden.
-const NAMESPACE_MUTATION_RIGHTS: u32 = FILE_ADD_FILE
-    | FILE_ADD_SUBDIRECTORY
-    | FILE_DELETE_CHILD
-    | FILE_WRITE_DATA
-    | FILE_WRITE_EA
-    | FILE_WRITE_ATTRIBUTES
-    | DELETE
-    | WRITE_DAC
-    | WRITE_OWNER
-    | GENERIC_ALL
-    | GENERIC_WRITE;
+/// Exact maintained Windows TrustedInstaller service SID.
+///
+/// Parsed only via native `ConvertStringSidToSidW` into an owned buffer —
+/// never LookupAccountName, network/account-name trust, or arbitrary
+/// service SIDs. Accepted solely as trusted **ancestor owner**; never as
+/// product owner and never as a product DACL allowlist principal.
+const TRUSTED_INSTALLER_SERVICE_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// Access bits allowed to unknown principals on a non-INHERIT_ONLY ancestor
+/// ACE: existing read/traverse plus FILE_ADD_SUBDIRECTORY only.
+///
+/// FILE_ADD_SUBDIRECTORY (`0x4`) is create-new-subdirectory name — it cannot
+/// replace an existing name. Held-handle safety (module docs): every child is
+/// opened relative a retained parent handle no-follow and independently
+/// verified; final product create is `FILE_CREATE` + protected DACL (no
+/// overwrite; ancestor ACEs do not propagate into product).
+///
+/// FILE_ADD_FILE / FILE_WRITE_DATA (bit `0x2`) stay forbidden: writable
+/// file / reparse risks differ from create-subdir. DELETE / DELETE_CHILD /
+/// WRITE_DAC / WRITE_OWNER / GENERIC_WRITE / GENERIC_ALL / write
+/// attributes/EA and every other bit are refused (allow-list, not deny-list).
+const ANCESTOR_UNKNOWN_ALLOWED_RIGHTS: u32 = FILE_LIST_DIRECTORY
+    | FILE_READ_DATA
+    | FILE_READ_EA
+    | FILE_READ_ATTRIBUTES
+    | FILE_TRAVERSE
+    | FILE_EXECUTE
+    | READ_CONTROL
+    | SYNCHRONIZE
+    | GENERIC_READ
+    | GENERIC_EXECUTE
+    | FILE_ADD_SUBDIRECTORY;
+
+/// Flags allowed on ancestor ALLOW ACEs. Unknown object/callback flag bits
+/// fail closed; INHERIT_ONLY is validated then ignored for current-directory
+/// mutation (grants nothing on this object).
+const ANCESTOR_ALLOWED_ACE_FLAGS: ACE_FLAGS = CONTAINER_INHERIT_ACE
+    | OBJECT_INHERIT_ACE
+    | INHERIT_ONLY_ACE
+    | NO_PROPAGATE_INHERIT_ACE
+    | INHERITED_ACE;
 
 // ----- handle / allocator wrappers -----
 
@@ -278,12 +328,53 @@ pub(crate) fn reject_unsafe_windows_path(abs: &Path) -> AppResult<()> {
 
 // ----- SIDs -----
 
-struct SidBuf(Vec<u8>);
+/// Owned SID bytes in pointer-aligned storage.
+///
+/// SIDs are self-relative byte structures, but Windows SID and
+/// `TOKEN_USER` / `SECURITY_DESCRIPTOR` APIs assume at least pointer
+/// alignment. Every SID backing (current user / well-known / TrustedInstaller)
+/// uses this allocation so `as_psid()` is always aligned and owned — no
+/// borrowed pointer escapes, no unaligned `Vec<u8>` casts. API byte lengths
+/// passed to `CopySid` / `CreateWellKnownSid` / `GetTokenInformation` stay
+/// exact and bounded.
+struct SidBuf {
+    /// Pointer-aligned backing store (`u64` words).
+    storage: Vec<u64>,
+}
 
 impl SidBuf {
-    fn as_psid(&self) -> PSID {
-        self.0.as_ptr() as PSID
+    /// Aligned storage able to hold `bytes` (rounded up to `u64` words).
+    fn alloc_bytes(bytes: usize) -> Self {
+        let words = bytes.div_ceil(std::mem::size_of::<u64>());
+        Self {
+            storage: vec![0u64; words],
+        }
     }
+
+    fn as_psid(&self) -> PSID {
+        self.storage.as_ptr() as PSID
+    }
+
+    fn as_mut_psid(&mut self) -> PSID {
+        self.storage.as_mut_ptr() as PSID
+    }
+}
+
+/// Exact `CopySid` into a fresh pointer-aligned owned buffer.
+fn copy_sid_owned(src: PSID) -> AppResult<SidBuf> {
+    if src.is_null() {
+        return Err(AppError::internal("CopySid source SID is null"));
+    }
+    let len = unsafe { GetLengthSid(src) } as usize;
+    if len == 0 || len > 68 {
+        return Err(AppError::internal("SID length invalid"));
+    }
+    let mut out = SidBuf::alloc_bytes(len);
+    let ok = unsafe { CopySid(len as u32, out.as_mut_psid(), src) };
+    if ok == 0 {
+        return Err(last_err("CopySid"));
+    }
+    Ok(out)
 }
 
 fn current_user_sid() -> AppResult<SidBuf> {
@@ -300,12 +391,13 @@ fn current_user_sid() -> AppResult<SidBuf> {
     if needed == 0 {
         return Err(last_err("GetTokenInformation(TokenUser) size"));
     }
-    let mut buf = vec![0u8; needed as usize];
+    // TOKEN_USER contains a PSID — the query buffer must be pointer-aligned.
+    let mut buf = SidBuf::alloc_bytes(needed as usize);
     let ok = unsafe {
         GetTokenInformation(
             token.get(),
             TokenUser,
-            buf.as_mut_ptr() as _,
+            buf.as_mut_psid() as _,
             needed,
             &mut needed,
         )
@@ -313,39 +405,34 @@ fn current_user_sid() -> AppResult<SidBuf> {
     if ok == 0 {
         return Err(last_err("GetTokenInformation(TokenUser)"));
     }
-    let user = buf.as_ptr() as *const TOKEN_USER;
+    if (needed as usize) > buf.storage.len() * std::mem::size_of::<u64>() {
+        return Err(AppError::internal(
+            "GetTokenInformation(TokenUser) exceeded aligned allocation",
+        ));
+    }
+    let user = buf.as_psid() as *const TOKEN_USER;
     let sid = unsafe { (*user).User.Sid };
     if sid.is_null() {
         return Err(AppError::internal("token user SID is null"));
     }
-    let len = unsafe { GetLengthSid(sid) } as usize;
-    if len == 0 || len > 68 {
-        return Err(AppError::internal("token user SID length invalid"));
-    }
-    let mut out = vec![0u8; len];
-    let ok = unsafe { CopySid(len as u32, out.as_mut_ptr() as PSID, sid) };
-    if ok == 0 {
-        return Err(last_err("CopySid(token user)"));
-    }
-    Ok(SidBuf(out))
+    copy_sid_owned(sid)
 }
 
 fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> AppResult<SidBuf> {
-    let mut buf = vec![0u8; 68];
-    let mut size = buf.len() as u32;
-    let ok = unsafe {
-        CreateWellKnownSid(
-            kind,
-            std::ptr::null_mut(),
-            buf.as_mut_ptr() as PSID,
-            &mut size,
-        )
-    };
+    // 68 is the documented CreateWellKnownSid maximum; exact `size` is
+    // checked and the aligned allocation is retained as the owned backing.
+    const MAX_SID_BYTES: usize = 68;
+    let mut buf = SidBuf::alloc_bytes(MAX_SID_BYTES);
+    let mut size = MAX_SID_BYTES as u32;
+    let ok =
+        unsafe { CreateWellKnownSid(kind, std::ptr::null_mut(), buf.as_mut_psid(), &mut size) };
     if ok == 0 {
         return Err(last_err("CreateWellKnownSid"));
     }
-    buf.truncate(size as usize);
-    Ok(SidBuf(buf))
+    if size == 0 || size as usize > MAX_SID_BYTES {
+        return Err(AppError::internal("CreateWellKnownSid length invalid"));
+    }
+    Ok(buf)
 }
 
 fn sid_eq(a: PSID, b: PSID) -> bool {
@@ -355,11 +442,40 @@ fn sid_eq(a: PSID, b: PSID) -> bool {
     unsafe { EqualSid(a, b) != 0 }
 }
 
-/// Current user / SYSTEM / Administrators.
+/// Exact TrustedInstaller service SID from the maintained literal string.
+///
+/// Native parse + owned pointer-aligned copy (`ConvertStringSidToSidW` →
+/// `CopySid`). The temporary LocalAlloc SID is freed immediately; the
+/// returned `SidBuf` is the only backing store callers hold.
+fn trusted_installer_sid() -> AppResult<SidBuf> {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    // PCWSTR — no mutation required.
+    let wide: Vec<u16> = TRUSTED_INSTALLER_SERVICE_SID
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut raw: PSID = std::ptr::null_mut();
+    let ok = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut raw) };
+    if ok == 0 {
+        return Err(last_err("ConvertStringSidToSidW(TrustedInstaller)"));
+    }
+    if raw.is_null() {
+        return Err(AppError::internal(
+            "ConvertStringSidToSidW(TrustedInstaller) returned null SID",
+        ));
+    }
+    let raw = LocalFreePtr(raw as windows_sys::Win32::Foundation::HLOCAL);
+    copy_sid_owned(raw.0 as PSID)
+}
+
+/// Current user / SYSTEM / Administrators (+ TrustedInstaller for ancestor
+/// **owner** only).
 struct AllowSids {
     user: SidBuf,
     system: SidBuf,
     admins: SidBuf,
+    /// Ancestor owner only — never product owner, never product DACL ACE.
+    trusted_installer: SidBuf,
 }
 
 impl AllowSids {
@@ -368,9 +484,11 @@ impl AllowSids {
             user: current_user_sid()?,
             system: well_known_sid(WinLocalSystemSid)?,
             admins: well_known_sid(WinBuiltinAdministratorsSid)?,
+            trusted_installer: trusted_installer_sid()?,
         })
     }
 
+    /// Product DACL / product owner allowlist. TrustedInstaller is absent.
     fn contains(&self, sid: PSID) -> bool {
         sid_eq(sid, self.user.as_psid())
             || sid_eq(sid, self.system.as_psid())
@@ -379,6 +497,11 @@ impl AllowSids {
 
     fn is_user(&self, sid: PSID) -> bool {
         sid_eq(sid, self.user.as_psid())
+    }
+
+    /// Ancestor owner set: trusted principals plus exact TrustedInstaller.
+    fn is_trusted_ancestor_owner(&self, sid: PSID) -> bool {
+        self.contains(sid) || sid_eq(sid, self.trusted_installer.as_psid())
     }
 }
 
@@ -663,17 +786,22 @@ pub(crate) fn verify_product_dir_on_handle(handle: HANDLE) -> AppResult<()> {
 
 /// Ancestor namespace-integrity policy on a held directory handle.
 ///
-/// Owner must be current user / SYSTEM / Administrators. Unknown principals
-/// may hold read/traverse only — never name mutation, delete-child, write-DACL,
-/// write-owner, or delete. Object/callback/unknown ACE types and NULL DACL fail
+/// Owner must be current user / SYSTEM / Administrators / exact
+/// TrustedInstaller service SID (ancestor owner only). Unknown principals
+/// may hold existing read/traverse plus FILE_ADD_SUBDIRECTORY (create-new
+/// subdirectory) — never file-add/write-data, delete-child, write-DACL,
+/// write-owner, or delete. INHERIT_ONLY ACEs grant nothing on this object:
+/// type/flags are validated, then the current-directory mask is ignored
+/// (children are independently verified; product creates use a protected SD).
+/// Object/callback/unknown ACE types, unknown ACE flags, and NULL DACL fail
 /// closed. Inherited ACEs are allowed when their SID/mask still satisfy this
 /// policy (inheritance is not a trust root; every ACE is checked).
 pub(crate) fn verify_ancestor_namespace_integrity(handle: HANDLE) -> AppResult<()> {
     let allow = AllowSids::current()?;
     let (owner, dacl, _sd) = fetch_owner_and_dacl(handle)?;
-    if owner.is_null() || !allow.contains(owner) {
+    if owner.is_null() || !allow.is_trusted_ancestor_owner(owner) {
         return Err(AppError::bad_request(
-            "path ancestor is not owned by the current principal/SYSTEM/Administrators; \
+            "path ancestor is not owned by the current principal/SYSTEM/Administrators/TrustedInstaller; \
              refusing private store",
         ));
     }
@@ -694,20 +822,31 @@ pub(crate) fn verify_ancestor_namespace_integrity(handle: HANDLE) -> AppResult<(
         }
         let header = unsafe { &*(ace_ptr as *const ACE_HEADER) };
         reject_unsupported_ace_type(header.AceType)?;
+        let ace_flags: ACE_FLAGS = header.AceFlags as ACE_FLAGS;
+        if ace_flags & !ANCESTOR_ALLOWED_ACE_FLAGS != 0 {
+            return Err(AppError::bad_request(
+                "path ancestor ACCESS_ALLOWED ACE has unsupported flags; refusing private store",
+            ));
+        }
         if header.AceType as u32 == ACCESS_DENIED_ACE_TYPE {
             continue;
         }
-        // INHERIT_ONLY does not grant access on this directory itself, but it
-        // propagates to children — check the principal and mutation mask.
+        // INHERIT_ONLY grants nothing on this directory. Children are opened
+        // relative a retained parent handle no-follow and independently
+        // verified; created product SDs are protected so this ACE never
+        // propagates into product. Ignore the current-directory mask.
+        if ace_flags & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
         let sid = ace_sid(ace_ptr);
         if allow.contains(sid) {
             continue;
         }
         let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
-        if ace.Mask & NAMESPACE_MUTATION_RIGHTS != 0 {
+        if ace.Mask & !ANCESTOR_UNKNOWN_ALLOWED_RIGHTS != 0 {
             return Err(AppError::bad_request(
                 "path ancestor grants name-mutation/delete-child/write-DACL/write-owner \
-                 to a principal outside the trusted owner/SYSTEM/Administrators set; \
+                 or file-add/write-data to a principal outside the trusted owner/SYSTEM/Administrators set; \
                  refusing private store",
             ));
         }
@@ -761,6 +900,13 @@ impl OpenRights {
     }
 }
 
+/// Open `name` relative a retained parent handle (NT `RootDirectory`).
+///
+/// The parent handle keeps its object identity across ancestor renames; the
+/// walk never re-resolves from a path string after a child is held. Create is
+/// `FILE_CREATE` (exclusive, no overwrite); existing opens are `FILE_OPEN`.
+/// `FILE_OPEN_REPARSE_POINT` is always set so junction/symlink components are
+/// opened as the reparse object and then refused.
 fn open_relative(
     parent: HANDLE,
     name: &std::ffi::OsStr,
@@ -1324,7 +1470,9 @@ mod tests {
     use windows_sys::Win32::Security::{
         WinBuiltinUsersSid, WinWorldSid, PROTECTED_DACL_SECURITY_INFORMATION,
     };
-    use windows_sys::Win32::Storage::FileSystem::FILE_TRAVERSE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+    };
 
     #[test]
     fn nt_and_win32_path_aliases_are_refused_before_io() {
@@ -1349,6 +1497,27 @@ mod tests {
         (dir, path)
     }
 
+    /// Aligned SD + ACL scratch for `SetNamedSecurityInfoW` test helpers.
+    ///
+    /// Absolute `SECURITY_DESCRIPTOR` requires pointer alignment; a `Vec<u8>`
+    /// is only byte-aligned. Returns (storage, sd_ptr, acl_ptr).
+    fn aligned_sd_acl(
+        acl_len: usize,
+    ) -> (
+        Vec<u64>,
+        *mut SECURITY_DESCRIPTOR,
+        *mut windows_sys::Win32::Security::ACL,
+    ) {
+        let sd_size = std::mem::size_of::<SECURITY_DESCRIPTOR>();
+        let total = sd_size + acl_len;
+        let words = total.div_ceil(std::mem::size_of::<u64>());
+        let mut storage = vec![0u64; words];
+        let sd_ptr = storage.as_mut_ptr() as *mut SECURITY_DESCRIPTOR;
+        let acl_ptr =
+            unsafe { (sd_ptr as *mut u8).add(sd_size) } as *mut windows_sys::Win32::Security::ACL;
+        (storage, sd_ptr, acl_ptr)
+    }
+
     /// Build a DACL on `dir` that grants `everyone` the given mask (plus a
     /// user full-control ACE so the test can still create children).
     fn grant_everyone(dir: &Path, mask: u32) {
@@ -1359,14 +1528,8 @@ mod tests {
         let adm = well_known_sid(WinBuiltinAdministratorsSid).expect("admins sid");
 
         let acl_len = 256usize;
-        let mut sd_buf = vec![0u8; std::mem::size_of::<SECURITY_DESCRIPTOR>() + acl_len];
-        let sd_ptr = sd_buf.as_mut_ptr() as *mut SECURITY_DESCRIPTOR;
+        let (_storage, sd_ptr, acl_ptr) = aligned_sd_acl(acl_len);
         let sd_ps: PSECURITY_DESCRIPTOR = sd_ptr as PSECURITY_DESCRIPTOR;
-        let acl_ptr = unsafe {
-            sd_buf
-                .as_mut_ptr()
-                .add(std::mem::size_of::<SECURITY_DESCRIPTOR>())
-        } as *mut windows_sys::Win32::Security::ACL;
         unsafe {
             assert!(InitializeSecurityDescriptor(sd_ps, 1) != 0);
             assert!(InitializeAcl(acl_ptr, acl_len as u32, ACL_REVISION) != 0);
@@ -1557,14 +1720,8 @@ mod tests {
     fn add_ace(path: &Path, sid: PSID, mask: u32, ace_flags: ACE_FLAGS) {
         use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
         let acl_len = 256usize;
-        let mut sd_buf = vec![0u8; std::mem::size_of::<SECURITY_DESCRIPTOR>() + acl_len];
-        let sd_ptr = sd_buf.as_mut_ptr() as *mut SECURITY_DESCRIPTOR;
+        let (_storage, sd_ptr, acl_ptr) = aligned_sd_acl(acl_len);
         let sd_ps: PSECURITY_DESCRIPTOR = sd_ptr as PSECURITY_DESCRIPTOR;
-        let acl_ptr = unsafe {
-            sd_buf
-                .as_mut_ptr()
-                .add(std::mem::size_of::<SECURITY_DESCRIPTOR>())
-        } as *mut windows_sys::Win32::Security::ACL;
         unsafe {
             assert!(InitializeSecurityDescriptor(sd_ps, 1) != 0);
             assert!(InitializeAcl(acl_ptr, acl_len as u32, ACL_REVISION) != 0);
@@ -1740,14 +1897,8 @@ mod tests {
         let sys = well_known_sid(WinLocalSystemSid).expect("sys");
         let adm = well_known_sid(WinBuiltinAdministratorsSid).expect("adm");
         let acl_len = 256usize;
-        let mut sd_buf = vec![0u8; std::mem::size_of::<SECURITY_DESCRIPTOR>() + acl_len];
-        let sd_ptr = sd_buf.as_mut_ptr() as *mut SECURITY_DESCRIPTOR;
+        let (_storage, sd_ptr, acl_ptr) = aligned_sd_acl(acl_len);
         let sd_ps: PSECURITY_DESCRIPTOR = sd_ptr as PSECURITY_DESCRIPTOR;
-        let acl_ptr = unsafe {
-            sd_buf
-                .as_mut_ptr()
-                .add(std::mem::size_of::<SECURITY_DESCRIPTOR>())
-        } as *mut windows_sys::Win32::Security::ACL;
         unsafe {
             assert!(InitializeSecurityDescriptor(sd_ps, 1) != 0);
             assert!(InitializeAcl(acl_ptr, acl_len as u32, ACL_REVISION) != 0);
@@ -1879,5 +2030,439 @@ mod tests {
             err.to_string().contains("symlink") || err.to_string().contains("reparse"),
             "err={err}"
         );
+    }
+
+    // Only owned fixtures need foreign-owner assignment. Use a thread token;
+    // never enable SeRestorePrivilege on the process shared by parallel tests.
+    struct RestorePrivilegeScope {
+        previous: Option<OwnedHandle>,
+        _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for RestorePrivilegeScope {
+        fn drop(&mut self) {
+            use windows_sys::Win32::Security::RevertToSelf;
+            use windows_sys::Win32::System::Threading::SetThreadToken;
+            let ok = unsafe {
+                match &self.previous {
+                    Some(token) => SetThreadToken(std::ptr::null(), token.get()),
+                    None => RevertToSelf(),
+                }
+            };
+            // Test-only fatal cleanup failure: continuing would leak elevated
+            // thread context into a later test, including during unwinding.
+            if ok == 0 {
+                std::process::abort();
+            }
+        }
+    }
+
+    fn enable_restore_privilege() -> RestorePrivilegeScope {
+        use windows_sys::Win32::Foundation::{ERROR_NO_TOKEN, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, ImpersonateSelf, LookupPrivilegeValueW, SecurityImpersonation,
+            LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_IMPERSONATE,
+            TOKEN_PRIVILEGES,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        let mut previous: HANDLE = std::ptr::null_mut();
+        let opened = unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_QUERY | TOKEN_IMPERSONATE,
+                1,
+                &mut previous,
+            )
+        };
+        let previous = if opened != 0 {
+            Some(OwnedHandle::from_raw(previous).expect("previous thread token"))
+        } else {
+            assert_eq!(
+                unsafe { GetLastError() },
+                ERROR_NO_TOKEN,
+                "query previous thread token"
+            );
+            None
+        };
+        assert!(
+            unsafe { ImpersonateSelf(SecurityImpersonation) } != 0,
+            "ImpersonateSelf"
+        );
+        // Construct immediately: all subsequent assertion failures unwind back
+        // to the exact previous thread context.
+        let scope = RestorePrivilegeScope {
+            previous,
+            _same_thread: std::marker::PhantomData,
+        };
+        let mut token: HANDLE = std::ptr::null_mut();
+        assert!(
+            unsafe {
+                OpenThreadToken(
+                    GetCurrentThread(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                    1,
+                    &mut token,
+                )
+            } != 0,
+            "OpenThreadToken for SeRestorePrivilege"
+        );
+        let token = OwnedHandle::from_raw(token).expect("thread token handle");
+        let mut luid = unsafe { std::mem::zeroed::<windows_sys::Win32::Foundation::LUID>() };
+        let name: Vec<u16> = "SeRestorePrivilege"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert!(
+            unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) } != 0,
+            "LookupPrivilegeValueW SeRestorePrivilege"
+        );
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let ok = unsafe {
+            AdjustTokenPrivileges(
+                token.get(),
+                0,
+                &tp,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let error = unsafe { GetLastError() };
+        assert!(ok != 0, "AdjustTokenPrivileges SeRestorePrivilege");
+        assert_eq!(
+            error, ERROR_SUCCESS,
+            "SeRestorePrivilege must actually be assigned"
+        );
+        scope
+    }
+
+    #[test]
+    fn restore_fixture_privilege_does_not_escape_unwind() {
+        use windows_sys::Win32::Foundation::ERROR_NO_TOKEN;
+        use windows_sys::Win32::Security::{
+            TokenPrivileges, TokenStatistics, TOKEN_INFORMATION_CLASS,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+        fn token_bytes(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Vec<u8> {
+            let mut needed = 0;
+            unsafe {
+                GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut needed);
+            }
+            assert!(needed > 0 && needed <= 65_536, "bounded token metadata");
+            let mut storage = vec![0u64; (needed as usize).div_ceil(8)];
+            assert!(
+                unsafe {
+                    GetTokenInformation(
+                        token,
+                        class,
+                        storage.as_mut_ptr().cast(),
+                        needed,
+                        &mut needed,
+                    )
+                } != 0,
+                "query token metadata"
+            );
+            assert!(needed as usize <= storage.len() * 8);
+            unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), needed as usize) }
+                .to_vec()
+        }
+
+        fn thread_metadata() -> Option<Vec<u8>> {
+            let mut handle = std::ptr::null_mut();
+            if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut handle) } == 0 {
+                assert_eq!(unsafe { GetLastError() }, ERROR_NO_TOKEN);
+                None
+            } else {
+                let token = OwnedHandle::from_raw(handle).expect("thread token");
+                Some(token_bytes(token.get(), TokenStatistics))
+            }
+        }
+
+        let mut handle = std::ptr::null_mut();
+        assert!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) } != 0);
+        let process = OwnedHandle::from_raw(handle).expect("process token");
+        let before_process = token_bytes(process.get(), TokenPrivileges);
+        let before_thread = thread_metadata();
+        let result = std::panic::catch_unwind(|| {
+            let _scope = enable_restore_privilege();
+            assert!(
+                thread_metadata().is_some(),
+                "fixture must impersonate on this thread"
+            );
+            panic!("deliberate fixture unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            thread_metadata(),
+            before_thread,
+            "restore the previous thread context"
+        );
+        assert_eq!(
+            token_bytes(process.get(), TokenPrivileges),
+            before_process,
+            "parallel tests must retain unchanged process privileges"
+        );
+    }
+
+    /// Set the object owner to `sid` (SeRestorePrivilege for non-self owners).
+    fn set_owner(path: &Path, sid: PSID) {
+        use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                sid,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "SetNamedSecurityInfoW owner rc={rc}");
+    }
+
+    /// Exact TrustedInstaller SID parses and is accepted as ancestor owner.
+    #[test]
+    fn trusted_installer_owner_on_ancestor_is_allowed() {
+        let _privilege = enable_restore_privilege();
+        let ti = trusted_installer_sid().expect("trusted installer sid");
+        assert!(!ti.as_psid().is_null());
+        let (_dir, base) = tmpdir();
+        let mid = base.join("ti-ancestor");
+        std::fs::create_dir(&mid).expect("ti-ancestor dir");
+        set_owner(&mid, ti.as_psid());
+        create_new_private_file(&mid.join("recovery.txt"), b"OK")
+            .expect("TrustedInstaller ancestor owner must allow private create");
+        assert!(mid.join("recovery.txt").exists());
+    }
+
+    /// TrustedInstaller is not a product-dir owner (final store stays
+    /// current-principal owned).
+    #[test]
+    fn trusted_installer_owner_on_product_dir_is_refused() {
+        let _privilege = enable_restore_privilege();
+        let ti = trusted_installer_sid().expect("trusted installer sid");
+        let (_dir, base) = tmpdir();
+        let dir = base.join("store");
+        ensure_private_store_dir(&dir).expect("store dir");
+        set_owner(&dir, ti.as_psid());
+        let err = ensure_private_store_dir(&dir)
+            .expect_err("product dir owner must remain current principal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("owned by the current process principal")
+                || msg.contains("refusing credential store"),
+            "msg={msg}"
+        );
+    }
+
+    /// TrustedInstaller is never a product DACL allowlist principal.
+    #[test]
+    fn trusted_installer_dac_on_product_file_is_refused() {
+        let ti = trusted_installer_sid().expect("trusted installer sid");
+        let (_dir, base) = tmpdir();
+        let dir = base.join("store");
+        ensure_private_store_dir(&dir).expect("store dir");
+        let db = dir.join("hs-server.db");
+        create_private_store_file(&db).expect("create");
+        add_ace(&db, ti.as_psid(), 0x001F_01FF, 0);
+        let err = verify_private_store_file(&db)
+            .expect_err("TrustedInstaller product DACL ACE must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allowlist") || msg.contains("refusing"),
+            "msg={msg}"
+        );
+    }
+
+    /// Unknown read/traverse + FILE_ADD_SUBDIRECTORY on an ancestor is allowed
+    /// (create-new subdirectory only; observed normal Temp root grant).
+    #[test]
+    fn foreign_sid_add_subdirectory_on_ancestor_is_allowed() {
+        let (_dir, base) = tmpdir();
+        let ok_dir = base.join("listed");
+        std::fs::create_dir(&ok_dir).expect("listed dir");
+        grant_everyone(
+            &ok_dir,
+            FILE_ADD_SUBDIRECTORY
+                | FILE_LIST_DIRECTORY
+                | FILE_TRAVERSE
+                | FILE_READ_ATTRIBUTES
+                | READ_CONTROL
+                | SYNCHRONIZE,
+        );
+        create_new_private_file(&ok_dir.join("recovery.txt"), b"OK")
+            .expect("FILE_ADD_SUBDIRECTORY ancestor must allow private create");
+        assert!(ok_dir.join("recovery.txt").exists());
+    }
+
+    /// FILE_ADD_FILE / FILE_WRITE_DATA (bit 0x2) on an ancestor is refused.
+    #[test]
+    fn foreign_sid_add_file_on_ancestor_is_denied() {
+        let (_dir, base) = tmpdir();
+        let hostile = base.join("hostile");
+        std::fs::create_dir(&hostile).expect("hostile dir");
+        grant_everyone(
+            &hostile,
+            FILE_ADD_FILE | FILE_LIST_DIRECTORY | FILE_TRAVERSE | SYNCHRONIZE,
+        );
+        let target = hostile.join("recovery.txt");
+        let err = create_new_private_file(&target, b"SECRET")
+            .expect_err("FILE_ADD_FILE on ancestor must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("file-add/write-data")
+                || msg.contains("name-mutation")
+                || msg.contains("refusing private store")
+                || msg.contains("path ancestor"),
+            "msg={msg}"
+        );
+        assert!(!target.exists(), "no insecure fallback create");
+        assert!(!msg.contains("SECRET"), "no secret in error");
+    }
+
+    /// FILE_WRITE_DATA (same bit 0x2 as FILE_ADD_FILE) on an ancestor is refused.
+    #[test]
+    fn foreign_sid_write_data_on_ancestor_is_denied() {
+        let (_dir, base) = tmpdir();
+        let hostile = base.join("hostile");
+        std::fs::create_dir(&hostile).expect("hostile dir");
+        grant_everyone(
+            &hostile,
+            FILE_WRITE_DATA | FILE_LIST_DIRECTORY | FILE_TRAVERSE | SYNCHRONIZE,
+        );
+        let err = create_new_private_file(&hostile.join("r.txt"), b"SECRET")
+            .expect_err("FILE_WRITE_DATA on ancestor must refuse");
+        assert!(
+            err.to_string().contains("file-add/write-data")
+                || err.to_string().contains("refusing private store")
+                || err.to_string().contains("path ancestor"),
+            "err={err}"
+        );
+        assert!(!hostile.join("r.txt").exists());
+    }
+
+    /// GENERIC_WRITE on an ancestor is refused.
+    #[test]
+    fn foreign_sid_generic_write_on_ancestor_is_denied() {
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        let (_dir, base) = tmpdir();
+        let hostile = base.join("hostile");
+        std::fs::create_dir(&hostile).expect("hostile dir");
+        grant_everyone(
+            &hostile,
+            GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+        );
+        let err = create_new_private_file(&hostile.join("r.txt"), b"SECRET")
+            .expect_err("GENERIC_WRITE on ancestor must refuse");
+        assert!(
+            err.to_string().contains("file-add/write-data")
+                || err.to_string().contains("refusing private store")
+                || err.to_string().contains("path ancestor"),
+            "err={err}"
+        );
+        assert!(!hostile.join("r.txt").exists());
+    }
+
+    /// WRITE_OWNER / write-attributes / write-EA on an ancestor are refused.
+    #[test]
+    fn foreign_sid_write_owner_attrs_ea_on_ancestor_is_denied() {
+        for mask in [
+            WRITE_OWNER | FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+            FILE_WRITE_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+            FILE_WRITE_EA | FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+        ] {
+            let (_dir, base) = tmpdir();
+            let hostile = base.join("hostile");
+            std::fs::create_dir(&hostile).expect("hostile dir");
+            grant_everyone(&hostile, mask);
+            let err = create_new_private_file(&hostile.join("r.txt"), b"SECRET")
+                .expect_err("write-owner/attrs/EA on ancestor must refuse");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("file-add/write-data")
+                    || msg.contains("refusing private store")
+                    || msg.contains("path ancestor"),
+                "mask=0x{mask:08X} msg={msg}"
+            );
+            assert!(!hostile.join("r.txt").exists());
+        }
+    }
+
+    /// INHERIT_ONLY on an ancestor grants nothing on that object: unknown
+    /// current-write-looking masks are ignored after type/flags validation.
+    #[test]
+    fn ancestor_inherit_only_unknown_mutation_is_ignored() {
+        use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+        let (_dir, base) = tmpdir();
+        let ok_dir = base.join("listed");
+        std::fs::create_dir(&ok_dir).expect("listed dir");
+        let everyone = well_known_sid(WinWorldSid).expect("world");
+        add_ace(
+            &ok_dir,
+            everyone.as_psid(),
+            GENERIC_ALL | GENERIC_WRITE | FILE_ADD_FILE | FILE_WRITE_DATA | FILE_DELETE_CHILD,
+            INHERIT_ONLY_ACE | CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        );
+        create_new_private_file(&ok_dir.join("recovery.txt"), b"OK")
+            .expect("ancestor INHERIT_ONLY must not grant current-directory mutation");
+        assert!(ok_dir.join("recovery.txt").exists());
+    }
+
+    /// Same unknown INHERIT_ONLY on a product directory is still refused
+    /// (SQLite children would inherit).
+    #[test]
+    fn product_dir_inherit_only_unknown_still_denied() {
+        use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+        let (_dir, base) = tmpdir();
+        let dir = base.join("store");
+        ensure_private_store_dir(&dir).expect("store dir");
+        let everyone = well_known_sid(WinWorldSid).expect("world");
+        add_ace(
+            &dir,
+            everyone.as_psid(),
+            GENERIC_ALL | GENERIC_WRITE | FILE_ADD_FILE | FILE_WRITE_DATA,
+            INHERIT_ONLY_ACE | CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        );
+        let err = ensure_private_store_dir(&dir)
+            .expect_err("product dir unknown INHERIT_ONLY must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allowlist") || msg.contains("refusing"),
+            "msg={msg}"
+        );
+    }
+
+    /// Unknown preexisting final name cannot be overwritten, re-ACL'd, or
+    /// receive a secret write.
+    #[test]
+    fn unknown_preexisting_final_is_not_overwritten_or_reacled() {
+        let (_dir, base) = tmpdir();
+        let path = base.join("recovery.txt");
+        std::fs::write(&path, b"PREEXISTING").expect("seed preexisting");
+        let users = well_known_sid(WinBuiltinUsersSid).expect("users");
+        add_ace(&path, users.as_psid(), 0x001F_01FF, 0);
+        let err = create_new_private_file(&path, b"SECRET")
+            .expect_err("preexisting final name must not be overwritten");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already exists") || msg.contains("create_new_only"),
+            "msg={msg}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read unchanged"),
+            b"PREEXISTING",
+            "no secret write over preexisting final"
+        );
+        assert!(!msg.contains("SECRET"), "no secret in error");
     }
 }
