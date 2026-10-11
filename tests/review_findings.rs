@@ -831,7 +831,10 @@ fn windows_open_refuses_preexisting_mfa_rows() {
         )
         .expect("seed mfa");
     }
-    let err = db::open(&path).expect_err("must refuse pre-existing MFA rows");
+    let err = match db::open(&path) {
+        Err(err) => err,
+        Ok(_) => panic!("must refuse pre-existing MFA rows"),
+    };
     let msg = err.to_string();
     assert!(
         msg.contains("persisted MFA") || msg.contains("preexisting_mfa"),
