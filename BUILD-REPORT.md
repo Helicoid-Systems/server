@@ -17,7 +17,7 @@ authority, production manager keys/signing, endpoint admission, native
 installed proofs, configured operator MFA policy, media/control/file jobs,
 security delegation/reset, real multi-process soak.
 
-The coordinator reproduced 202 macOS tests, format/clippy, and all 21 native
+The coordinator reproduced 208 macOS tests, format/clippy, and all 21 native
 client loopback checks. Backup output is now created privately before SQLite
 writes its consistent snapshot; the existing migration regression exercises
 the supported empty-file VACUUM output. Native Linux/Windows acceptance is
@@ -35,9 +35,29 @@ scripts/live-integration.sh /tmp/hs-build/server-target/debug/hs-server
 | Command | Result |
 | --- | --- |
 | `cargo fmt -- --check` | **clean** |
-| `cargo test --locked` | **202 passed, 0 failed** on macOS (61 lib + 24 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter + 12 installer_review + 20 review_findings) |
+| `cargo test --locked` | **208 passed, 0 failed** on macOS (61 lib + 24 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter + 12 installer_review + 6 mfa_legacy_boundary + 20 review_findings) |
 | `cargo clippy --locked --all-targets -- -D warnings` | **clean** |
 | 21 client loopback checks | **21/21 passed** (dotnet ClientProof + swift ClientProof) |
+
+### Additional coordinator review (2026-10-11)
+
+The coordinator reproduced a legacy login bypass after genuine v2 TOTP
+enrollment. MiMo V2.6 Pro repaired the shared `Service::login` boundary: MFA
+factors and pending enrollment deny password-only session minting, including
+HTTP and CLI callers. The final IMMEDIATE transaction also rechecks account
+state, the verified password-hash snapshot and manager approval before insert.
+Six regressions cover enrolled/pending/recovery MFA, approved manager identity,
+mounted HTTP refusal without a token/session row and preserved legacy development
+login for accounts without an MFA requirement. The coordinator tightened HTTP
+status to 403 and required successful cleanup in the legacy success fixture.
+No deterministic mid-call login race hook was introduced; transaction placement
+was reviewed, while real multi-process authority integration remains unverified.
+
+Native Windows migration fixtures now exercise the implemented refusal, keeping
+v1/current stores byte-identical with no backup directory or sidecars. Unix
+private migration success still runs. The coordinator replaced ignored sidecar
+cleanup in the seed fixture with assertions that none were created. Native
+Linux/Windows CI must pass before the integration pin moves.
 
 ### Portability / pre-open boundary findings (2026-10-11)
 

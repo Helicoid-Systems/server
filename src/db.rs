@@ -994,13 +994,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn migrate_takes_backup_and_upgrades() {
-        let (_dir, base) = real_tempdir();
-        let path = base.join("v1.db");
-        let backup_dir = base.join("backups");
+    /// Seed a full v1-schema database file and leave it as a clean single file.
+    fn seed_v1_schema_file(path: &Path) {
         {
-            let conn = Connection::open(&path).expect("open");
+            let conn = Connection::open(path).expect("open");
             conn.execute_batch(
                 "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL);
                  INSERT INTO schema_meta (id, schema_version) VALUES (1, 1);
@@ -1063,7 +1060,37 @@ mod tests {
             )
             .expect("seed v1");
         }
-        force_private_mode(&path);
+        force_private_mode(path);
+        assert_no_sqlite_sidecars(path);
+    }
+
+    /// Seed a current-schema database file and leave it as a clean single file.
+    fn seed_current_schema_file(path: &Path) {
+        {
+            let conn = Connection::open(path).expect("open");
+            ensure_schema(&conn).expect("install");
+        }
+        force_private_mode(path);
+        assert_no_sqlite_sidecars(path);
+    }
+
+    fn assert_no_sqlite_sidecars(db_path: &Path) {
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            assert!(
+                !sidecar_path(db_path, suffix).exists(),
+                "sidecar {suffix} must not be created"
+            );
+        }
+    }
+
+    /// Unix: verified private store allows explicit migrate with a backup.
+    #[cfg(unix)]
+    #[test]
+    fn migrate_takes_backup_and_upgrades() {
+        let (_dir, base) = real_tempdir();
+        let path = base.join("v1.db");
+        let backup_dir = base.join("backups");
+        seed_v1_schema_file(&path);
 
         let report = migrate(&path, &backup_dir).expect("migrate");
         assert_eq!(report.from_version, 1);
@@ -1086,20 +1113,84 @@ mod tests {
         assert_eq!(state, "active");
     }
 
+    /// Unix: already-current store is refused without a second migration.
+    #[cfg(unix)]
     #[test]
     fn migrate_is_idempotent_refusal_when_current() {
         let (_dir, base) = real_tempdir();
         let path = base.join("current.db");
-        {
-            let conn = Connection::open(&path).expect("open");
-            ensure_schema(&conn).expect("install");
-        }
-        force_private_mode(&path);
+        seed_current_schema_file(&path);
         let err = match migrate(&path, &base) {
             Ok(_) => panic!("must refuse when already current"),
             Err(err) => err,
         };
         assert!(err.to_string().contains("already"), "err={err}");
+    }
+
+    // ----- Windows: explicit migration denial before any mutation -----
+    //
+    // Production `migrate` refuses before any SQLite open or backup when
+    // native verified private files are unsupported. Denial must leave the
+    // existing store byte-identical and create no backup directory/sidecars.
+
+    #[cfg(windows)]
+    #[test]
+    fn migrate_denies_v1_store_before_mutation_without_private_boundary() {
+        let (_dir, base) = real_tempdir();
+        let path = base.join("v1.db");
+        let backup_dir = base.join("backups");
+        seed_v1_schema_file(&path);
+        let before = std::fs::read(&path).expect("v1 bytes");
+
+        let err = match migrate(&path, &backup_dir) {
+            Ok(_) => panic!("migrate must deny without a verified private store"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.code(),
+            crate::error::ErrorCode::NotImplemented,
+            "err={err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("v1 bytes after"),
+            before,
+            "v1 store must remain byte-identical"
+        );
+        assert!(
+            !backup_dir.exists(),
+            "no backup directory may be created on denial"
+        );
+        assert_no_sqlite_sidecars(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn migrate_denies_current_store_before_mutation_without_private_boundary() {
+        let (_dir, base) = real_tempdir();
+        let path = base.join("current.db");
+        let backup_dir = base.join("backups");
+        seed_current_schema_file(&path);
+        let before = std::fs::read(&path).expect("current bytes");
+
+        let err = match migrate(&path, &backup_dir) {
+            Ok(_) => panic!("migrate must deny without a verified private store"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.code(),
+            crate::error::ErrorCode::NotImplemented,
+            "err={err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("current bytes after"),
+            before,
+            "current store must remain byte-identical"
+        );
+        assert!(
+            !backup_dir.exists(),
+            "no backup directory may be created on denial"
+        );
+        assert_no_sqlite_sidecars(&path);
     }
 
     #[cfg(unix)]

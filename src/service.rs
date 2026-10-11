@@ -484,6 +484,13 @@ impl Service {
         }
         self.clear_login_failures(&req.username);
 
+        // Cheap early refusal when DB already records an MFA requirement.
+        // The final IMMEDIATE transaction rechecks this; enrollment between
+        // here and session insertion cannot mint a password-only session.
+        if self.with_conn(|conn| account_has_mfa_requirement(conn, &account_id))? {
+            return Err(mfa_required_error());
+        }
+
         // Manager binding is a separate approval check (D20).
         let manager_id = if let Some(public_identity) = &req.manager_public_identity {
             let row = self.with_conn(|conn| {
@@ -518,7 +525,49 @@ impl Service {
         let now = now_unix();
         let expires_at = now + SESSION_TTL_SECS;
 
+        // FINAL IMMEDIATE TRANSACTION: recheck account + verified password
+        // hash snapshot + manager approval + DB-owned MFA requirement, then
+        // insert the session. Enrollment/account changes after password
+        // verification cannot bypass the MFA denial.
         self.with_tx(|conn| {
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT password_hash, state FROM accounts WHERE id = ?1",
+                    params![account_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (current_hash, current_state) = match row {
+                Some(row) => row,
+                None => return Err(AppError::unauthorized("invalid credentials")),
+            };
+            if current_state != "active" {
+                return Err(AppError::forbidden("account is disabled"));
+            }
+            // Snapshot must still be the verified hash (password change/reset).
+            if current_hash != password_hash {
+                return Err(AppError::unauthorized("invalid credentials"));
+            }
+            if let Some(manager_id) = &manager_id {
+                let lifecycle: Option<String> = conn
+                    .query_row(
+                        "SELECT lifecycle_state FROM managers WHERE id = ?1",
+                        params![manager_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match lifecycle {
+                    Some(ref state) if state == "approved" => {}
+                    _ => {
+                        return Err(AppError::forbidden(
+                            "manager identity is not approved for this deployment",
+                        ))
+                    }
+                }
+            }
+            if account_has_mfa_requirement(conn, &account_id)? {
+                return Err(mfa_required_error());
+            }
             conn.execute(
                 "INSERT INTO sessions (
                     id, account_id, manager_id, token_hash, created_at, expires_at
@@ -1311,6 +1360,29 @@ pub(crate) fn validate_password(password: &str) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Database-owned MFA requirement for legacy password-only session minting.
+///
+/// True when the account has any persisted MFA factor (`account_mfa`, pending
+/// or active) or an unconsumed MFA enrollment. Callers must refuse v1
+/// password-only login; this is never a client flag.
+fn account_has_mfa_requirement(conn: &Connection, account_id: &str) -> AppResult<bool> {
+    let present: i64 = conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM account_mfa WHERE account_id = ?1
+            UNION ALL
+            SELECT 1 FROM mfa_enrollments
+             WHERE account_id = ?1 AND consumed_at IS NULL
+        )",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    Ok(present != 0)
+}
+
+fn mfa_required_error() -> AppError {
+    AppError::forbidden("multi-factor authentication is required; password-only login is refused")
 }
 
 pub(crate) fn map_unique(err: rusqlite::Error, message: &str) -> AppError {

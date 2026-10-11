@@ -323,9 +323,11 @@ issued.
 | Administrator | **Mandatory MFA.** Challenge login requires active TOTP enrollment. v2 bootstrap creates `pending_mfa` until confirmation + independently stored recovery material. |
 | Configured operator policy (per-account MFA optional/required settings) | **Not implemented** in this foundation — explicitly unavailable. |
 
-Admin MFA is enforced regardless of any legacy local v1 state. v1 loopback
-development login (`/v1/auth/login`) remains for local development only and is
-not a public compatibility bypass.
+MFA-enrolled accounts cannot use v1 password-only login. The final session
+transaction rechecks the database-owned MFA requirement before inserting a
+session. Legacy accounts without MFA still use explicitly loopback-only v1
+development login (`/v1/auth/login`); they do not establish production MFA
+policy or authorize public compatibility access.
 
 ## Unchanged unavailable surfaces
 
