@@ -45,12 +45,12 @@ function Get-KnownSidCatalog {
     $catalog.Add(@{
         Class = 'System'
         Sid = New-KnownSid -WellKnown (
-            [System.Security.Principal.WellKnownSidType]::WinLocalSystemSid)
+            [System.Security.Principal.WellKnownSidType]::LocalSystemSid)
     })
     $catalog.Add(@{
         Class = 'Administrators'
         Sid = New-KnownSid -WellKnown (
-            [System.Security.Principal.WellKnownSidType]::WinBuiltinAdministratorsSid)
+            [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid)
     })
     $catalog.Add(@{
         Class = 'TrustedInstaller'
@@ -59,22 +59,22 @@ function Get-KnownSidCatalog {
     $catalog.Add(@{
         Class = 'Users'
         Sid = New-KnownSid -WellKnown (
-            [System.Security.Principal.WellKnownSidType]::WinBuiltinUsersSid)
+            [System.Security.Principal.WellKnownSidType]::BuiltinUsersSid)
     })
     $catalog.Add(@{
         Class = 'Everyone'
         Sid = New-KnownSid -WellKnown (
-            [System.Security.Principal.WellKnownSidType]::WinWorldSid)
+            [System.Security.Principal.WellKnownSidType]::WorldSid)
     })
     $catalog.Add(@{
         Class = 'AuthenticatedUsers'
         Sid = New-KnownSid -WellKnown (
-            [System.Security.Principal.WellKnownSidType]::WinAuthenticatedUserSid)
+            [System.Security.Principal.WellKnownSidType]::AuthenticatedUserSid)
     })
     $catalog.Add(@{
         Class = 'CreatorOwner'
         Sid = New-KnownSid -WellKnown (
-            [System.Security.Principal.WellKnownSidType]::WinCreatorOwnerSid)
+            [System.Security.Principal.WellKnownSidType]::CreatorOwnerSid)
     })
     return $catalog
 }
@@ -178,6 +178,7 @@ Write-Host 'This diagnostic is not runtime acceptance of any store ACL policy.'
 
 $createdPath = $null
 $diagnosticOk = $false
+$diagnosticStage = 'create-temp'
 try {
     $guidName = [System.Guid]::NewGuid().ToString('N')
     $createdPath = [System.IO.Path]::Combine(
@@ -189,6 +190,7 @@ try {
         throw 'Failed to create disposable GUID temp directory.'
     }
 
+    $diagnosticStage = 'walk-components'
     $components = New-Object 'System.Collections.Generic.List[System.IO.DirectoryInfo]'
     $walk = New-Object System.IO.DirectoryInfo $createdPath
     while ($null -ne $walk) {
@@ -203,8 +205,10 @@ try {
         throw 'Diagnostic produced zero path components.'
     }
 
+    $diagnosticStage = 'sid-catalog'
     $catalog = Get-KnownSidCatalog
     for ($i = 0; $i -lt $components.Count; $i++) {
+        $diagnosticStage = 'component-' + $i
         Write-ComponentMetadata -Index $i -Component $components[$i] -Catalog $catalog
     }
 
@@ -215,7 +219,9 @@ try {
 }
 catch {
     # No native exception text: it may include the runner's account/path.
-    Write-Host 'diagnostic result: failed (metadata unavailable or bounds exceeded).'
+    $errorType = [regex]::Replace($_.Exception.GetType().Name, '[^A-Za-z0-9_]', '')
+    $errorType = $errorType.Substring(0, [Math]::Min(64, $errorType.Length))
+    Write-Host ('diagnostic result: failed stage={0} errorType={1}' -f $diagnosticStage, $errorType)
     $diagnosticOk = $false
 }
 finally {
