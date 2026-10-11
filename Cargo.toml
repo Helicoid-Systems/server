@@ -56,6 +56,14 @@ tempfile = "3"
 tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+] }
+
 [profile.dev]
 # Keep local proof runs responsive; production profile is not a proof gate.
 opt-level = 0

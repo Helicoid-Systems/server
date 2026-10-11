@@ -25,16 +25,29 @@ fn bootstrap_service(service: &Service) {
         .expect("bootstrap");
 }
 
-/// Tempdir forced owner-private (0700) so `db::open` store policy accepts it.
+/// Tempdir whose `base` is store-parent ready: Unix owner-private (0700);
+/// Windows a genuine private product child via `ensure_private_store_dir`
+/// (no silent re-ACL of TempDir or ancestors).
 fn private_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().canonicalize().expect("canonicalize");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
-    (dir, path)
+    #[cfg(windows)]
+    let base = {
+        let child = dir.path().join("hs-store");
+        hs_server::private_file::ensure_private_store_dir(&child)
+            .expect("windows private product child");
+        child
+    };
+    #[cfg(not(windows))]
+    let base = {
+        let path = dir.path().canonicalize().expect("canonicalize");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        path
+    };
+    (dir, base)
 }
 
 // ----- Finding 1: durable latch hydration -----

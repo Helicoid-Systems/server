@@ -1295,14 +1295,25 @@ mod tests {
     /// policy (`tempfile` default is `0755` on some hosts).
     fn tmpdir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().canonicalize().expect("canonicalize");
-        #[cfg(unix)]
+        #[cfg(windows)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                .expect("chmod tmpdir");
+            // Store/recovery tests need a genuine private product child.
+            // Do not re-ACL the TempDir or ancestors.
+            let child = dir.path().join("hs-store");
+            ensure_private_store_dir(&child).expect("windows private product child");
+            (dir, child)
         }
-        (dir, path)
+        #[cfg(not(windows))]
+        {
+            let path = dir.path().canonicalize().expect("canonicalize");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod tmpdir");
+            }
+            (dir, path)
+        }
     }
 
     #[cfg(unix)]
