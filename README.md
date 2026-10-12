@@ -14,7 +14,9 @@ security-state-unavailable behavior.
 
 Repository: https://github.com/Helicoid-Systems/server. Durable release identifiers remain pending.
 
-The Windows private-store repair is awaiting a fresh complete native run. [CI 38246041857](https://github.com/Helicoid-Systems/server/actions/runs/38246041857) at `c939c8f` passed Linux and 72 Windows library tests; one inherit-only ACL fixture on a regular file did not establish that Windows retained the intended ACE. That fixture is repaired test-only: unknown inherit-only SIDs are now proven on a real directory ACL carrier with an explicit `GetAce` precondition and the shared store-file verifier, while the public file-kind guard still refuses directories. Production DACL policy is unchanged. The later [CI 38247883345](https://github.com/Helicoid-Systems/server/actions/runs/38247883345) run passed 74 Windows library tests and reached later CLI tests; its invalid-token fixture had stopped at an empty password and is repaired test-only to pipe an explicit test password on stdin (the CLI reads the password before the token) while keeping the same denial, no-recovery-file and zero-secret assertions. Existing SQLite store files accept current user, SYSTEM or Administrators ownership only with the strict trusted DACL and protected product-parent checks. Recovery/key/material reads, product directories and explicit creates retain current-user ownership. TrustedInstaller and foreign owners remain refused for store files. Main retains accepted server `3a20aa0` until the entire native gate passes. Windows TLS, public listeners, installed services and recovery remain unavailable. Exact acceptance boundaries are recorded in [BUILD-REPORT.md](BUILD-REPORT.md).
+The Windows private-store prerequisite now passes complete [native CI38252656196](https://github.com/Helicoid-Systems/server/actions/runs/38252656196) at code `f01019faa41d484f7ce43bcc0f0559834ad9d10c`: **235 Linux and 226 Windows tests**, strict Clippy, Windows release build and real PowerShell 5.1/7 launcher checks. The coordinator independently passes **242 Mac tests**, verifies the downloaded archive digest and PE x64 executable, and checks all companion scripts against source. [Download the development server bundle](https://github.com/Helicoid-Systems/server/actions/runs/38252656196/artifacts/11748988843).
+
+Existing SQLite store files accept only currentUser/SYSTEM/Administrators ownership together with the strict held DACL/shape/link and protected-parent boundary. New objects, recovery/key reads and product directories remain current-user owned; foreign and TrustedInstaller store owners remain refused. The launcher chooses a missing path and lets the server create its protected folder. Windows TLS, public authentication/listeners, installed services, recovery cutover and signing remain unavailable. This is a native private-store/MFA/CLI prerequisite, not a completed deployment or worker/admission checkpoint. Historical failures and acceptance boundaries are in [BUILD-REPORT.md](BUILD-REPORT.md).
 
 ## What this foundation is
 
@@ -29,7 +31,7 @@ The Windows private-store repair is awaiting a fresh complete native run. [CI 38
 | Schema init / migration | Storage schema 2; explicit init or migration with consistent backup; never migrates on open |
 | Security State Unavailable | Durable latch; restart never resets it; no auto-recovery |
 | Required read/commit failures | Latch + `503 security_state_unavailable` (not bare 500) |
-| v2 administrator MFA | TOTP enrollment, Ed25519 device proof and atomic challenge completion implemented for loopback development. **Unix private-store only** — see Windows section |
+| v2 administrator MFA | TOTP enrollment, Ed25519 device proof and atomic challenge completion implemented for loopback development. Native private-store tests pass on Unix and Windows; public authentication remains gated |
 | v2 recovery credentials | Bounded, single-use factor recovery only; cannot issue normal sessions |
 | Configurable operator MFA / scoped delegation | Unavailable; production policy still gated |
 | File jobs / authority recovery and cutover | Explicitly unavailable (`501`) |
@@ -39,7 +41,7 @@ The Windows private-store repair is awaiting a fresh complete native run. [CI 38
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
 | Windows/macOS host installation | Unavailable in this server build |
-| Windows persistent v2 MFA | **Candidate / native Not Verified**: held no-follow handles, strict current-user directories/material, trusted SQLite file owners and current-user/SYSTEM/Administrators ACLs with trusted file-child inheritance. Full native CI must pass before integration adoption |
+| Windows persistent v2 MFA | **Verified prerequisite**: real native bootstrap/MFA/reopen, strict current-user directories/material, trusted SQLite file owners and private child inheritance. Installed service identity and security review remain Not Verified |
 
 Legacy v1 Manager `public_identity` values are **not** cryptographic production identities.
 They are development fixtures for local/loopback integration until B03 freezes
@@ -48,17 +50,13 @@ signed endpoint/manager identity formats. Do not invent grant formats.
 MFA-enrolled accounts refuse legacy password-only login through the service,
 HTTP route and CLI. The final session transaction rechecks MFA state, account
 state, the verified password hash and manager approval. Legacy accounts without
-MFA remain an explicitly loopback-only development path. The Windows private-store candidate requires a protected current-user product directory, trusted child inheritance and verified trusted SQLite file ownership before explicit migration;
+MFA remain an explicitly loopback-only development path. The Windows private store requires a protected current-user product directory, trusted child inheritance and verified trusted SQLite file ownership before explicit migration;
 native refusal tests retain both the original database bytes and no-output checks.
 
 The [v2 development contract](contracts/http-v2.md) describes deployment-bound
 Ed25519 challenges, administrator enrollment, transaction boundaries and recovery
 limits. Unix HTTPS transport is implemented as a loopback prerequisite. Production trust adoption, public authentication and public routes remain unavailable.
-The v1 HTTP wire contract remains version 1; health separately reports storage
-schema version 2. Reviewed authority baseline `3656c22` passed **209 tests** on macOS
-(61 lib + 24 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter +
-12 installer_review + 6 mfa_legacy_boundary + 21 review_findings), formatting and clippy pass; this
-does not establish production readiness. The HTTPS candidate adds 29 tests; coordinator acceptance is **238 Mac tests**, formatting, clippy and build. Native Linux/Windows HTTPS-candidate CI is pending.
+The v1 HTTP wire contract remains version 1; health separately reports storage schema version 2. Current complete acceptance is **242 Mac,235 Linux and 226 Windows tests**. Native counts come from [CI38252656196](https://github.com/Helicoid-Systems/server/actions/runs/38252656196); Mac checks were reproduced by the coordinator. Earlier authority-only and Unix TLS counts are historical evidence in the build report.
 
 Platform-split of `tests/installer_adapter.rs` (29 total): **19 portable**
 (listener/parser/systemctl decode, read bounds, injected query faults) run on
@@ -67,13 +65,13 @@ regressions cover the descriptor-relative atomic writer (`write_file_atomic`).
 There is no Windows native service installer and no Windows atomic writer —
 host installation on Windows/macOS remains unavailable.
 
-Verified authority baseline `3656c22` ([CI 38139828063](https://github.com/Helicoid-Systems/server/actions/runs/38139828063)); HTTPS-candidate native counts remain pending:
+Current native private-store/MFA/CLI prerequisite:
 
 | Platform | Verified total | Notes |
 | --- | --- | --- |
-| macOS | **209** (observed) | includes 5 Darwin-only extended-ACL tests |
-| Linux | **203** | excludes 5 Darwin ACL tests and one Mac-only installer check |
-| Windows | **182** | portable + 10 Windows denial/legacy tests; excludes Unix-only FS and Darwin ACL tests |
+| macOS | **242** | Coordinator full tests, formatting, strict Clippy and build |
+| Linux | **235** | Native full tests, formatting and strict Clippy |
+| Windows Server 2025 CI | **226** | Native full tests, strict Clippy, release and actual PowerShell 5.1/7 private-ACL/launcher checks; Windows TLS and installed Windows 11 runtime remain unavailable/unverified |
 
 `hs-server --data /private-product-directory/hs-server.db serve-tls --tls-cert /private-product-directory/server.crt --tls-key /private-product-directory/server.key` requires operator-supplied certificate/key files. Each file is bounded at64KiB, owner-only, regular, singly linked and read through its verified held descriptor. It refuses malformed/mismatched material before opening data. Public binds and Windows TLS hosting refuse before reading material or creating data. Bootstrap remains local-only or inside verified SSH tunnels. These checks do not establish installation or enrollment readiness.
 
@@ -84,15 +82,11 @@ production confidentiality claim and **not** a persistent-MFA support claim.
 ## Build and test
 
 ```sh
-export CARGO_HOME=/tmp/hs-toolchain/cargo
-export RUSTUP_HOME=/tmp/hs-toolchain/rustup
-export PATH=/tmp/hs-toolchain/cargo/bin:$PATH
-export CARGO_TARGET_DIR=/tmp/hs-build/server-target
-
 cd modules/server
 cargo fmt -- --check
 cargo test --locked
-cargo clippy --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked
 ```
 
 Independent GitHub Actions workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)

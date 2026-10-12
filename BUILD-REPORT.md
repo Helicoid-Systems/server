@@ -1,5 +1,13 @@
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
+## Current native private-store acceptance, 12 October 2026
+
+Complete [CI38252656196](https://github.com/Helicoid-Systems/server/actions/runs/38252656196) passes at exact code `f01019faa41d484f7ce43bcc0f0559834ad9d10c`: **235 Linux and 226 Windows tests**, zero failures/ignores, formatting and strict Clippy. Windows release and the actual launcher run under both PowerShell 5.1 and 7 pass, including missing-path selection, protected current-user folder ownership, trusted allow ACLs, Unicode stdin password authentication, single-use refusal, caller environment preservation and batch diagnostics/exit propagation. The coordinator independently passes 242 Mac tests, formatting, strict Clippy/build and real token-denial/path-delegation probes.
+
+The coordinator downloads [artifact11748988843](https://github.com/Helicoid-Systems/server/actions/runs/38252656196/artifacts/11748988843), verifies ZIP integrity and its exact published SHA256 digest `b360ede6ccf48269a66edd1a179fe8be0833049a805e1e35dd21f8bdbda726bc`. The 7,554,048-byte executable is PE x64, SHA256 `c4d5b7182bbb6217a087f9a91cf93ea2bb8596dec34b9c608e772f7169f8c3d1`. All three companion texts match the compiled revision after Git line-ending normalization.
+
+This evidence-only revision preserves the tested source. Bounded prerequisite **Verified**: native private stores, persisted MFA, protected SQLite recreation, CLI token parsing and developer launchers. **Not Verified/unavailable**: Windows TLS hosting, public authentication/routing, service installation and installed Windows 11 identity, recovery cutover, signing and release security review. Stock RustDesk route adoption remains Failed/Closed. No VM mutation, public listener or normal media/control is enabled. The dated candidate entries below are historical; their pending statuses describe those earlier revisions.
+
 ## Opaque leading-hyphen bootstrap token CLI parse, 12 October 2026
 
 Native [CI 38249674679](https://github.com/Helicoid-Systems/server/actions/runs/38249674679) at `e575572` failed `tests/review_findings::legacy_loopback_init_and_bootstrap_still_work` on Linux with `error: unexpected argument '-i' found` from Clap. The generated one-time token is 32-byte URL-safe base64 (`URL_SAFE_NO_PAD`), which may begin with `-`; passing it as a separate `--token VALUE` was rejected as an unknown flag before any domain work. `--token=value` already parsed. This is a production CLI parser defect, not a test mask.
