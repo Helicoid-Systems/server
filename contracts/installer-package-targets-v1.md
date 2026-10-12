@@ -55,17 +55,43 @@ key:
 - Valid signatures from the independent trust key continue to verify.
 - Format version remains `1`. Artifact size/hash bounds, no-symlink and
   unknown-file guards are unchanged.
+- Package `product`, release `version`, and a nonempty `artifacts` list are
+  bound as specified below before any artifact is opened. Expected product and
+  trusted target are never derived from package values.
 
-## Version and schema metadata floors
+## Product identity
 
-`min_installer_version` is strict `major.minor.patch` decimal: exactly three
-components, digits only, no leading zeros, no overflow. Malformed values
-refuse — they are **never** coerced to zero (that would look like “no floor”).
+The package `product` field must be **exactly** `hs-server` (the canonical
+development server package product). This is a fail-closed exact-match binding
+checked before any artifact is opened.
 
-`min_schema_version` must be an integer in `[1, SCHEMA_VERSION]`. Non-positive
-floors refuse. This is a package-metadata compatibility check only; it does
-**not** introduce update, rollback, recovery, or security-floor semantics, and
-does not change wire shapes.
+Refused (non-exhaustive): aliases (`hsserver`, `hs_server`), case changes
+(`HS-Server`, `hs-Server`), other components (`hs-manager`, `hs-computer`,
+`helicoid`), path traversal (`hs-server/../evil`, `../hs-server`), NUL bytes,
+newlines, empty strings, and unbounded names. A package signed for another
+component by the same independently trusted publisher key is **not** admitted
+as a server package. Expected product is never derived from package values.
+
+## Release version and schema metadata floors
+
+`version` (release identity) is strict `major.minor.patch` decimal, using the
+same grammar as `min_installer_version`: exactly three components, digits only,
+no leading zeros, no overflow. Malformed values refuse — they are **never**
+coerced to zero. Canonical bounded numeric triples (for example `0.1.0`,
+`0.0.0`, `1.2.3`) accept. This is signed metadata structure only: it does
+**not** invent release names, does not authorize a release channel, and is
+separate from the required compatibility floors below.
+
+`min_installer_version` is the same strict `major.minor.patch` grammar and must
+be `<=` the running `INSTALLER_VERSION`. `min_schema_version` must be an integer
+in `[1, SCHEMA_VERSION]`. Non-positive floors refuse. These are
+package-metadata compatibility checks only; they do **not** introduce update,
+rollback, recovery, or security-floor semantics, and do not change wire shapes.
+
+## Artifact list bound
+
+The manifest `artifacts` list must be **nonempty** and contain at most 256
+entries. An empty list refuses even when the manifest is validly signed.
 
 ## Portable artifact namespace
 
@@ -103,9 +129,14 @@ declared path. Directories are descended only when they are a path prefix of a
 declared artifact, and never through a symlink (symlinked parents of declared
 artifacts are already refused by the artifact symlink-parent guard).
 
-## Non-goals
+## Non-goals and proof limits
 
 - Windows/macOS installation, Service Management/SCM/systemd runtime
 - Manifest `format_version` bump or automatic data migration
 - CLI/wizard wire-shape changes
 - Signing, release, security floors/rollback/recovery verification
+- Publisher-key compromise protection: product/version/artifact-list binding is
+  signed metadata structure only
+- Platform signing or per-target release identity authority
+- Actual binary architecture, installed state, update, rollback, security
+  floors, or recovery verification

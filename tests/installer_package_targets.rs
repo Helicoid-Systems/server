@@ -100,7 +100,9 @@ fn verify_all_targets_ok(signing_key: &SigningKey) {
             target,
             result.err()
         );
-        assert_eq!(result.unwrap().platform, target.platform_str());
+        let verified = result.unwrap();
+        assert_eq!(verified.platform, target.platform_str());
+        assert_eq!(verified.product, "hs-server");
     }
 }
 
@@ -694,4 +696,183 @@ fn frozen_platform_strings_are_exact() {
         Some(InstallerTarget::MacosX86_64)
     );
     assert_eq!(InstallerTarget::from_platform_str("macos-intel"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Product / release-version / artifact-list binding (signed packages)
+// ---------------------------------------------------------------------------
+
+/// Signed package that is otherwise valid (correct artifact bytes/hash/size,
+/// valid min requirements, real signature). Only `product`, `version`, or the
+/// artifact list may be hostile.
+fn package_with_identity(
+    adapter: &TestAdapter,
+    signing_key: &SigningKey,
+    product: &str,
+    version: &str,
+    artifacts: Vec<ArtifactEntry>,
+) -> PathBuf {
+    let mut manifest = manifest_for_platform("linux-x86_64");
+    manifest.product = product.to_string();
+    manifest.version = version.to_string();
+    manifest.artifacts = artifacts;
+    write_package(adapter, signing_key, &manifest, &[])
+}
+
+fn default_artifacts() -> Vec<ArtifactEntry> {
+    manifest_for_platform("linux-x86_64").artifacts
+}
+
+#[test]
+fn wrong_product_signed_with_trusted_key_refuses() {
+    // Same independently trusted test key; only `product` is hostile.
+    let signing_key = primary_signing_key();
+    let hostile_owned: Vec<String> = vec![
+        // Aliases and case changes.
+        "HS-Server".into(),
+        "hs-Server".into(),
+        "hs_server".into(),
+        "hsserver".into(),
+        "hs-server ".into(),
+        " hs-server".into(),
+        "hs-server.".into(),
+        "hs-server-v2".into(),
+        "HS-SERVER".into(),
+        // Other components.
+        "hs-manager".into(),
+        "hs-computer".into(),
+        "helicoid".into(),
+        "hs-client".into(),
+        // Traversal / NUL / unbounded.
+        "hs-server/../evil".into(),
+        "../hs-server".into(),
+        "hs-server/..".into(),
+        "hs-server\u{0}".into(),
+        "hs\u{0}-server".into(),
+        "hs-server\n".into(),
+        "x".repeat(1024),
+        "hs-server/".repeat(32),
+        String::new(),
+    ];
+    for bad in &hostile_owned {
+        let adapter = TestAdapter::new();
+        let package_dir =
+            package_with_identity(&adapter, &signing_key, bad, "0.1.0", default_artifacts());
+        let err = verify_manifest_for_target(
+            &adapter,
+            &package_dir,
+            &signing_key.verifying_key().to_bytes(),
+            InstallerTarget::LinuxX86_64,
+        )
+        .expect_err(&format!("product={bad:?} must refuse"));
+        assert_eq!(
+            err.code(),
+            ErrorCode::Unprocessable,
+            "product={bad:?} err={err}"
+        );
+        // Fixed descriptive error: untrusted product is not echoed.
+        assert_eq!(
+            err.to_string(),
+            "package product is not the canonical server product",
+            "product={bad:?} err={err}"
+        );
+    }
+}
+
+#[test]
+fn malformed_release_version_with_valid_min_requirements_refuses() {
+    // min_installer_version and min_schema_version stay valid; only the
+    // release `version` field is malformed.
+    let signing_key = primary_signing_key();
+    for bad in [
+        "",
+        "0.1",
+        "0.1.0.0",
+        "abc.0.0",
+        "1.0.0-rc1",
+        "-1.0.0",
+        "01.0.0",
+        "99999999999.0.0",
+        "1.2.3.4",
+        "v0.1.0",
+        " 0.1.0",
+        "0.1.0 ",
+    ] {
+        let adapter = TestAdapter::new();
+        let package_dir = package_with_identity(
+            &adapter,
+            &signing_key,
+            "hs-server",
+            bad,
+            default_artifacts(),
+        );
+        let err = verify_manifest_for_target(
+            &adapter,
+            &package_dir,
+            &signing_key.verifying_key().to_bytes(),
+            InstallerTarget::LinuxX86_64,
+        )
+        .expect_err(&format!("version={bad:?} must refuse"));
+        assert_eq!(
+            err.code(),
+            ErrorCode::Unprocessable,
+            "version={bad:?} err={err}"
+        );
+        // Fixed descriptive error: untrusted version is not echoed.
+        assert_eq!(
+            err.to_string(),
+            "malformed version",
+            "version={bad:?} err={err}"
+        );
+    }
+}
+
+#[test]
+fn empty_artifact_list_with_valid_signature_refuses() {
+    let signing_key = primary_signing_key();
+    let adapter = TestAdapter::new();
+    let package_dir = package_with_identity(&adapter, &signing_key, "hs-server", "0.1.0", vec![]);
+    let err = verify_manifest_for_target(
+        &adapter,
+        &package_dir,
+        &signing_key.verifying_key().to_bytes(),
+        InstallerTarget::LinuxX86_64,
+    )
+    .expect_err("empty artifact list must refuse");
+    assert_eq!(err.code(), ErrorCode::Unprocessable);
+    assert_eq!(
+        err.to_string(),
+        "manifest must list at least one artifact",
+        "err={err}"
+    );
+}
+
+#[test]
+fn canonical_release_versions_still_verify() {
+    let signing_key = primary_signing_key();
+    for ver in [
+        "0.0.0",
+        "0.1.0",
+        "1.2.3",
+        "10.20.30",
+        "0.0.1",
+        "4294967295.0.0",
+    ] {
+        let adapter = TestAdapter::new();
+        let mut manifest = manifest_for_platform("linux-x86_64");
+        manifest.version = ver.to_string();
+        let package_dir = write_package(&adapter, &signing_key, &manifest, &[]);
+        let result = verify_manifest_for_target(
+            &adapter,
+            &package_dir,
+            &signing_key.verifying_key().to_bytes(),
+            InstallerTarget::LinuxX86_64,
+        );
+        assert!(
+            result.is_ok(),
+            "version={ver} must verify: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().version, ver);
+    }
 }

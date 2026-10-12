@@ -21,6 +21,10 @@ use crate::installer::models::ArtifactEntry;
 /// Minimum installer version that this build is compatible with.
 const INSTALLER_VERSION: &str = "0.1.0";
 
+/// Canonical server package product identity. Exact match only — aliases,
+/// case changes, other components, traversal/NUL and unbounded names refuse.
+const EXPECTED_PRODUCT: &str = "hs-server";
+
 /// Allowed artifact path prefix.
 const ALLOWED_PREFIX: &str = "artifacts/";
 
@@ -58,12 +62,15 @@ pub fn verify_manifest(
 /// Verify the full package manifest for a trusted target:
 /// 1. Parse manifest.json
 /// 2. Strict Ed25519 signature (manifest.sig); refuse weak keys/signatures
-/// 3. Check platform equals the trusted target's frozen string
-/// 4. Check min_schema_version <= SCHEMA_VERSION
-/// 5. Check min_installer_version <= INSTALLER_VERSION
-/// 6. Validate portable artifact paths and reject duplicates/collisions
-/// 7. Verify each artifact: safe path, sha256, size, no symlinks
-/// 8. Ensure no unknown files in artifacts/ directory
+/// 3. Require a nonempty artifact list within the existing bound
+/// 4. Check product equals the canonical server product identity
+/// 5. Check release version is strict major.minor.patch
+/// 6. Check platform equals the trusted target's frozen string
+/// 7. Check min_schema_version <= SCHEMA_VERSION
+/// 8. Check min_installer_version <= INSTALLER_VERSION
+/// 9. Validate portable artifact paths and reject duplicates/collisions
+/// 10. Verify each artifact: safe path, sha256, size, no symlinks
+/// 11. Ensure no unknown files in artifacts/ directory
 pub fn verify_manifest_for_target(
     adapter: &dyn CommandAdapter,
     package_dir: &Path,
@@ -122,6 +129,11 @@ pub fn verify_manifest_for_target(
     let manifest: PackageManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| AppError::bad_request(format!("invalid manifest.json: {e}")))?;
 
+    if manifest.artifacts.is_empty() {
+        return Err(AppError::unprocessable(
+            "manifest must list at least one artifact",
+        ));
+    }
     if manifest.artifacts.len() > MAX_ARTIFACTS {
         return Err(AppError::unprocessable(format!(
             "manifest lists {} artifacts (max {MAX_ARTIFACTS})",
@@ -135,6 +147,23 @@ pub fn verify_manifest_for_target(
             "unsupported manifest format_version: {}",
             manifest.format_version
         )));
+    }
+
+    // Product binding: a package signed for another component by the same
+    // independently trusted publisher key must not be admitted as a server
+    // package. Exact match only — never derived from package values. Fixed
+    // error text: untrusted product is not echoed.
+    if manifest.product != EXPECTED_PRODUCT {
+        return Err(AppError::unprocessable(
+            "package product is not the canonical server product",
+        ));
+    }
+
+    // Release identity: strict major.minor.patch structure. Compatibility
+    // floors (min_installer_version / min_schema_version) stay separate below.
+    // Fixed error text: untrusted version is not echoed.
+    if parse_version_triple(&manifest.version).is_none() {
+        return Err(AppError::unprocessable("malformed version"));
     }
 
     // Check platform against the caller-supplied target (never inferred here
