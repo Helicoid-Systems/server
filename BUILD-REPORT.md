@@ -1,5 +1,17 @@
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
+## Native package identity acceptance, 13 October 2026
+
+Complete [CI38320441248](https://github.com/Helicoid-Systems/server/actions/runs/38320441248) passes at exact source `21d2ff337e0b02c4dd01ea8a3bed5213fad3dacf`: **265 Linux /273 Windows tests**, no failures or ignored tests, format, strict all-target Clippy, Windows release and both PowerShell launchers. All26 signed-package tests pass on both native platforms, including otherwise-valid hostile product/version/empty-artifact packages. The independent coordinator passes272 Mac tests, all26 package tests, format, Clippy and build against frozen source hashes in a separate build directory.
+
+The unchanged accepted `afa7544` snapshot, built separately, accepts otherwise-valid signed wrong-product, malformed-release and empty packages; final regressions against that old source yield23 passes and3 expected failures. Current source rejects those metadata cases before artifact reads, with fixed bounded errors; publisher-key independence, strict signatures, trusted targets, portable paths and compatibility guards remain intact. This is metadata verification, not declared binary architecture/install/update authority.
+
+Coordinator download inspection verifies [artifact11778357880](https://github.com/Helicoid-Systems/server/actions/runs/38320441248/artifacts/11778357880), ZIP SHA256 `ed4cd0e1ea43e35fbe1d58a1ab061b2c350aac1acba8e24b8c8283f537ff271d`, the actual9,175,040-byte PE x64 executable (SHA256 `649d5337c9e6acb2762c7f171fe8795d398be906f9b4d5036dee52e9de7454f6`) and all three companion texts against exact tested source after line-ending normalization. Windows TLS and private-store/MFA/CLI tests remain verified for literal loopback.
+
+MiMo session `ses_ffe5ecdb81ef1ffeFyKNNGooZi`: all40 exported assistant records identify `xiaomi/mimo-v2.6-pro`; sanitized export SHA256 `e5a0ddfba863b3435728ea668753ee1b5e88822bcea6112e371bf9138e5aedfc`. This acceptance revision changes only README/BUILD-REPORT; executable source remains identical to tested `21d2ff3`.
+
+Installation commands remain Linux-only; Windows/macOS service setup, public authentication/routing, installed Windows11 acceptance, actual input/capture, updates/security floors/rollback/recovery, platform signing and release review remain unavailable or Not Verified. Owned Windows child kill/reap is not installed service-stop acceptance. No VM changes or public listeners. Earlier dated candidate entries record their then-current state and are superseded by this acceptance.
+
 ## Native target-bound package acceptance, 13 October 2026
 
 Complete [CI38315726535](https://github.com/Helicoid-Systems/server/actions/runs/38315726535) passes at code `7f82f8f1599a178d4f55b61c6dc90962f714a326`: **261 Linux / 269 Windows tests**, zero failures/ignores, formatting, strict all-target Clippy, Windows release and both PowerShell launchers. Coordinator checks pass **268 Mac tests** plus formatting, strict Clippy and compilation. The 22 signed-package tests run on Linux and Windows, including four trusted targets, wrong key/signature/target/architecture, weak-key refusal, canonical paths, nested unknown files and malformed compatibility metadata. Coordinator directly reproduces invalid-version acceptance with the original parser from accepted `88c2730`.
