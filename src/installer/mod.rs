@@ -12,8 +12,9 @@ pub mod models;
 #[cfg(target_os = "linux")]
 pub use adapter::LinuxAdapter;
 pub use adapter::{CommandAdapter, TestAdapter};
+pub use manifest::{verify_manifest, verify_manifest_for_target};
 pub use models::{
-    ApplyInput, ApplyResult, InspectInput, InspectResult, InstallPlan, PackageManifest, Phase,
-    PhaseStatus, PlanInput, PlanResult, PreflightInput, PreflightResult, RemoveInput, RemoveResult,
-    CONTRACT_VERSION,
+    ApplyInput, ApplyResult, InspectInput, InspectResult, InstallPlan, InstallerTarget,
+    PackageManifest, Phase, PhaseStatus, PlanInput, PlanResult, PreflightInput, PreflightResult,
+    RemoveInput, RemoveResult, CONTRACT_VERSION,
 };

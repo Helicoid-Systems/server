@@ -450,6 +450,66 @@ pub enum ResourceStatus {
 // Package manifest
 // ---------------------------------------------------------------------------
 
+/// Trusted installer package target.
+///
+/// The verifier never infers this value: not from the untrusted package
+/// `platform` field, and not from the verifier's own local OS. A trusted
+/// server or native caller selects the target — including from authenticated
+/// target-host or preflight platform facts for remote/native setup — and
+/// passes it in. Frozen platform strings are documented in
+/// `contracts/installer-package-targets-v1.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InstallerTarget {
+    LinuxX86_64,
+    WindowsX86_64,
+    MacosArm64,
+    MacosX86_64,
+}
+
+impl InstallerTarget {
+    /// Every supported target. Order is stable for diagnostics.
+    pub const ALL: [InstallerTarget; 4] = [
+        InstallerTarget::LinuxX86_64,
+        InstallerTarget::WindowsX86_64,
+        InstallerTarget::MacosArm64,
+        InstallerTarget::MacosX86_64,
+    ];
+
+    /// Frozen package `platform` string for this target.
+    pub const fn platform_str(self) -> &'static str {
+        match self {
+            InstallerTarget::LinuxX86_64 => "linux-x86_64",
+            InstallerTarget::WindowsX86_64 => "windows-x86_64",
+            InstallerTarget::MacosArm64 => "macos-arm64",
+            InstallerTarget::MacosX86_64 => "macos-x86_64",
+        }
+    }
+
+    /// OS component of the frozen platform string.
+    pub const fn os_str(self) -> &'static str {
+        match self {
+            InstallerTarget::LinuxX86_64 => "linux",
+            InstallerTarget::WindowsX86_64 => "windows",
+            InstallerTarget::MacosArm64 | InstallerTarget::MacosX86_64 => "macos",
+        }
+    }
+
+    /// Architecture component of the frozen platform string.
+    pub const fn arch_str(self) -> &'static str {
+        match self {
+            InstallerTarget::LinuxX86_64
+            | InstallerTarget::WindowsX86_64
+            | InstallerTarget::MacosX86_64 => "x86_64",
+            InstallerTarget::MacosArm64 => "arm64",
+        }
+    }
+
+    /// Resolve a frozen platform string. Unknown strings yield `None`.
+    pub fn from_platform_str(platform: &str) -> Option<InstallerTarget> {
+        Self::ALL.into_iter().find(|t| t.platform_str() == platform)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageManifest {
     pub format_version: u32,
