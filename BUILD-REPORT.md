@@ -1,5 +1,15 @@
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
+## Windows CLI bootstrap-v2 fixture password stdin, 12 October 2026
+
+Native [CI 38247883345](https://github.com/Helicoid-Systems/server/actions/runs/38247883345) at `0ae3c4c` passed the Windows full library suite (including ACL carrier retention, store owner and privacy checks) and later auth/http/installer/legacy suites; `tests/review_findings::windows_cli_bootstrap_v2_denies_invalid_token_without_recovery_file` failed with `error: password on stdin was empty`. Linux passed. That fixture used `.output()` with an empty stdin pipe. Now that verified native persisted-MFA writes are no longer Unsupported, `bootstrap-v2` reaches `read_password_stdin` before token validation and refuses an empty password, so the child never exercised the invalid-token contract.
+
+Test-only repair in `tests/review_findings.rs`: spawn the real `hs-server` binary on the existing `private_tempdir` fixture, write an explicit test-only password on the process-owned stdin pipe (same `long-enough-password` pattern as the sibling recovery preflight and legacy bootstrap fixtures), close that pipe before `wait_with_output`, then keep the existing denial contract unchanged — non-zero exit, no `totp_secret`/`mfa_enrollment_id` on stdout, stderr names the token refusal, and no recovery file is created. Production `main.rs` / `auth_v2.rs` entry order and private store code are untouched. The dummy token still fails at `bootstrap token is missing, already used, or invalid` only after the password is accepted, which is the same wrong-token refusal this fixture exists to lock. No secret or password is written to stdout/stderr or argv.
+
+Fresh coordinator checks: `cargo fmt -- --check` clean, `cargo test --locked` **240 Mac tests**, `cargo clippy --locked --all-targets -- -D warnings` clean. Mac cannot execute the `#[cfg(windows)]` CLI test; complete Windows gate remains **Not Verified** until the next native CI run.
+
+The coordinator independently exercised the same real CLI input on a disposable private Mac store: exit 1 for invalid token, no empty-password failure, no enrollment secret output and no recovery file. This checks entry ordering and denial behavior; Windows native execution still requires the next CI run.
+
 ## Inherit-only ACL fixture repair, 12 October 2026
 
 Native [CI 38246041857](https://github.com/Helicoid-Systems/server/actions/runs/38246041857) at `c939c8f` passed Linux and 72 Windows library tests; the single failure was `trusted_store_owner_with_untrusted_dacl_is_refused` expecting a policy refusal after `add_ace` installed a Users `INHERIT_ONLY|OBJECT_INHERIT` ACE on a **regular file**. That leaf fixture did not establish on-disk retention of its intended ACE. Microsoft documents `INHERIT_ONLY` as a child-inheritance ACE; kernel filtering remains an inference because the failed run took no on-disk snapshot. Production `check_product_allow_aces` is unchanged.

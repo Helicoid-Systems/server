@@ -778,13 +778,17 @@ fn legacy_loopback_init_and_bootstrap_still_work() {
 /// Windows CLI bootstrap-v2 with an invalid token must refuse without
 /// creating a recovery file or printing secrets. The private store boundary
 /// is native; auth still rejects a dummy token before any secret material.
+///
+/// Bootstrap-v2 always reads the password from stdin before token validation
+/// (`read_password_stdin`), so the child must receive a real test password on
+/// a process-owned pipe and that pipe must be closed before wait.
 #[cfg(windows)]
 #[test]
 fn windows_cli_bootstrap_v2_denies_invalid_token_without_recovery_file() {
     let (_dir, base) = private_tempdir();
     let db_path = base.join("hs-server.db");
     let recovery = base.join("recovery.txt");
-    let out = std::process::Command::new(hs_server_bin())
+    let mut child = std::process::Command::new(hs_server_bin())
         .arg("--data")
         .arg(&db_path)
         .arg("bootstrap-v2")
@@ -797,8 +801,16 @@ fn windows_cli_bootstrap_v2_denies_invalid_token_without_recovery_file() {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .spawn()
         .expect("run");
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin
+            .write_all(b"long-enough-password\n")
+            .expect("write password");
+    }
+    let out = child.wait_with_output().expect("wait");
     assert!(!out.status.success(), "must deny invalid bootstrap token");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
