@@ -1,6 +1,12 @@
-Coordinator review, 13 October: independently reproduced malformed-version acceptance using the unchanged version parser extracted from accepted 88c2730. The new signed-package tests reject those requirements, NUL/empty artifact paths, and invalid schema floors. Coordinator reran all 268 tests, formatting, strict all-target Clippy and compilation successfully; native Windows/Linux candidate acceptance is pending; Windows/macOS installation and production security floors remain Not Verified.
-
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
+
+## Native target-bound package acceptance, 13 October 2026
+
+Complete [CI38315726535](https://github.com/Helicoid-Systems/server/actions/runs/38315726535) passes at code `7f82f8f1599a178d4f55b61c6dc90962f714a326`: **261 Linux / 269 Windows tests**, zero failures/ignores, formatting, strict all-target Clippy, Windows release and both PowerShell launchers. Coordinator checks pass **268 Mac tests** plus formatting, strict Clippy and compilation. The 22 signed-package tests run on Linux and Windows, including four trusted targets, wrong key/signature/target/architecture, weak-key refusal, canonical paths, nested unknown files and malformed compatibility metadata. Coordinator directly reproduces invalid-version acceptance with the original parser from accepted `88c2730`.
+
+The downloaded [artifact11776925306](https://github.com/Helicoid-Systems/server/actions/runs/38315726535/artifacts/11776925306) matches SHA256 `39d577eddaf6395b8c2a73966a5f6e115b051041a7b790aa1b221146db4cf12a`. Its 9,173,504-byte PE x64 executable has SHA256 `67167dc8a00b886277761470ccc22640c154dc6d772a173ded4046963db50f1d`; all three companion texts match compiled source after line-ending normalization. All 66 assistant records in exported session `ses_ffe5ecde89ee6ffeOfBTMpsaK5` use `xiaomi/mimo-v2.6-pro`; sanitized export SHA256 `0b1e0672d816984b45defd16032eddef7f22f0e8bb7b41bde5433cca0b69f51d`.
+
+**Verified prerequisite:** typed signed-package metadata verification, strict Ed25519, portable artifact names and unchanged literal-loopback TLS/private-store/MFA/CLI launchers. **Not Verified/unavailable:** Windows/macOS installation, occupied-host Linux installation, persistent security floors, safe rollback, recovery cutover, public authorization/routing, live media/control, platform signing, installed acceptance and release review. This documentation update changes only README and BUILD-REPORT; source equals the exact tested revision. Earlier dated candidates below are historical.
 
 ## Target-bound installer package verification, 12 October 2026
 
