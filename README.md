@@ -132,11 +132,14 @@ CI artifact `hs-server-windows-x64-dev` (from the `windows-latest` job) contains
 | [`scripts/start-development.ps1`](scripts/start-development.ps1) | Disposable literal-loopback fixture launcher |
 | [`scripts/windows-tester.md`](scripts/windows-tester.md) | Tester instructions and manual CLI steps |
 
-`start-development.ps1` creates a fresh unique disposable database directory
-(refuses any existing DB), prompts for a password of at least 12 characters
-(hidden), passes that password to `hs-server` only via stdin, captures the init
-bootstrap token in memory only, approves exactly `dev-manager-key` at bootstrap,
-and serves on `http://127.0.0.1:8787` in the foreground until Ctrl+C.
+`start-development.ps1` selects a fresh unique disposable database path
+(refuses any existing path or DB) and lets `hs-server init` create the private
+store directory (current-user owned, protected DACL; the launcher never
+creates that folder with `New-Item` and never re-ACLs one), prompts for a
+password of at least 12 characters (hidden), passes that password to
+`hs-server` only via stdin, captures the init bootstrap token in memory only,
+approves exactly `dev-manager-key` at bootstrap, and serves on
+`http://127.0.0.1:8787` in the foreground until Ctrl+C.
 
 It does **not** install a service, elevate, bypass execution policy, open
 firewall ports, bind non-loopback, auto-create access scopes, or delete the

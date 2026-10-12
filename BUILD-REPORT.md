@@ -450,3 +450,71 @@ installer + 29 installer_adapter + 12 installer_review + 17 review_findings).
 The historical portability-only estimate was **148** (158 − 10); current
 platform counts come from the subsequent filesystem/capability checks.
 Coordinator claims native CI; this pass only gates and typechecks.
+
+## Windows launcher private-directory repair (agent pass)
+
+Date: 12 October 2026. Source commit `286af7c` (frozen hyphen-token parser
+fix intact). Owned writes this pass: `scripts/start-development.ps1`,
+`scripts/check-development-fixture.ps1`, `scripts/windows-tester.md`,
+`.github/workflows/ci.yml` (PS7 counterpart only), `README.md`,
+`BUILD-REPORT.md`, report
+`/tmp/hs-production-20261012/server-launcher-private-directory-report.md`.
+No Rust/Cargo/lock/authority/auth/TLS changes.
+
+### Observed failure
+
+Native CI `CI38249674679` at `e575572` passed Windows Rust tests
+(74 lib, 27 auth, 12 http, 44 installer, 19 adapter, 12 installer_review,
+6 legacy, 23 review_findings, 7 TLS), strict Clippy and release build.
+Its real Windows PowerShell 5.1 fixture then failed `hs-server init` with
+`object is not owned by the current process principal; refusing credential store`.
+Log: `/tmp/hs-production-20261012/server-e575-windows-failed.log`.
+Cause: `New-DisposableDatabaseDirectory` used generic `New-Item` before
+server init. On elevated Windows native CI the default owner may be
+Administrators; the strict product directory must be current-user owned and
+protected.
+
+### Smallest repair (this pass)
+
+- `Select-DisposableDatabaseDirectoryPath` (replaces
+  `New-DisposableDatabaseDirectory`) **chooses** a fresh missing
+  path under an existing parent and does **not** create the folder. Collision
+  refuses; nothing is repaired, deleted, or re-ACL'd.
+- Real `hs-server init` creates the final store directory through existing
+  exclusive held nofollow protected current-user-owner creation
+  (`windows_ensure_private_store_dir`).
+- Non-credential batch child fixture creation is isolated in
+  `New-NonCredentialFixtureDirectory` (plain directory; no store data).
+- `check-development-fixture.ps1` asserts the chosen store path is initially
+  absent, then after init runs actual `Get-Acl` checks: current-user owner,
+  protected DACL, only trusted allow SIDs (user / SYSTEM / Administrators).
+  Source AST parse is not treated as ACL proof.
+- `ci.yml` runs the same real fixture script under Windows PowerShell 5.1 and
+  PowerShell 7 (`shell: powershell` + `shell: pwsh`). Job timeout stays 30m.
+- `windows-tester.md` manual CLI steps no longer `New-Item` the store folder.
+
+Preserved: no reuse / existing parent required; fixed development identity
+(loopback fixture only); process-owned UTF-8 stdin password; child-only
+bootstrap environment; token/password not written to output; timeout/disposal;
+visible CMD diagnostics. No production identities or normal media.
+
+### Agent checks (this Mac)
+
+| Check | Result |
+| --- | --- |
+| `pwsh` parse `start-development.ps1` + `check-development-fixture.ps1` | **agent verified** (syntax) |
+| `actionlint` `.github/workflows/ci.yml` | **agent verified** if edited |
+| Focused diff / grep of helper names and absence of `New-Item` on store path | **agent verified** |
+| Native Windows launcher + Get-Acl store proof | **NotVerified** (no Windows host here) |
+| Coordinator independent re-run | **Not claimed** |
+
+Native acceptance commands (Windows): `./scripts/check-development-fixture.ps1`
+under `powershell` and under `pwsh` after `cargo build --locked --release`.
+
+Coordinator review, 12 October: both scripts parse in PowerShell7.6.6 and
+Actionlint1.7.12 accepts the workflow. Running the real selected-path helper
+leaves its folder absent and refuses a missing parent; the actual Unix server
+then creates the private store successfully. No Windows ACL/runtime proof is
+claimed from that probe. Sanitized session export verifies all29 assistant
+records as `xiaomi/mimo-v2.6-pro`. Full native tests and both real Windows
+launcher checks remain required before integration acceptance.

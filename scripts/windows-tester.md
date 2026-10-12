@@ -30,7 +30,9 @@ instead of weakening policy for this fixture.
 
 `start-development.ps1` and the manual steps below:
 
-- create a **fresh unique disposable** database directory and refuse any existing DB
+- choose a **fresh unique disposable** database path and refuse any existing DB;
+  `hs-server init` creates the private store directory (current-user owned,
+  protected DACL) and this launcher never creates that folder or re-ACLs one
 - bind **literal loopback only** (`127.0.0.1:8787`)
 - do **not** install a Windows service
 - do **not** require elevation
@@ -97,15 +99,19 @@ Same safety rules apply. Do not put the password or bootstrap token on the
 command line.
 
 ```powershell
-# 1. Fresh disposable directory (never reuse an existing DB directory)
+# 1. Choose a fresh disposable directory path (never reuse an existing one).
+#    Do NOT create the folder with New-Item: hs-server init creates the
+#    private store directory itself (current-user owned, protected DACL).
+#    On collision, refuse and pick another path; never repair/delete/re-ACL.
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $unique = [guid]::NewGuid().ToString('N').Substring(0, 8)
 $dbDir = Join-Path $env:TEMP "helicoid-hs-server-$stamp-$unique"
-New-Item -ItemType Directory -Path $dbDir | Out-Null
+if (Test-Path -LiteralPath $dbDir) { throw "Path already exists (refusing): $dbDir" }
 $db = Join-Path $dbDir 'hs-server.db'
 
-# 2. Init — prints a single-use bootstrap token ONCE (stdout).
-#    Capture it in memory. Do not paste it into logs, chat, or screenshots.
+# 2. Init — creates the private store directory and prints a single-use
+#    bootstrap token ONCE (stdout). Capture it in memory. Do not paste it
+#    into logs, chat, or screenshots.
 .\hs-server.exe --data $db init
 #    (token appears after the 'single-use bootstrap token' header)
 
