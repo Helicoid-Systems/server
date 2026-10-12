@@ -564,3 +564,30 @@ then creates the private store successfully. No Windows ACL/runtime proof is
 claimed from that probe. Sanitized session export verifies all29 assistant
 records as `xiaomi/mimo-v2.6-pro`. Full native tests and both real Windows
 launcher checks remain required before integration acceptance.
+
+
+## Signed package product / release identity candidate — 2026-10-13
+
+The verifier now requires exact product `hs-server`, a strict bounded numeric
+`major.minor.patch` release version, and a nonempty artifact list. These checks
+precede artifact reads and preserve strict signatures, independent publisher
+trust, typed targets, portable paths and the existing compatibility guards.
+New errors use fixed text without echoing untrusted product/version values.
+
+Coordinator baseline: the unchanged accepted `afa7544` snapshot, compiled in
+a separate fresh build directory, accepted otherwise valid signed packages
+with another product, a malformed release version, and an empty artifact list.
+The final regression suite against that baseline produces exactly23 passes
+and3 expected failures; the candidate passes all26 package tests and272
+macOS server tests with0 failures/ignores. Format, strict all-target Clippy
+and build pass independently against frozen source hashes.
+
+MiMo session `ses_ffe5ecdb81ef1ffeFyKNNGooZi`: all40 exported assistant records
+identify `xiaomi/mimo-v2.6-pro`; sanitized export SHA256
+`e5a0ddfba863b3435728ea668753ee1b5e88822bcea6112e371bf9138e5aedfc`.
+
+Native Linux/Windows CI and downloadable artifact inspection of this revision
+are **Not Verified** pending the new run. This is signed metadata structure
+verification only; actual binary architecture per declared package target,
+installed services, updates, security floors, rollback, recovery, platform
+signing and production release remain gated. No VM changes or public routes.
