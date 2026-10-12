@@ -1,5 +1,15 @@
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
+## Native Windows loopback HTTPS acceptance, 12 October 2026
+
+Complete [CI38259032769](https://github.com/Helicoid-Systems/server/actions/runs/38259032769) passes at exact code `1d996692a248c4c743525e34c9481a6e4fe472c8`: **235 Linux and243 Windows tests**, no failures/ignores, formatting, strict Clippy, Windows release and actual PowerShell5.1/7 launchers. The observed runner is Windows Server2025 (`windows-2025-vs2026`). The coordinator independently passes **29 HTTPS and242 total Mac tests**, formatting, strict Clippy and build.
+
+The Windows suite includes24 TLS tests: actual-binary HTTPS health with owned-child kill/reap, real CA/name rejection, plaintext refusal, stalled handshake bounds, checked library graceful shutdown, private-reader preconditions and specific unsafe-DACL/hardlink rejection before database effects. Owned-child kill/reap is not graceful console-signal or installed service-stop acceptance.
+
+The coordinator downloads [artifact11751622589](https://github.com/Helicoid-Systems/server/actions/runs/38259032769/artifacts/11751622589), verifies ZIP integrity and exact published SHA256 `e26601d528efd82b2fd961bb35fea0ecce09978030b217a617e029670f861f66`. The9,138,688-byte `hs-server.exe` is PE x64, SHA256 `27cea927f77b815c488994a76f6b41a2429f6df643bc592c385a3a093bc68ec6`. All companion texts match exact compiled source after Git line-ending normalization.
+
+**Verified prerequisite:** literal-loopback HTTPS on Unix/Windows, native private stores, persisted MFA, CLI and developer launchers. **Not Verified/unavailable:** installed Windows11/service identity and service-stop, production trust adoption/public authentication/routing, normal media/control, installation/recovery, signing and release security review. Selected stock RustDesk routing remains Failed/Closed. This documentation revision changes only evidence; source remains equivalent to the exact tested code. Earlier entries below describe historical candidate states, including the `f01019f` artifact that refused Windows TLS.
+
 ## Current native private-store acceptance, 12 October 2026
 
 Complete [CI38252656196](https://github.com/Helicoid-Systems/server/actions/runs/38252656196) passes at exact code `f01019faa41d484f7ce43bcc0f0559834ad9d10c`: **235 Linux and 226 Windows tests**, zero failures/ignores, formatting and strict Clippy. Windows release and the actual launcher run under both PowerShell 5.1 and 7 pass, including missing-path selection, protected current-user folder ownership, trusted allow ACLs, Unicode stdin password authentication, single-use refusal, caller environment preservation and batch diagnostics/exit propagation. The coordinator independently passes 242 Mac tests, formatting, strict Clippy/build and real token-denial/path-delegation probes.
