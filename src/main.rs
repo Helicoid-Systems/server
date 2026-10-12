@@ -42,7 +42,9 @@ enum Command {
     /// Consume the single-use bootstrap token to create the first administrator.
     Bootstrap {
         /// Bootstrap token from `hs-server init` (or HS_BOOTSTRAP_TOKEN).
-        #[arg(long)]
+        ///
+        /// Opaque URL-safe base64 may begin with `-`; accept one value unchanged.
+        #[arg(long, allow_hyphen_values = true)]
         token: Option<String>,
         #[arg(long)]
         username: String,
@@ -62,7 +64,9 @@ enum Command {
     /// MFA confirmation and independently stored recovery material.
     BootstrapV2 {
         /// Bootstrap token from `hs-server init` (or HS_BOOTSTRAP_TOKEN).
-        #[arg(long)]
+        ///
+        /// Opaque URL-safe base64 may begin with `-`; accept one value unchanged.
+        #[arg(long, allow_hyphen_values = true)]
         token: Option<String>,
         #[arg(long)]
         username: String,
@@ -631,4 +635,54 @@ fn read_line_stdin(what: &str) -> AppResult<String> {
 /// without a verified secure create-new path. Secrets are not printed on error.
 fn write_private_file(path: &std::path::Path, contents: &[u8]) -> AppResult<()> {
     hs_server::private_file::create_new_private_file(path, contents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Disposable invalid token beginning with `-` (URL-safe base64 alphabet).
+    /// Parser must preserve it opaque; backend still denies it.
+    const LEADING_HYPHEN_TOKEN: &str = "-iDisposableInvalidToken00000000000000000";
+
+    fn bootstrap_token(cli: &Cli) -> Option<&str> {
+        match &cli.command {
+            Command::Bootstrap { token, .. } | Command::BootstrapV2 { token, .. } => {
+                token.as_deref()
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn bootstrap_parses_leading_hyphen_token_as_separate_value() {
+        let cli = Cli::try_parse_from([
+            "hs-server",
+            "bootstrap",
+            "--token",
+            LEADING_HYPHEN_TOKEN,
+            "--username",
+            "admin",
+            "--password-stdin",
+        ])
+        .expect("bootstrap must accept opaque leading-hyphen --token VALUE");
+        assert_eq!(bootstrap_token(&cli), Some(LEADING_HYPHEN_TOKEN));
+        assert!(matches!(cli.command, Command::Bootstrap { .. }));
+    }
+
+    #[test]
+    fn bootstrap_v2_parses_leading_hyphen_token_as_separate_value() {
+        let cli = Cli::try_parse_from([
+            "hs-server",
+            "bootstrap-v2",
+            "--token",
+            LEADING_HYPHEN_TOKEN,
+            "--username",
+            "admin",
+            "--password-stdin",
+        ])
+        .expect("bootstrap-v2 must accept opaque leading-hyphen --token VALUE");
+        assert_eq!(bootstrap_token(&cli), Some(LEADING_HYPHEN_TOKEN));
+        assert!(matches!(cli.command, Command::BootstrapV2 { .. }));
+    }
 }

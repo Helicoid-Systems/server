@@ -198,6 +198,9 @@ HTTP wire shape is unchanged from that version-1 file.
 - Owner fields (capabilities, scopes) come from the session, never from request bodies.
 - Administration capability does not imply inventory, observe, or operate rights.
 - Single-use bootstrap token is hashed at rest and consumed transactionally.
+- Bootstrap tokens are opaque URL-safe base64 and may begin with `-`; both
+  `bootstrap` and `bootstrap-v2` accept `--token VALUE` unchanged (Clap
+  `allow_hyphen_values` on that option only). Invalid tokens still fail closed.
 - Durable Security State Unavailable latch: hydrated at service start with
   exact integer `0`/`1` (invalid values fail closed); required storage **and**
   lock-poison/internal failures latch and deny new authority; memory latch stays
