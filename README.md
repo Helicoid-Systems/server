@@ -40,6 +40,7 @@ Existing SQLite store files accept only currentUser/SYSTEM/Administrators owners
 | HTTPS transport | `serve-tls`, default `127.0.0.1:8920`, maintained rustls TLS1.2/1.3 and private held-descriptor material reads on Unix and Windows; public routes remain closed |
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
+| Installer package targets | Typed trusted target (`linux-x86_64`, `windows-x86_64`, `macos-arm64`, `macos-x86_64`) and portable artifact paths in [contracts/installer-package-targets-v1.md](contracts/installer-package-targets-v1.md); verification only — Windows/macOS installation remains unavailable |
 | Windows/macOS host installation | Unavailable in this server build |
 | Windows persistent v2 MFA | **Verified prerequisite**: real native bootstrap/MFA/reopen, strict current-user directories/material, trusted SQLite file owners and private child inheritance. Installed service identity and security review remain Not Verified |
 
