@@ -22,14 +22,26 @@
 //!    accepted); every ACCESS_ALLOWED ACE SID (including INHERITED and
 //!    INHERIT_ONLY) is exactly current user / SYSTEM / Administrators.
 //!    **Create-new** of our own files/dirs uses an explicit **protected**
-//!    DACL. **SQLite-created children** (WAL/SHM/journal) carry
-//!    **inherited trusted ACEs** from a product directory with a protected
-//!    DACL and trusted OBJECT_INHERIT ACEs — they are not given their own
-//!    protected DACL; verification accepts validated inherited trusted
-//!    ACEs. TokenDefaultDacl is never assumed. Product dirs must prove a
-//!    trusted OBJECT_INHERIT ACE exists; unknown SID / NULL DACL / foreign
-//!    owner fail closed. Existing product dirs keep the strict all-unknown
-//!    refusal (including INHERIT_ONLY) because SQLite children inherit.
+//!    DACL and remains current-user owned. **SQLite-created children**
+//!    (WAL/SHM/journal) carry **inherited trusted ACEs** from a product
+//!    directory with a protected DACL and trusted OBJECT_INHERIT ACEs —
+//!    they are not given their own protected DACL; verification accepts
+//!    validated inherited trusted ACEs. TokenDefaultDacl is never assumed.
+//!    Product dirs must prove a trusted OBJECT_INHERIT ACE exists; unknown
+//!    SID / NULL DACL / foreign owner fail closed. Existing product dirs
+//!    keep the strict all-unknown refusal (including INHERIT_ONLY) because
+//!    SQLite children inherit.
+//! 3. **Existing SQLite store files** verified through
+//!    [`windows_verify_private_store_file`] (DB and SQLite-created
+//!    WAL/SHM/journal) additionally accept **SYSTEM** or
+//!    **Administrators** as object owner — already the product DACL trust
+//!    root — because elevated tokens assign TokenOwner to those groups on
+//!    SQLite-recreated sidecars. This is owner-only compatibility: the
+//!    strict trusted DACL check is unchanged and still required. Recovery,
+//!    key, and material files stay current-user only through
+//!    [`verify_private_object_on_handle`]. No TrustedInstaller, Users,
+//!    Everyone, foreign SID, or arbitrary TokenOwner is accepted as store
+//!    owner. New creates remain current-user owned.
 //!
 //! Create-new supplies the protected DACL atomically via
 //! `OBJECT_ATTRIBUTES.SecurityDescriptor` — no brief public window and no
@@ -722,14 +734,37 @@ fn dacl_is_protected(sd: PSECURITY_DESCRIPTOR) -> AppResult<bool> {
     Ok(control & SE_DACL_PROTECTED != 0)
 }
 
-/// Final product object (file or leaf): owner is current user; every ALLOW ACE
-/// (including inherited / inherit-only) is a trusted SID. Supported
-/// inheritance: inherited allow ACEs from a trusted product parent pass the
-/// SID check; unknown SID fails closed. Never mutates the object.
-pub(crate) fn verify_private_object_on_handle(handle: HANDLE) -> AppResult<()> {
+/// Owner policy for a final private object on a held handle.
+///
+/// Distinct from the DACL allowlist (always current user / SYSTEM /
+/// Administrators). TrustedInstaller is never an owner here.
+#[derive(Clone, Copy)]
+enum PrivateOwnerPolicy {
+    /// Only the current process user. Recovery/key/material files and every
+    /// newly created product object.
+    CurrentUserOnly,
+    /// Existing SQLite store files (DB and SQLite-created WAL/SHM/journal):
+    /// current user, SYSTEM, or Administrators — the product DACL trust root
+    /// already used for ALLOW ACEs. No new principal gains authority.
+    TrustedStoreFile,
+}
+
+fn verify_private_object_with_owner_policy(
+    handle: HANDLE,
+    policy: PrivateOwnerPolicy,
+) -> AppResult<()> {
     let allow = AllowSids::current()?;
     let (owner, dacl, _sd) = fetch_owner_and_dacl(handle)?;
-    if owner.is_null() || !allow.is_user(owner) {
+    if owner.is_null() {
+        return Err(AppError::bad_request(
+            "object is not owned by the current process principal; refusing credential store",
+        ));
+    }
+    let owner_ok = match policy {
+        PrivateOwnerPolicy::CurrentUserOnly => allow.is_user(owner),
+        PrivateOwnerPolicy::TrustedStoreFile => allow.contains(owner),
+    };
+    if !owner_ok {
         return Err(AppError::bad_request(
             "object is not owned by the current process principal; refusing credential store",
         ));
@@ -741,6 +776,29 @@ pub(crate) fn verify_private_object_on_handle(handle: HANDLE) -> AppResult<()> {
     }
     let _ = check_product_allow_aces(dacl, &allow)?;
     Ok(())
+}
+
+/// Final product object (file or leaf): owner is current user; every ALLOW ACE
+/// (including inherited / inherit-only) is a trusted SID. Supported
+/// inheritance: inherited allow ACEs from a trusted product parent pass the
+/// SID check; unknown SID fails closed. Never mutates the object.
+///
+/// Recovery/key/material files and newly created products use this strict
+/// current-user owner gate. Existing SQLite store files use
+/// [`verify_private_store_file_on_handle`].
+pub(crate) fn verify_private_object_on_handle(handle: HANDLE) -> AppResult<()> {
+    verify_private_object_with_owner_policy(handle, PrivateOwnerPolicy::CurrentUserOnly)
+}
+
+/// Existing SQLite store file (DB / WAL / SHM / journal) verification.
+///
+/// Owner may be current user, SYSTEM, or Administrators (the product DACL
+/// trust root) together with the same strict trusted DACL used by
+/// [`verify_private_object_on_handle`]. TrustedInstaller, Users, Everyone,
+/// foreign SIDs, and NULL/foreign/unsupported DACLs still fail closed.
+/// Never mutates the object.
+fn verify_private_store_file_on_handle(handle: HANDLE) -> AppResult<()> {
+    verify_private_object_with_owner_policy(handle, PrivateOwnerPolicy::TrustedStoreFile)
 }
 
 /// Product directory used as a SQLite/credential store parent.
@@ -1364,7 +1422,9 @@ pub(crate) fn windows_verify_private_store_file(abs: &Path) -> AppResult<()> {
             "store object link count is not 1; refusing credential store",
         ));
     }
-    verify_private_object_on_handle(file.get())
+    // Store-file owner policy (user/SYSTEM/Administrators) + strict trusted
+    // DACL. SQLite-recreated sidecars inherit TokenOwner on elevated tokens.
+    verify_private_store_file_on_handle(file.get())
 }
 
 pub(crate) fn windows_read_existing_private(
@@ -2620,5 +2680,162 @@ mod tests {
             conn.close().expect("close2");
             assert!(!refused, "{}", diagnostics.join("\n"));
         }
+    }
+
+    /// Explicit store-file create remains current-user owned (strict gate),
+    /// while an existing store file may be owned by SYSTEM or Administrators
+    /// **only** together with the strict trusted DACL. A trusted owner never
+    /// skips DACL validation.
+    #[test]
+    fn store_file_trusted_owner_requires_strict_trusted_acl() {
+        let _privilege = enable_restore_privilege();
+        let (_dir, base) = tmpdir();
+        let dir = base.join("store");
+        ensure_private_store_dir(&dir).expect("store dir");
+        let db = dir.join("hs-server.db");
+        create_private_store_file(&db).expect("create");
+
+        // Create remains current user: strict recovery-style gate must pass
+        // before any owner mutation.
+        {
+            let (parent, name) = open_parent_nofollow(&db, DirRole::ProductDir).expect("parent");
+            let file = open_relative(
+                parent.get(),
+                &name,
+                false,
+                false,
+                None,
+                OpenRights::FileRead,
+            )
+            .expect("open created store");
+            verify_private_object_on_handle(file.get())
+                .expect("explicit store create must remain currentUser");
+        }
+
+        let admin = well_known_sid(WinBuiltinAdministratorsSid).expect("admins");
+        let system = well_known_sid(WinLocalSystemSid).expect("sys");
+
+        // Trusted owners pass only with the strict trusted DACL already on
+        // the created store file.
+        set_owner(&db, admin.as_psid());
+        verify_private_store_file(&db).expect("Administrators owner + trusted ACL must pass");
+        set_owner(&db, system.as_psid());
+        verify_private_store_file(&db).expect("SYSTEM owner + trusted ACL must pass");
+
+        // Trusted owner never skips DACL checks: foreign granting ACE fails.
+        set_owner(&db, admin.as_psid());
+        let users = well_known_sid(WinBuiltinUsersSid).expect("users");
+        add_ace(&db, users.as_psid(), 0x001F_01FF, 0);
+        let err = verify_private_store_file(&db)
+            .expect_err("trusted owner + foreign granting ACE must refuse");
+        assert!(
+            err.to_string().contains("allowlist") || err.to_string().contains("refusing"),
+            "err={err}"
+        );
+    }
+
+    /// Trusted store owner with NULL or foreign-granting DACL
+    /// must fail closed.
+    #[test]
+    fn trusted_store_owner_with_untrusted_dacl_is_refused() {
+        let _privilege = enable_restore_privilege();
+        let admin = well_known_sid(WinBuiltinAdministratorsSid).expect("admins");
+        let users = well_known_sid(WinBuiltinUsersSid).expect("users");
+
+        // NULL DACL
+        {
+            let (_dir, base) = tmpdir();
+            let dir = base.join("store");
+            ensure_private_store_dir(&dir).expect("store dir");
+            let db = dir.join("hs-server.db");
+            create_private_store_file(&db).expect("create");
+            set_owner(&db, admin.as_psid());
+            set_null_dacl(&db);
+            let err =
+                verify_private_store_file(&db).expect_err("trusted owner + NULL DACL must refuse");
+            assert!(
+                err.to_string().contains("NULL DACL") || err.to_string().contains("refusing"),
+                "err={err}"
+            );
+        }
+
+        // Foreign granting ACE (including inherit-only must already fail via
+        // existing SID allowlist; current-write foreign grant proves the
+        // owner exception does not open DACL).
+        {
+            let (_dir, base) = tmpdir();
+            let dir = base.join("store");
+            ensure_private_store_dir(&dir).expect("store dir");
+            let db = dir.join("hs-server.db");
+            create_private_store_file(&db).expect("create");
+            set_owner(&db, admin.as_psid());
+            add_ace(
+                &db,
+                users.as_psid(),
+                0x001F_01FF,
+                INHERIT_ONLY_ACE | OBJECT_INHERIT_ACE,
+            );
+            let err = verify_private_store_file(&db)
+                .expect_err("trusted owner + foreign inherit-only granting ACE must refuse");
+            assert!(
+                err.to_string().contains("allowlist") || err.to_string().contains("refusing"),
+                "err={err}"
+            );
+        }
+    }
+
+    /// Foreign / TrustedInstaller store owners fail even with an otherwise
+    /// trusted DACL, and verification never mutates the file bytes.
+    #[test]
+    fn foreign_or_ti_store_owner_with_trusted_acl_fails_bytes_unchanged() {
+        let _privilege = enable_restore_privilege();
+        let ti = trusted_installer_sid().expect("ti");
+        let users = well_known_sid(WinBuiltinUsersSid).expect("users");
+        let payload = b"STORE-BYTES-UNCHANGED";
+
+        for owner in [ti.as_psid(), users.as_psid()] {
+            let (_dir, base) = tmpdir();
+            let dir = base.join("store");
+            ensure_private_store_dir(&dir).expect("store dir");
+            let db = dir.join("hs-server.db");
+            create_private_store_file(&db).expect("create");
+            std::fs::write(&db, payload).expect("seed bytes");
+            set_owner(&db, owner);
+            let err = verify_private_store_file(&db)
+                .expect_err("foreign/TI store owner must refuse trusted DACL");
+            assert!(
+                err.to_string()
+                    .contains("owned by the current process principal")
+                    || err.to_string().contains("refusing credential store"),
+                "err={err}"
+            );
+            assert_eq!(
+                std::fs::read(&db).expect("read after refusal"),
+                payload,
+                "owner refusal must not mutate store bytes"
+            );
+        }
+    }
+
+    /// Generic recovery private read keeps the strict current-user owner
+    /// gate even when the DACL is trusted (Admin-owned recovery material is
+    /// refused).
+    #[test]
+    fn recovery_private_read_retains_strict_owner() {
+        let _privilege = enable_restore_privilege();
+        let (_dir, base) = tmpdir();
+        let path = base.join("recovery.key");
+        create_new_private_file(&path, b"RECOVERY-SECRET").expect("create recovery");
+        // Trusted DACL is already present; only the owner becomes Admin.
+        let admin = well_known_sid(WinBuiltinAdministratorsSid).expect("admins");
+        set_owner(&path, admin.as_psid());
+        let err = read_existing_private_file(&path, 64)
+            .expect_err("recovery read must keep strict currentUser owner");
+        assert!(
+            err.to_string()
+                .contains("owned by the current process principal")
+                || err.to_string().contains("refusing"),
+            "err={err}"
+        );
     }
 }

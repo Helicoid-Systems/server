@@ -14,8 +14,7 @@ security-state-unavailable behavior.
 
 Repository: https://github.com/Helicoid-Systems/server. Durable release identifiers remain pending.
 
-The Windows private-store candidate is under native review. [CI 38165068195](https://github.com/Helicoid-Systems/server/actions/runs/38165068195) passes ancestor and scoped-privilege checks but fails four database/SQLite owner checks. The reviewed fixture repair creates private seed files before SQLite opens them; bounded test diagnostics identify recreated sidecar and default-owner roles. Production owner policy is unchanged pending actual Windows evidence. The coordinator passes 240 Mac tests, formatting, strict Clippy/build and Windows source type checks. Main retains accepted server `3a20aa0` until the complete native suite passes; public listeners, Windows TLS, installed services and recovery remain unavailable. Exact acceptance boundaries are recorded in [BUILD-REPORT.md](BUILD-REPORT.md).
-
+The Windows private-store repair is awaiting a fresh complete native run. [CI 38167890462](https://github.com/Helicoid-Systems/server/actions/runs/38167890462) passed Linux and 67 Windows library tests; its two remaining failures identified SQLite-recreated WAL/SHM owners as Administrators, matching the elevated token's default owner. Existing SQLite store files now accept current user, SYSTEM or Administrators ownership only with the unchanged strict trusted DACL and protected product-parent checks. Recovery/key/material reads, product directories and explicit creates retain current-user ownership. TrustedInstaller and foreign owners remain refused for store files. Main retains accepted server `3a20aa0` until the entire native gate passes. Windows TLS, public listeners, installed services and recovery remain unavailable. Exact acceptance boundaries are recorded in [BUILD-REPORT.md](BUILD-REPORT.md).
 
 ## What this foundation is
 
@@ -40,7 +39,7 @@ The Windows private-store candidate is under native review. [CI 38165068195](htt
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
 | Windows/macOS host installation | Unavailable in this server build |
-| Windows persistent v2 MFA | **Candidate / native Not Verified**: held no-follow handles, exact owner/SYSTEM/Administrators ACL and trusted file-child inheritance. Full native CI must pass before integration adoption |
+| Windows persistent v2 MFA | **Candidate / native Not Verified**: held no-follow handles, strict current-user directories/material, trusted SQLite file owners and current-user/SYSTEM/Administrators ACLs with trusted file-child inheritance. Full native CI must pass before integration adoption |
 
 Legacy v1 Manager `public_identity` values are **not** cryptographic production identities.
 They are development fixtures for local/loopback integration until B03 freezes
@@ -49,7 +48,7 @@ signed endpoint/manager identity formats. Do not invent grant formats.
 MFA-enrolled accounts refuse legacy password-only login through the service,
 HTTP route and CLI. The final session transaction rechecks MFA state, account
 state, the verified password hash and manager approval. Legacy accounts without
-MFA remain an explicitly loopback-only development path. The Windows private-store candidate requires private current-user ownership and trusted child inheritance before explicit migration;
+MFA remain an explicitly loopback-only development path. The Windows private-store candidate requires a protected current-user product directory, trusted child inheritance and verified trusted SQLite file ownership before explicit migration;
 native refusal tests retain both the original database bytes and no-output checks.
 
 The [v2 development contract](contracts/http-v2.md) describes deployment-bound
