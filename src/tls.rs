@@ -8,8 +8,9 @@
 //!
 //! This is HTTPS *transport* only. A public listener remains unavailable
 //! until complete auth/device/channel/route gates pass; no v1/bootstrap or
-//! setup UI is exposed publicly here. Windows is explicitly unsupported
-//! until a native private credential boundary exists.
+//! setup UI is exposed publicly here. Literal-loopback serve-tls is available
+//! on Unix and Windows through the native-verified private_file held reader;
+//! all other platforms remain explicitly unsupported.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -41,10 +42,11 @@ pub const TLS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
 /// True when this platform has a verified private credential boundary for
-/// TLS material. Windows is false in this build (no native-verified
-/// owner/SYSTEM/administrators DACL path).
+/// TLS material. Unix and Windows qualify through the native-verified
+/// private_file held reader (no path reopen, held descriptor, bounded
+/// zeroized reads). All other platforms remain explicitly unsupported.
 pub fn tls_transport_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// Validated listener + server TLS configuration.
@@ -86,7 +88,7 @@ pub fn validate_serve_tls_inputs(
         return Err(AppError::not_implemented(
             "HTTPS transport is not supported on this platform; \
              refusing serve-tls without a native-verified private credential boundary. \
-             Unix verified; Windows explicitly unsupported until that boundary exists.",
+             Unix and Windows verified; all other platforms explicitly unsupported.",
         ));
     }
 

@@ -14,9 +14,9 @@ security-state-unavailable behavior.
 
 Repository: https://github.com/Helicoid-Systems/server. Durable release identifiers remain pending.
 
-The Windows private-store prerequisite now passes complete [native CI38252656196](https://github.com/Helicoid-Systems/server/actions/runs/38252656196) at code `f01019faa41d484f7ce43bcc0f0559834ad9d10c`: **235 Linux and 226 Windows tests**, strict Clippy, Windows release build and real PowerShell 5.1/7 launcher checks. The coordinator independently passes **242 Mac tests**, verifies the downloaded archive digest and PE x64 executable, and checks all companion scripts against source. [Download the development server bundle](https://github.com/Helicoid-Systems/server/actions/runs/38252656196/artifacts/11748988843).
+The Windows private-store prerequisite passes complete [native CI38252656196](https://github.com/Helicoid-Systems/server/actions/runs/38252656196) at code `f01019faa41d484f7ce43bcc0f0559834ad9d10c`: **235 Linux and 226 Windows tests**, strict Clippy, Windows release build and real PowerShell 5.1/7 launcher checks. The coordinator independently passes **242 Mac tests**, verifies the downloaded archive digest and PE x64 executable, and checks all companion scripts against source. [Download the development server bundle](https://github.com/Helicoid-Systems/server/actions/runs/38252656196/artifacts/11748988843). **That accepted `f01019f` artifact does not include Windows HTTPS hosting** (it exercises explicit Windows TLS refusal). Windows literal-loopback `serve-tls` exists only in this unaccepted source candidate and is **native Not Verified**.
 
-Existing SQLite store files accept only currentUser/SYSTEM/Administrators ownership together with the strict held DACL/shape/link and protected-parent boundary. New objects, recovery/key reads and product directories remain current-user owned; foreign and TrustedInstaller store owners remain refused. The launcher chooses a missing path and lets the server create its protected folder. Windows TLS, public authentication/listeners, installed services, recovery cutover and signing remain unavailable. This is a native private-store/MFA/CLI prerequisite, not a completed deployment or worker/admission checkpoint. Historical failures and acceptance boundaries are in [BUILD-REPORT.md](BUILD-REPORT.md).
+Existing SQLite store files accept only currentUser/SYSTEM/Administrators ownership together with the strict held DACL/shape/link and protected-parent boundary. New objects, recovery/key reads and product directories remain current-user owned; foreign and TrustedInstaller store owners remain refused. The launcher chooses a missing path and lets the server create its protected folder. **Candidate (unaccepted source, agent-checked on Mac only):** literal-loopback HTTPS (`serve-tls`) on Unix and Windows through the native-verified private_file held reader. Public authentication/listeners, installed services, recovery cutover and signing remain unavailable. This is a native private-store/MFA/CLI prerequisite plus an unaccepted Windows loopback TLS source candidate, not a completed deployment or worker/admission checkpoint. Historical failures and acceptance boundaries are in [BUILD-REPORT.md](BUILD-REPORT.md).
 
 ## What this foundation is
 
@@ -37,7 +37,7 @@ Existing SQLite store files accept only currentUser/SYSTEM/Administrators owners
 | File jobs / authority recovery and cutover | Explicitly unavailable (`501`) |
 | Remote control / screen observation | Not present (B02/B03/RD03 proofs pending) |
 | Bind policy | **Literal loopback only** (`127.0.0.1` / `::1`); other binds refused |
-| HTTPS transport | `serve-tls`, default `127.0.0.1:8920`, maintained rustls TLS1.2/1.3 and private held-descriptor material reads; Unix only; public routes remain closed |
+| HTTPS transport | `serve-tls`, default `127.0.0.1:8920`, maintained rustls TLS1.2/1.3 and private held-descriptor material reads on Unix and Windows **in this unaccepted source candidate** (accepted `f01019f` download still refuses Windows TLS; native Not Verified for the candidate); public routes remain closed |
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
 | Windows/macOS host installation | Unavailable in this server build |
@@ -55,8 +55,10 @@ native refusal tests retain both the original database bytes and no-output check
 
 The [v2 development contract](contracts/http-v2.md) describes deployment-bound
 Ed25519 challenges, administrator enrollment, transaction boundaries and recovery
-limits. Unix HTTPS transport is implemented as a loopback prerequisite. Production trust adoption, public authentication and public routes remain unavailable.
-The v1 HTTP wire contract remains version 1; health separately reports storage schema version 2. Current complete acceptance is **242 Mac,235 Linux and 226 Windows tests**. Native counts come from [CI38252656196](https://github.com/Helicoid-Systems/server/actions/runs/38252656196); Mac checks were reproduced by the coordinator. Earlier authority-only and Unix TLS counts are historical evidence in the build report.
+limits. Literal-loopback HTTPS transport is implemented on Unix and Windows as a
+loopback prerequisite. Production trust adoption, public authentication and
+public routes remain unavailable.
+The v1 HTTP wire contract remains version 1; health separately reports storage schema version 2. Last coordinator-accepted complete native acceptance is **242 Mac,235 Linux and 226 Windows tests** at the private-store pin (CI38252656196 / `f01019f` download; Windows TLS unavailable in that artifact). Agent Mac checks on the Windows loopback TLS source candidate are labeled agent in BUILD-REPORT.md; native counts for that change are **Not Verified** until the next fresh CI run and artifact gate. Earlier authority-only and Unix TLS counts are historical evidence in the build report.
 
 Platform-split of `tests/installer_adapter.rs` (29 total): **19 portable**
 (listener/parser/systemctl decode, read bounds, injected query faults) run on
@@ -71,9 +73,9 @@ Current native private-store/MFA/CLI prerequisite:
 | --- | --- | --- |
 | macOS | **242** | Coordinator full tests, formatting, strict Clippy and build |
 | Linux | **235** | Native full tests, formatting and strict Clippy |
-| Windows Server 2025 CI | **226** | Native full tests, strict Clippy, release and actual PowerShell 5.1/7 private-ACL/launcher checks; Windows TLS and installed Windows 11 runtime remain unavailable/unverified |
+| Windows Server 2025 CI | **226** | Native full tests, strict Clippy, release and actual PowerShell 5.1/7 private-ACL/launcher checks at the private-store pin; Windows loopback TLS sources change after that pin and need a fresh native run; installed Windows 11 runtime remains unavailable/unverified |
 
-`hs-server --data /private-product-directory/hs-server.db serve-tls --tls-cert /private-product-directory/server.crt --tls-key /private-product-directory/server.key` requires operator-supplied certificate/key files. Each file is bounded at64KiB, owner-only, regular, singly linked and read through its verified held descriptor. It refuses malformed/mismatched material before opening data. Public binds and Windows TLS hosting refuse before reading material or creating data. Bootstrap remains local-only or inside verified SSH tunnels. These checks do not establish installation or enrollment readiness.
+`hs-server --data /private-product-directory/hs-server.db serve-tls --tls-cert /private-product-directory/server.crt --tls-key /private-product-directory/server.key` requires operator-supplied certificate/key files. Each file is bounded at64KiB, owner-only, regular, singly linked and read through its verified held descriptor. It refuses malformed/mismatched material before opening data. Public binds refuse before reading material or creating data on every platform. Bootstrap remains local-only or inside verified SSH tunnels. These checks do not establish installation or enrollment readiness.
 
 In-memory (nonpersistent) auth v2 tests run on **every** platform including
 Windows and exercise real TOTP/Ed25519/recovery crypto. They are **not** a
@@ -156,8 +158,10 @@ username `admin` (password is whatever you entered at the prompt).
 This candidate verifies held-handle owner/DACL boundaries before opening or
 creating persistent credentials. Existing objects are never silently re-ACL'd;
 unknown principals, unsafe namespace rights, aliases/reparse points and public
-SQLite sidecars are refused. Native Windows runtime acceptance is still pending.
-Installation, public hosting and Windows TLS are unavailable.
+SQLite sidecars are refused. Native Windows runtime acceptance of the earlier
+private-store pin is recorded above; the Windows loopback TLS source change in
+this revision still needs a fresh native CI run. Installation and public
+hosting remain unavailable. Literal-loopback HTTPS is implemented.
 
 The accepted downloaded baseline `3a20aa0` opens a **legacy loopback development** store
 (`StoreCapability::PersistentUnverified`):
@@ -221,4 +225,4 @@ from an existing terminal. The CMD launcher keeps errors visible after the
 child process stops and preserves the configured execution policy.
 
 
-Current HTTPS prerequisite code `ccaf29a` passed **238 Mac, 231 Linux and189 native Windows tests**, formatting/Clippy/build and the actual Windows PowerShell development fixture. [Native CI38143445740](https://github.com/Helicoid-Systems/server/actions/runs/38143445740) provides the [Windows x64 development server](https://github.com/Helicoid-Systems/server/actions/runs/38143445740/artifacts/11703299972). Windows exercises explicit TLS/private-MFA refusal; it does not support HTTPS hosting in this revision. Public connections, installed services and production recovery remain unavailable.
+Historical HTTPS prerequisite code `ccaf29a` passed **238 Mac, 231 Linux and189 native Windows tests**, formatting/Clippy/build and the actual Windows PowerShell development fixture. [Native CI38143445740](https://github.com/Helicoid-Systems/server/actions/runs/38143445740) provides the [Windows x64 development server](https://github.com/Helicoid-Systems/server/actions/runs/38143445740/artifacts/11703299972). That revision refused Windows HTTPS hosting. The current tree enables literal-loopback `serve-tls` on Unix and Windows through the native-verified private_file held reader; public connections, installed services and production recovery remain unavailable. Agent Mac checks on this revision are recorded in BUILD-REPORT.md; native Linux/Windows CI for the TLS enablement is Not Verified until the next coordinator run.

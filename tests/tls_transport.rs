@@ -2,45 +2,46 @@
 //!
 //! Platform applicability:
 //! - Portable tests (help/default text, required flags, public-bind refusal
-//!   with zero DB) run on Unix and Windows.
-//! - Unix-only success helpers and genuine TLS socket tests are `cfg(unix)`:
-//!   production `load_server_config` / private writer return `NotImplemented`
-//!   on Windows, so a fixture that calls `create_new_private_file` cannot
-//!   succeed there.
-//! - Windows keeps explicit denial tests (library + actual CLI). No
-//!   production mock bypass for Windows unsupported private stores.
+//!   with zero DB) run on every platform.
+//! - Disposable PKI / material parse / bounds / binding / real TLS socket /
+//!   actual-binary HTTPS proofs are `cfg(any(unix, windows))`: they use the
+//!   native-verified private_file held reader and the supported-platform TLS
+//!   transport. Other targets must not compile or run those helpers.
+//! - True Unix filesystem fixtures (mode 0644, FIFO, symlink, hardlink) and
+//!   the macOS extended-ACL fixture stay `cfg(unix)` / `cfg(target_os)`.
+//! - Windows process cleanup uses owned `Child::kill`/`wait` only — that is
+//!   not a graceful CTRL_C/service-stop proof.
 //!
 //! Scope:
 //! - Library/fixture socket tests use a short-handshake acceptor built from
 //!   `load_server_config` + `axum_server` on a `TcpListener`. They prove
 //!   material parsing, loopback gating, and real TLS I/O, **not** the CLI
-//!   process wiring or the production 10s handshake constant.
+//!   process wiring or the production 10s handshake constant. The fixture
+//!   acceptor uses 2s; the production constant stays `TLS_HANDSHAKE_TIMEOUT`
+//!   (10s) and is asserted separately as a real bound.
 //! - `actual_cli_*` tests spawn the real `hs-server` binary and cover
 //!   required flags, default bind text, public refusal with zero DB, and
-//!   (Unix) HTTPS `/health` plus bounded SIGINT shutdown.
+//!   HTTPS `/health` (Unix also proves bounded SIGINT shutdown; Windows
+//!   proves bounded kill/reap process cleanup only).
 //!
 //! These tests use disposable rcgen-generated certificates written as test
 //! fixtures only. No runtime laboratory grant/CA exists in product code.
 //! Product apps stay closed; listeners here are literal loopback.
 
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
-#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hs_server::private_file::{create_new_private_file, read_existing_private_file};
-#[allow(unused_imports)]
-use hs_server::tls::tls_transport_supported;
-use hs_server::tls::{self, run_serve_tls};
-
-#[cfg(unix)]
+use hs_server::private_file::create_new_private_file;
+#[cfg(any(unix, windows))]
+use hs_server::private_file::read_existing_private_file;
+use hs_server::tls::{self, DEFAULT_TLS_BIND};
+#[cfg(any(unix, windows))]
 use hs_server::tls::{
-    load_server_config, MAX_TLS_CERT_CHAIN, MAX_TLS_PEM_BYTES, TLS_HANDSHAKE_TIMEOUT,
-    TLS_SHUTDOWN_TIMEOUT,
+    load_server_config, run_serve_tls, MAX_TLS_CERT_CHAIN, MAX_TLS_PEM_BYTES,
+    TLS_HANDSHAKE_TIMEOUT, TLS_SHUTDOWN_TIMEOUT,
 };
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::Arc;
 
 /// Tempdir whose `base` is a genuine private product child on Windows
@@ -79,8 +80,7 @@ fn mode_of(path: &Path) -> u32 {
 }
 
 /// Write an existing private file without create-new semantics (for fixtures
-/// that must start at a non-0600 mode or empty contents). Unix-only helpers
-/// use this; Windows denial tests seed with `std::fs::write`.
+/// that must start at a non-0600 mode). Unix-only helpers use this.
 #[cfg(unix)]
 fn write_fixture(path: &Path, contents: &[u8], mode: u32) {
     std::fs::write(path, contents).expect("write fixture");
@@ -88,9 +88,33 @@ fn write_fixture(path: &Path, contents: &[u8], mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod fixture");
 }
 
-// ----- disposable rcgen test material (Unix fixtures only) -----
+/// Write TLS/fixture material as a genuine private file on every supported
+/// platform.
+///
+/// Unix: owner-only `0600` write (matches the historical fixtures).
+/// Windows: `create_new_private_file` inside the product child (protected
+/// DACL from create-new; never re-ACL an existing object). Oversize payloads
+/// exceed the create-new bound, so Windows seeds a private file then replaces
+/// contents without mutating its DACL — the held reader still sees a genuine
+/// private object and applies the oversize refusal.
+#[cfg(any(unix, windows))]
+fn write_private_material(path: &Path, contents: &[u8]) {
+    #[cfg(unix)]
+    write_fixture(path, contents, 0o600);
+    #[cfg(windows)]
+    {
+        if contents.len() > hs_server::private_file::MAX_PRIVATE_PAYLOAD_BYTES {
+            create_new_private_file(path, b"seed").expect("seed private fixture");
+            std::fs::write(path, contents).expect("write oversize private fixture");
+        } else {
+            create_new_private_file(path, contents).expect("create private fixture");
+        }
+    }
+}
 
-#[cfg(unix)]
+// ----- disposable rcgen test material (Unix + Windows fixtures) -----
+
+#[cfg(any(unix, windows))]
 struct TestPki {
     ca_pem: String,
     cert_pem: String,
@@ -98,7 +122,7 @@ struct TestPki {
 }
 
 /// Generate a throwaway CA and a server certificate for `sans`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn test_pki(sans: &[&str]) -> TestPki {
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 
@@ -126,7 +150,7 @@ fn test_pki(sans: &[&str]) -> TestPki {
 }
 
 /// Write cert/key as private files under `base` and return their paths.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn write_tls_material(base: &Path, pki: &TestPki) -> (PathBuf, PathBuf) {
     let cert_path = base.join("server.crt");
     let key_path = base.join("server.key");
@@ -136,6 +160,8 @@ fn write_tls_material(base: &Path, pki: &TestPki) -> (PathBuf, PathBuf) {
 }
 
 // ----- held-file reader refusals (no path re-open after verify) -----
+// True Unix mode/link/FIFO/symlink fixtures stay Unix. Windows coverage for
+// the same boundary uses make_public_file and the TLS loader below.
 
 #[cfg(unix)]
 #[test]
@@ -265,11 +291,11 @@ fn held_file_missing_path_is_refused() {
     let _ = err;
 }
 
-/// Grant an unknown SID (Everyone) read access so the file is genuinely
-/// non-private. `SetNamedSecurityInfoW` takes an ACL only. Aligned `Vec<u64>`
-/// / array storage; buffers live through the call.
+/// Replace the DACL of an existing file with a test Everyone-allow ACL.
+/// `SetNamedSecurityInfoW` writes the DACL only; the owner is unchanged.
+/// Aligned `Vec<u64>` / array storage; buffers live through the call.
 #[cfg(windows)]
-fn make_public_file(path: &std::path::Path, contents: &[u8]) {
+fn install_untrusted_allow_dacl(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
@@ -277,7 +303,6 @@ fn make_public_file(path: &std::path::Path, contents: &[u8]) {
         DACL_SECURITY_INFORMATION, PSID,
     };
     use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_LIST_DIRECTORY};
-    std::fs::write(path, contents).expect("write public fixture");
 
     let mut world_storage = [0u64; 9];
     let mut world_len = std::mem::size_of_val(&world_storage) as u32;
@@ -316,22 +341,56 @@ fn make_public_file(path: &std::path::Path, contents: &[u8]) {
     }
 }
 
+/// Build a non-private leaf whose owner is the current user.
+///
+/// The leaf is created through `create_new_private_file` first (currentUser
+/// owner + protected DACL). Only then is its DACL replaced with the test
+/// Everyone-allow ACL. Elevated CI default owner is Administrators, so a
+/// raw `std::fs::write` leaf would be refused on owner before the reader
+/// ever inspects the untrusted DACL — that would not exercise this boundary.
+#[cfg(windows)]
+fn make_public_file(path: &Path, contents: &[u8]) {
+    create_new_private_file(path, contents).expect("create owned private leaf");
+    // Positive precondition: genuine private material is readable.
+    let got = read_existing_private_file(path, contents.len()).expect("private held read");
+    assert_eq!(
+        got.as_slice(),
+        contents,
+        "fixture contents before DACL mutation"
+    );
+    install_untrusted_allow_dacl(path);
+}
+
+/// Refusal must be the nontrusted-principal / DACL allowlist boundary, not a
+/// broad owner or shape mismatch that could mask a bad fixture.
+#[cfg(windows)]
+fn assert_untrusted_dacl_refusal(msg: &str) {
+    assert!(
+        msg.contains("ACCESS_ALLOWED ACE names a principal outside the")
+            || msg.contains("principal outside the")
+            || (msg.contains("ACCESS_ALLOWED ACE") && msg.contains("allowlist")),
+        "expected nontrusted-principal/DACL refusal, msg={msg}"
+    );
+    assert!(
+        !msg.contains("not owned"),
+        "must be DACL/principal refusal, not owner: {msg}"
+    );
+    assert!(
+        !msg.contains("not a regular file"),
+        "must be DACL/principal refusal, not shape: {msg}"
+    );
+}
+
 #[cfg(windows)]
 #[test]
-fn windows_held_file_read_refuses_public_file_and_reads_private() {
+fn windows_held_file_read_refuses_untrusted_dacl_and_reads_private() {
     let (_dir, base) = private_tempdir();
     let public_path = base.join("public.pem");
     make_public_file(&public_path, b"PUBLIC");
     let err =
         read_existing_private_file(&public_path, 1024).expect_err("must refuse non-private file");
     let msg = err.to_string();
-    assert!(
-        msg.contains("not owned")
-            || msg.contains("refusing")
-            || msg.contains("private")
-            || msg.contains("allowlist"),
-        "msg={msg}"
-    );
+    assert_untrusted_dacl_refusal(&msg);
     assert!(!msg.contains("PUBLIC"));
 
     let private_path = base.join("material.pem");
@@ -342,7 +401,7 @@ fn windows_held_file_read_refuses_public_file_and_reads_private() {
 
 // ----- TLS PEM bounds and binding (before any listener/DB) -----
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn load_rejects_missing_files_without_db() {
     let (_dir, base) = private_tempdir();
@@ -357,7 +416,7 @@ fn load_rejects_missing_files_without_db() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn load_rejects_oversize_material_without_db() {
     let (_dir, base) = private_tempdir();
@@ -365,8 +424,8 @@ fn load_rejects_oversize_material_without_db() {
     let cert = base.join("big.crt");
     let key = base.join("big.key");
     let big = vec![b'A'; MAX_TLS_PEM_BYTES + 1];
-    write_fixture(&cert, &big, 0o600);
-    write_fixture(&key, &big, 0o600);
+    write_private_material(&cert, &big);
+    write_private_material(&key, &big);
     let err =
         run_serve_tls(&data, "127.0.0.1:8920", &cert, &key).expect_err("must refuse oversize");
     let msg = err.to_string();
@@ -377,7 +436,7 @@ fn load_rejects_oversize_material_without_db() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn load_rejects_empty_certificate_pem_without_db() {
     let (_dir, base) = private_tempdir();
@@ -386,10 +445,9 @@ fn load_rejects_empty_certificate_pem_without_db() {
     let cert = base.join("empty.crt");
     let key = base.join("server.key");
     // Cert file holds no certificates.
-    write_fixture(
+    write_private_material(
         &cert,
         b"-----BEGIN NOTES-----\nnot-a-cert\n-----END NOTES-----\n",
-        0o600,
     );
     create_new_private_file(&key, pki.key_pem.as_bytes()).expect("key");
     let err = run_serve_tls(&data, "127.0.0.1:8920", &cert, &key).expect_err("must refuse");
@@ -401,7 +459,7 @@ fn load_rejects_empty_certificate_pem_without_db() {
     assert!(!data.exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn load_rejects_chain_longer_than_bound() {
     let (_dir, base) = private_tempdir();
@@ -413,7 +471,7 @@ fn load_rejects_chain_longer_than_bound() {
     for _ in 0..(MAX_TLS_CERT_CHAIN + 1) {
         chain.push_str(&pki.cert_pem);
     }
-    write_fixture(&cert, chain.as_bytes(), 0o600);
+    write_private_material(&cert, chain.as_bytes());
     create_new_private_file(&key, pki.key_pem.as_bytes()).expect("key");
     let err = run_serve_tls(&data, "127.0.0.1:8920", &cert, &key).expect_err("must refuse chain");
     let msg = err.to_string();
@@ -424,7 +482,7 @@ fn load_rejects_chain_longer_than_bound() {
     assert!(!data.exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn load_rejects_duplicate_keys() {
     let (_dir, base) = private_tempdir();
@@ -437,14 +495,14 @@ fn load_rejects_duplicate_keys() {
     keys.push_str(&pki.key_pem);
     keys.push_str(&other.key_pem);
     create_new_private_file(&cert, pki.cert_pem.as_bytes()).expect("cert");
-    write_fixture(&key, keys.as_bytes(), 0o600);
+    write_private_material(&key, keys.as_bytes());
     let err = run_serve_tls(&data, "127.0.0.1:8920", &cert, &key).expect_err("duplicate keys");
     let msg = err.to_string();
     assert!(msg.contains("exactly one private key"), "msg={msg}");
     assert!(!data.exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn load_rejects_zero_keys() {
     let (_dir, base) = private_tempdir();
@@ -453,10 +511,9 @@ fn load_rejects_zero_keys() {
     let cert = base.join("server.crt");
     let key = base.join("nokey.key");
     create_new_private_file(&cert, pki.cert_pem.as_bytes()).expect("cert");
-    write_fixture(
+    write_private_material(
         &key,
         b"-----BEGIN NOTES-----\nno key here\n-----END NOTES-----\n",
-        0o600,
     );
     let err = run_serve_tls(&data, "127.0.0.1:8920", &cert, &key).expect_err("zero keys");
     let msg = err.to_string();
@@ -467,7 +524,7 @@ fn load_rejects_zero_keys() {
     assert!(!data.exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn load_rejects_mismatched_key_before_db_and_bind() {
     let (_dir, base) = private_tempdir();
@@ -491,7 +548,34 @@ fn load_rejects_mismatched_key_before_db_and_bind() {
     assert!(!data.exists(), "DB must not be created on mismatched key");
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[test]
+fn load_rejects_private_key_inside_certificate_file() {
+    let (_dir, base) = private_tempdir();
+    let data = base.join("hs-server.db");
+    let pki = test_pki(&["localhost"]);
+    let cert = base.join("cert-with-key.crt");
+    let key = base.join("server.key");
+    // Certificate file wrongly also holds the private key PEM.
+    let mut mixed = String::new();
+    mixed.push_str(&pki.cert_pem);
+    mixed.push_str(&pki.key_pem);
+    write_private_material(&cert, mixed.as_bytes());
+    create_new_private_file(&key, pki.key_pem.as_bytes()).expect("key");
+    let err = run_serve_tls(&data, "127.0.0.1:8920", &cert, &key).expect_err("must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("only X.509") || msg.contains("certificate PEM"),
+        "msg={msg}"
+    );
+    assert!(
+        !msg.contains("PRIVATE KEY") && !msg.contains("BEGIN"),
+        "no material in error"
+    );
+    assert!(!data.exists());
+}
+
+#[cfg(any(unix, windows))]
 #[test]
 fn public_bind_refuses_before_store_effects() {
     let (_dir, base) = private_tempdir();
@@ -522,7 +606,7 @@ fn public_bind_refuses_before_store_effects() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn loopback_bind_is_accepted_by_guard_and_material_loads() {
     let (_dir, base) = private_tempdir();
@@ -535,51 +619,93 @@ fn loopback_bind_is_accepted_by_guard_and_material_loads() {
 }
 
 /// Portable constant check: default bind is literal loopback :8920 on every
-/// platform, including Windows (which still refuses serve-tls later).
+/// platform.
 #[test]
 fn default_tls_bind_is_literal_loopback_8920() {
-    let addr: SocketAddr = tls::DEFAULT_TLS_BIND.parse().expect("default bind");
+    let addr: SocketAddr = DEFAULT_TLS_BIND.parse().expect("default bind");
     assert!(addr.ip().is_loopback());
     assert_eq!(addr.port(), 8920);
 }
 
+// ----- Windows: unsafe material refused by the actual TLS loader -----
+// Untrusted DACL and hardlink refusals run through the production held
+// reader / TLS loader before any DB or listener effect. Leaves are created
+// via create_new_private_file (currentUser owner) so refusal is the
+// DACL/principal boundary, not an elevated default-owner mismatch.
+
 #[cfg(windows)]
 #[test]
-fn windows_serve_tls_refuses_before_data_or_key_reads() {
+fn windows_tls_loader_refuses_untrusted_dacl_material_before_db() {
     let (_dir, base) = private_tempdir();
-    assert!(!tls_transport_supported(), "must not claim Windows TLS");
+    let pki = test_pki(&["localhost"]);
     let data = base.join("hs-server.db");
     let cert = base.join("server.crt");
     let key = base.join("server.key");
-    std::fs::write(
-        &cert,
-        b"-----BEGIN CERTIFICATE-----\nMIIA\n-----END CERTIFICATE-----\n",
-    )
-    .expect("seed cert");
-    std::fs::write(
-        &key,
-        b"-----BEGIN PRIVATE KEY-----\nMIIA\n-----END PRIVATE KEY-----\n",
-    )
-    .expect("seed key");
-    let err = run_serve_tls(&data, "127.0.0.1:8920", &cert, &key)
-        .expect_err("must deny serve-tls on Windows");
+
+    // Cert: owned private leaf, positive held read, then untrusted DACL.
+    create_new_private_file(&cert, pki.cert_pem.as_bytes()).expect("cert");
+    create_new_private_file(&key, pki.key_pem.as_bytes()).expect("key");
+    read_existing_private_file(&cert, MAX_TLS_PEM_BYTES).expect("private cert held read");
+    read_existing_private_file(&key, MAX_TLS_PEM_BYTES).expect("private key held read");
+    // Genuine private material loads before mutation (precondition).
+    let _ = load_server_config(&cert, &key).expect("private material loads");
+
+    install_untrusted_allow_dacl(&cert);
+    let err = load_server_config(&cert, &key).expect_err("untrusted cert DACL must be refused");
     let msg = err.to_string();
-    assert!(
-        msg.contains("not supported")
-            || msg.contains("not implemented")
-            || msg.contains("refusing"),
-        "msg={msg}"
-    );
-    assert!(!data.exists(), "no DB on Windows refusal");
-    assert!(!msg.contains("MIIA"), "no material in error");
+    assert_untrusted_dacl_refusal(&msg);
+    assert!(!msg.contains("BEGIN"), "no material in error");
+    let err = run_serve_tls(&data, "127.0.0.1:8920", &cert, &key)
+        .expect_err("untrusted cert DACL must refuse serve-tls");
+    let msg = err.to_string();
+    assert_untrusted_dacl_refusal(&msg);
+    assert!(!data.exists(), "no DB on untrusted cert DACL refusal");
+
+    // Key: fresh owned leaves, mutate only the key DACL.
+    let data2 = base.join("hs-server2.db");
+    let cert2 = base.join("server2.crt");
+    let key2 = base.join("server2.key");
+    create_new_private_file(&cert2, pki.cert_pem.as_bytes()).expect("cert");
+    create_new_private_file(&key2, pki.key_pem.as_bytes()).expect("key");
+    read_existing_private_file(&cert2, MAX_TLS_PEM_BYTES).expect("private cert2 held read");
+    read_existing_private_file(&key2, MAX_TLS_PEM_BYTES).expect("private key2 held read");
+    install_untrusted_allow_dacl(&key2);
+    let err = load_server_config(&cert2, &key2).expect_err("untrusted key DACL must be refused");
+    let msg = err.to_string();
+    assert_untrusted_dacl_refusal(&msg);
+    assert!(!msg.contains("BEGIN"), "no material in error");
+    let err = run_serve_tls(&data2, "127.0.0.1:8920", &cert2, &key2)
+        .expect_err("untrusted key DACL must refuse serve-tls");
+    let msg = err.to_string();
+    assert_untrusted_dacl_refusal(&msg);
+    assert!(!data2.exists(), "no DB on untrusted key DACL refusal");
 }
 
-// ----- genuine TLS sockets (fixture acceptor; not CLI wiring; Unix-only) -----
-// Windows cannot run these: load_server_config / private writer are
-// NotImplemented there. Portable and Windows denial coverage lives above
-// and in the actual CLI section below.
+#[cfg(windows)]
+#[test]
+fn windows_tls_loader_refuses_hardlinked_key_before_db() {
+    let (_dir, base) = private_tempdir();
+    let pki = test_pki(&["localhost"]);
+    let data = base.join("hs-server.db");
+    let (cert, key) = write_tls_material(&base, &pki);
+    let extra = base.join("extra-link.key");
+    std::fs::hard_link(&key, &extra).expect("hard link key");
+    let err = run_serve_tls(&data, "127.0.0.1:8920", &cert, &key)
+        .expect_err("hardlinked key must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("link count") || msg.contains("refusing"),
+        "msg={msg}"
+    );
+    assert!(!data.exists(), "no DB on hardlinked key refusal");
+}
 
-#[cfg(unix)]
+// ----- genuine TLS sockets (fixture acceptor; not CLI wiring) -----
+// Fixture acceptor handshake timeout is 2s so stalled-handshake tests stay
+// bounded. That does **not** prove the production 10s `TLS_HANDSHAKE_TIMEOUT`
+// constant; that bound is asserted explicitly below and in the CLI test.
+
+#[cfg(any(unix, windows))]
 struct TestServer {
     addr: SocketAddr,
     handle: axum_server::Handle<SocketAddr>,
@@ -587,18 +713,33 @@ struct TestServer {
     _db: tempfile::TempDir,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+impl TestServer {
+    /// Graceful shutdown with the original 2s grace / 5s join bounds, then
+    /// require all three layers: the join timeout must succeed, the
+    /// `JoinHandle` must not be a panic/`JoinError`, and the serve task's
+    /// inner `Result` must be `Ok`. The held TempDir stays alive until this
+    /// returns (no fixture cleanup before confirmed join).
+    async fn shutdown_and_confirm(self) {
+        self.handle.graceful_shutdown(Some(Duration::from_secs(2)));
+        let joined = tokio::time::timeout(Duration::from_secs(5), self.join)
+            .await
+            .expect("serve task must join within 5s bound");
+        let serve_result = joined.expect("serve task must not panic");
+        assert!(
+            serve_result.is_ok(),
+            "serve task inner result must be Ok: {serve_result:?}"
+        );
+    }
+}
+
+#[cfg(any(unix, windows))]
 async fn spawn_tls_server(base: &Path, pki: &TestPki) -> TestServer {
     let (cert_path, key_path) = write_tls_material(base, pki);
     let server_config = load_server_config(&cert_path, &key_path).expect("load server config");
     let config = axum_server::tls_rustls::RustlsConfig::from_config(server_config);
-    let db_dir = tempfile::tempdir().expect("db dir");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let p = db_dir.path().canonicalize().expect("canonicalize");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
-    let data = db_dir.path().join("hs-server.db");
+    let (db_dir, db_base) = private_tempdir();
+    let data = db_base.join("hs-server.db");
     let service = hs_server::open_service(&data).expect("open service");
     let app = hs_server::app(service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -612,6 +753,7 @@ async fn spawn_tls_server(base: &Path, pki: &TestPki) -> TestServer {
     let handle = axum_server::Handle::new();
     let server_handle = handle.clone();
     // Short handshake timeout so stalled-handshake tests stay bounded.
+    // Production serve-tls uses TLS_HANDSHAKE_TIMEOUT (10s), asserted below.
     let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(config)
         .handshake_timeout(Duration::from_secs(2));
     let join = tokio::spawn(async move {
@@ -630,7 +772,7 @@ async fn spawn_tls_server(base: &Path, pki: &TestPki) -> TestServer {
 }
 
 /// Client config that trusts only the supplied test CA (no OS fallback).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn client_config_for(ca_pem: &str) -> rustls::ClientConfig {
     use rustls::pki_types::pem::PemObject;
     use rustls::RootCertStore;
@@ -646,7 +788,7 @@ fn client_config_for(ca_pem: &str) -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn tls_get_health(
     addr: SocketAddr,
     client_config: rustls::ClientConfig,
@@ -686,7 +828,7 @@ async fn tls_get_health(
     serde_json::from_str(body).map_err(|err| format!("health JSON: {err} body={body:?}"))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn valid_test_ca_hostname_serves_real_health_json() {
     let (_dir, base) = private_tempdir();
@@ -709,13 +851,10 @@ async fn valid_test_ca_hostname_serves_real_health_json() {
             .is_some(),
         "health must be real JSON from /health: {health}"
     );
-    server
-        .handle
-        .graceful_shutdown(Some(Duration::from_secs(2)));
-    let _ = tokio::time::timeout(Duration::from_secs(5), server.join).await;
+    server.shutdown_and_confirm().await;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn foreign_ca_is_refused() {
     let (_dir, base) = private_tempdir();
@@ -730,13 +869,10 @@ async fn foreign_ca_is_refused() {
         err.contains("tls handshake") || err.contains("certificate") || err.contains("alert"),
         "err={err}"
     );
-    server
-        .handle
-        .graceful_shutdown(Some(Duration::from_secs(2)));
-    let _ = tokio::time::timeout(Duration::from_secs(5), server.join).await;
+    server.shutdown_and_confirm().await;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn wrong_hostname_is_refused() {
     let (_dir, base) = private_tempdir();
@@ -754,13 +890,10 @@ async fn wrong_hostname_is_refused() {
             || err.contains("NotValidForName"),
         "err={err}"
     );
-    server
-        .handle
-        .graceful_shutdown(Some(Duration::from_secs(2)));
-    let _ = tokio::time::timeout(Duration::from_secs(5), server.join).await;
+    server.shutdown_and_confirm().await;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn plaintext_request_cannot_access_http_body() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -788,13 +921,10 @@ async fn plaintext_request_cannot_access_http_body() {
         "plaintext must not receive an HTTP response, got: {text:?}"
     );
 
-    server
-        .handle
-        .graceful_shutdown(Some(Duration::from_secs(2)));
-    let _ = tokio::time::timeout(Duration::from_secs(5), server.join).await;
+    server.shutdown_and_confirm().await;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn stalled_handshake_is_bounded_and_dropped() {
     use tokio::io::AsyncReadExt;
@@ -827,17 +957,14 @@ async fn stalled_handshake_is_bounded_and_dropped() {
         elapsed < Duration::from_secs(5),
         "handshake close must be bounded, took {elapsed:?}"
     );
-    // Production constant stays a real bound.
-    assert!(TLS_HANDSHAKE_TIMEOUT >= Duration::from_secs(1));
-    assert!(TLS_HANDSHAKE_TIMEOUT <= Duration::from_secs(30));
+    // Production constant stays a real bound (fixture acceptor is 2s and does
+    // not prove this value).
+    assert_eq!(TLS_HANDSHAKE_TIMEOUT, Duration::from_secs(10));
 
-    server
-        .handle
-        .graceful_shutdown(Some(Duration::from_secs(2)));
-    let _ = tokio::time::timeout(Duration::from_secs(5), server.join).await;
+    server.shutdown_and_confirm().await;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn graceful_shutdown_is_bounded() {
     let (_dir, base) = private_tempdir();
@@ -859,13 +986,17 @@ async fn graceful_shutdown_is_bounded() {
         .graceful_shutdown(Some(TLS_SHUTDOWN_TIMEOUT.min(Duration::from_secs(3))));
     let joined = tokio::time::timeout(Duration::from_secs(8), server.join).await;
     let elapsed = start.elapsed();
-    assert!(joined.is_ok(), "graceful shutdown must complete");
+    let join_result = joined.expect("graceful shutdown must complete");
+    let serve_result = join_result.expect("serve task must not panic");
+    assert!(
+        serve_result.is_ok(),
+        "serve task inner result must be Ok: {serve_result:?}"
+    );
     assert!(
         elapsed < Duration::from_secs(7),
         "graceful shutdown must be bounded, took {elapsed:?}"
     );
-    assert!(TLS_SHUTDOWN_TIMEOUT >= Duration::from_secs(1));
-    assert!(TLS_SHUTDOWN_TIMEOUT <= Duration::from_secs(60));
+    assert_eq!(TLS_SHUTDOWN_TIMEOUT, Duration::from_secs(10));
 }
 
 // ----- macOS ACL helper (fixture only; mirrors private_file tests) -----
@@ -903,9 +1034,10 @@ fn add_everyone_allow_read_acl(path: &Path) {
 }
 
 // ----- actual `hs-server` binary CLI (implementation, not fixture acceptor) -----
-// Portable tests run on Unix and Windows. Unix-only CLI proofs that need a
-// live HTTPS listener or SIGINT are cfg(unix). Windows gets an explicit
-// denial test for serve-tls before material/data effects.
+// Portable tests run on every platform. Unix proves bounded SIGINT zero-exit
+// shutdown. Windows proves owned Child.kill/wait process cleanup only — that
+// is NOT a graceful CTRL_C/service-stop proof (the library Handle test above
+// is the portable graceful proof). No CTRL_C/CTRL_BREAK is broadcast.
 
 fn hs_server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hs-server"))
@@ -918,13 +1050,13 @@ fn reserve_loopback_port() -> u16 {
 }
 
 /// Owned `hs-server` child. `Drop` kills/waits only this child so a test
-/// panic before SIGINT cannot leak a live process (no shell cleanup).
-#[cfg(unix)]
+/// panic before shutdown cannot leak a live process (no shell cleanup).
+#[cfg(any(unix, windows))]
 struct CliChild {
     child: std::process::Child,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl CliChild {
     fn spawn(args: &[&str]) -> Self {
         let child = std::process::Command::new(hs_server_bin())
@@ -956,7 +1088,7 @@ impl CliChild {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for CliChild {
     fn drop(&mut self) {
         // Only the owned child is cleaned up — never a shell or other PIDs.
@@ -1056,70 +1188,15 @@ fn actual_cli_public_bind_refuses_with_zero_db() {
     assert!(!cert.exists() && !key.exists(), "no material files created");
 }
 
-/// Windows: actual CLI refuses serve-tls on literal loopback before
-/// material reads or DB creation (native private credential boundary is
-/// missing; NotImplemented / explicit refusal). Nonexistent cert/key paths.
-#[cfg(windows)]
-#[test]
-fn actual_windows_cli_refuses_serve_tls_before_material_or_data() {
-    let (_dir, base) = private_tempdir();
-    assert!(
-        !tls_transport_supported(),
-        "must not claim Windows TLS transport"
-    );
-    let data = base.join("hs-server.db");
-    let cert = base.join("missing.crt");
-    let key = base.join("missing.key");
-    let bind = format!("127.0.0.1:{}", reserve_loopback_port());
-    let out = std::process::Command::new(hs_server_bin())
-        .args([
-            "--data",
-            data.to_str().expect("data utf8"),
-            "serve-tls",
-            "--bind",
-            &bind,
-            "--tls-cert",
-            cert.to_str().expect("cert utf8"),
-            "--tls-key",
-            key.to_str().expect("key utf8"),
-        ])
-        .output()
-        .expect("run serve-tls on Windows");
-    assert!(
-        !out.status.success(),
-        "Windows serve-tls must refuse on literal loopback"
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("not supported")
-            || combined.contains("not implemented")
-            || combined.contains("refusing"),
-        "output={combined}"
-    );
-    assert!(!data.exists(), "no DB on Windows CLI refusal");
-    assert!(
-        !cert.exists() && !key.exists(),
-        "no material/output files created on Windows refusal"
-    );
-}
-
-/// Unix-only: live HTTPS `/health` against the real process plus bounded
-/// SIGINT shutdown. Needs create_new_private_file (NotImplemented on Windows).
-#[cfg(unix)]
-#[tokio::test]
-async fn actual_cli_https_health_and_bounded_sigint() {
-    let (_dir, base) = private_tempdir();
-    let pki = test_pki(&["localhost", "127.0.0.1"]);
-    let (cert, key) = write_tls_material(&base, &pki);
+/// Spawn the real process on an ephemeral literal-loopback port with genuine
+/// private material.
+#[cfg(any(unix, windows))]
+fn spawn_cli_tls(base: &Path, pki: &TestPki) -> (CliChild, SocketAddr, PathBuf) {
+    let (cert, key) = write_tls_material(base, pki);
     let data = base.join("hs-server.db");
     let port = reserve_loopback_port();
     let bind = format!("127.0.0.1:{port}");
-
-    let mut child = CliChild::spawn(&[
+    let child = CliChild::spawn(&[
         "--data",
         data.to_str().expect("data utf8"),
         "serve-tls",
@@ -1130,22 +1207,49 @@ async fn actual_cli_https_health_and_bounded_sigint() {
         "--tls-key",
         key.to_str().expect("key utf8"),
     ]);
-
-    // Wait until the real process accepts TCP on the requested port.
     let addr: SocketAddr = bind.parse().expect("bind addr");
-    let mut ready = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            ready = true;
-            break;
-        }
+    (child, addr, data)
+}
+
+/// Wait until the owned child accepts TCP, under a **single** 10s monotonic
+/// deadline. Each connect attempt is bounded by `timeout_at(deadline, …)` so
+/// an OS connect cannot outlive the deadline between attempts; the retry
+/// pause is an async sleep capped by the remaining time. Polls owned-child
+/// exit so a crash before listen fails fast. No CPU-blocking connect/sleep.
+#[cfg(any(unix, windows))]
+async fn wait_cli_listening(child: &mut CliChild, addr: SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
         if let Some(status) = child.try_wait() {
             panic!("hs-server exited before listen: {status:?}");
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            panic!("hs-server did not accept TCP within bound");
+        }
+        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(_stream)) => return,
+            Ok(Err(_)) => {
+                let next_attempt =
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(50));
+                tokio::time::sleep_until(next_attempt).await;
+            }
+            Err(_) => panic!("hs-server did not accept TCP within bound"),
+        }
     }
-    assert!(ready, "hs-server did not accept TCP within bound");
+}
+
+/// Unix-only: live HTTPS `/health` against the real process plus bounded
+/// SIGINT zero-exit shutdown.
+#[cfg(unix)]
+#[tokio::test]
+async fn actual_cli_https_health_and_bounded_sigint() {
+    let (_dir, base) = private_tempdir();
+    let pki = test_pki(&["localhost", "127.0.0.1"]);
+    let (mut child, addr, _data) = spawn_cli_tls(&base, &pki);
+    wait_cli_listening(&mut child, addr).await;
 
     // Real HTTPS /health against the actual process.
     let client = client_config_for(&pki.ca_pem);
@@ -1165,7 +1269,7 @@ async fn actual_cli_https_health_and_bounded_sigint() {
         "health must be real JSON: {health}"
     );
 
-    // Bounded SIGINT shutdown of the real process.
+    // Bounded SIGINT shutdown of the real process (Unix).
     send_sigint(&child.child);
     let start = std::time::Instant::now();
     let exit_status = child.wait_for_exit(Duration::from_secs(10));
@@ -1181,29 +1285,48 @@ async fn actual_cli_https_health_and_bounded_sigint() {
     // Drop is now a no-op (already reaped); it would kill on earlier panic.
 }
 
-#[cfg(unix)]
-#[test]
-fn load_rejects_private_key_inside_certificate_file() {
+/// Windows-only: live HTTPS `/health` against the real process, then owned
+/// `Child::kill`/`wait` process cleanup. This is NOT a graceful CTRL_C or
+/// service-stop proof — do not claim Windows CtrlC acceptance from kill.
+#[cfg(windows)]
+#[tokio::test]
+async fn actual_windows_cli_https_health_and_bounded_kill() {
     let (_dir, base) = private_tempdir();
-    let data = base.join("hs-server.db");
-    let pki = test_pki(&["localhost"]);
-    let cert = base.join("cert-with-key.crt");
-    let key = base.join("server.key");
-    // Certificate file wrongly also holds the private key PEM.
-    let mut mixed = String::new();
-    mixed.push_str(&pki.cert_pem);
-    mixed.push_str(&pki.key_pem);
-    write_fixture(&cert, mixed.as_bytes(), 0o600);
-    create_new_private_file(&key, pki.key_pem.as_bytes()).expect("key");
-    let err = run_serve_tls(&data, "127.0.0.1:8920", &cert, &key).expect_err("must refuse");
-    let msg = err.to_string();
+    let pki = test_pki(&["localhost", "127.0.0.1"]);
+    let (mut child, addr, data) = spawn_cli_tls(&base, &pki);
+    wait_cli_listening(&mut child, addr).await;
     assert!(
-        msg.contains("only X.509") || msg.contains("certificate PEM"),
-        "msg={msg}"
+        data.exists(),
+        "real CLI creates the store after material load"
+    );
+
+    // Actual pinned-TLS /health against the real process.
+    let client = client_config_for(&pki.ca_pem);
+    let health = tls_get_health(addr, client, "localhost")
+        .await
+        .expect("health against real CLI");
+    let status = health.get("status").and_then(|v| v.as_str());
+    assert!(
+        matches!(status, Some("ok") | Some("degraded")),
+        "health={health}"
     );
     assert!(
-        !msg.contains("PRIVATE KEY") && !msg.contains("BEGIN"),
-        "no material in error"
+        health
+            .get("storage_schema_version")
+            .and_then(|v| v.as_i64())
+            .is_some(),
+        "health must be real JSON: {health}"
     );
-    assert!(!data.exists());
+
+    // Owned kill/reap only (process cleanup). Not CTRL_C, not service-stop.
+    let start = std::time::Instant::now();
+    child.child.kill().expect("kill owned child");
+    let exit_status = child.wait_for_exit(Duration::from_secs(5));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "kill/reap must be bounded, took {elapsed:?}"
+    );
+    let _ = exit_status;
+    // Drop is now a no-op (already reaped); it would kill on earlier panic.
 }
