@@ -4,9 +4,15 @@
   Disposable literal-loopback hs-server development fixture for Helicoid.
 
 .DESCRIPTION
-  Creates a fresh unique database directory, runs hs-server init + bootstrap
-  with a fixed development manager identity (dev-manager-key), then serves on
-  127.0.0.1:8787 in the foreground until Ctrl+C.
+  Selects a fresh missing database directory path under an existing parent,
+  runs hs-server init + bootstrap with a fixed development manager identity
+  (dev-manager-key), then serves on 127.0.0.1:8787 in the foreground until
+  Ctrl+C.
+
+  Credential-store directory creation is owned by hs-server init (exclusive
+  held nofollow protected current-user-owner creation). This launcher never
+  creates that folder with New-Item and never mutates an existing folder's
+  owner or ACL.
 
   Scope and safety contract (this script does none of the following):
     - no Windows service install
@@ -81,7 +87,18 @@ function Resolve-ServerExePath {
     throw "hs-server.exe not found next to this script ($nextToScript). Pass -ServerExe or place hs-server.exe beside start-development.ps1."
 }
 
-function New-DisposableDatabaseDirectory {
+function Select-DisposableDatabaseDirectoryPath {
+    <#
+    .SYNOPSIS
+      Choose a fresh missing disposable credential-store directory path.
+
+    .DESCRIPTION
+      Chooses a unique missing path under an existing parent. Does NOT create
+      the folder. hs-server init creates the final store directory through
+      its exclusive held nofollow protected current-user-owner creation.
+      Refuses any existing path and never repairs, deletes, or re-ACLs user
+      files on collision.
+    #>
     param([string]$Parent)
     if (-not $Parent) {
         $Parent = [System.IO.Path]::GetTempPath()
@@ -94,9 +111,9 @@ function New-DisposableDatabaseDirectory {
     $name = "helicoid-hs-server-$stamp-$unique"
     $dir = Join-Path $Parent $name
     if (Test-Path -LiteralPath $dir) {
-        throw "Disposable directory already exists (refusing to reuse): $dir"
+        throw "Disposable directory already exists (refusing to reuse; not repaired): $dir"
     }
-    New-Item -ItemType Directory -Path $dir | Out-Null
+    # Path chosen only; folder stays absent until hs-server init creates it.
     return $dir
 }
 
@@ -236,7 +253,7 @@ function Show-DevelopmentInstructions {
 # --- main -----------------------------------------------------------------
 
 $serverExePath = Resolve-ServerExePath -Explicit $ServerExe
-$dbDirectory = New-DisposableDatabaseDirectory -Parent $ParentDirectory
+$dbDirectory = Select-DisposableDatabaseDirectoryPath -Parent $ParentDirectory
 $dbPath = Join-Path $dbDirectory 'hs-server.db'
 if (Test-Path -LiteralPath $dbPath) {
     throw "Refusing existing database file: $dbPath"

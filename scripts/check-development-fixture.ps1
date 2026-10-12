@@ -12,14 +12,76 @@ foreach ($statement in $ast.EndBlock.Statements) {
         Invoke-Expression $statement.Extent.Text
     }
 }
+
+# Non-credential fixture creation only (copied batch child). Isolated from
+# credential-store path selection; no store data is written here. Credential
+# store paths stay absent until hs-server init creates them privately.
+function New-NonCredentialFixtureDirectory {
+    param([string]$Parent)
+    if (-not $Parent) {
+        $Parent = [System.IO.Path]::GetTempPath()
+    }
+    if (-not (Test-Path -LiteralPath $Parent)) {
+        throw "Parent directory does not exist: $Parent"
+    }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $unique = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $name = "helicoid-batch-fixture-$stamp-$unique"
+    $dir = Join-Path $Parent $name
+    if (Test-Path -LiteralPath $dir) {
+        throw "Fixture directory already exists (refusing to reuse): $dir"
+    }
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    return $dir
+}
+
+# Actual native Windows ACL proof (Get-Acl). Source AST parse does not prove ACL.
+function Assert-PrivateStoreDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "Store directory was not created by hs-server init: $Path"
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($null -eq $currentUserSid) {
+        throw 'Could not resolve the current process user SID.'
+    }
+    $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+    if ($null -eq $ownerSid -or $ownerSid.Value -ne $currentUserSid.Value) {
+        throw "Store directory owner is not the current user; refusing: $Path"
+    }
+    if (-not $acl.AreAccessRulesProtected) {
+        throw "Store directory DACL is not protected; refusing: $Path"
+    }
+    $trustedSids = @(
+        $currentUserSid.Value,
+        'S-1-5-18',
+        'S-1-5-32-544'
+    )
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            continue
+        }
+        $ruleSid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($trustedSids -notcontains $ruleSid) {
+            throw "Store directory has an untrusted allow SID ($ruleSid); refusing: $Path"
+        }
+    }
+}
+
 $script:Username = 'admin'
 $script:ManagerIdentity = 'dev-manager-key'
 $script:FriendlyName = 'CI development fixture'
 $exe = (Resolve-Path 'target/release/hs-server.exe').Path
-$directory = New-DisposableDatabaseDirectory
+$directory = Select-DisposableDatabaseDirectoryPath
+if (Test-Path -LiteralPath $directory) {
+    throw 'Chosen store path must be initially absent.'
+}
 $database = Join-Path $directory 'hs-server.db'
 $password = 'fixture-' + [guid]::NewGuid().ToString('N') + [char]0xE9 + [char]0x6F22
 $output = Invoke-HsServerInit -Exe $exe -DbPath $database
+# hs-server init must create the protected current-user store directory.
+Assert-PrivateStoreDirectory -Path $directory
 $script:BootstrapToken = Get-BootstrapTokenFromInitOutput -InitOutput $output
 $output = $null
 $priorEnvironment = [Environment]::GetEnvironmentVariable('HS_BOOTSTRAP_TOKEN')
@@ -57,11 +119,11 @@ catch { $rejected = $true }
 if (-not $rejected) { throw 'Repeated bootstrap was accepted.' }
 $script:BootstrapToken = $null
 $password = $null
-Write-Host 'Windows PowerShell: launcher parse, Unicode stdin bootstrap, caller environment and single-use denial PASS.'
+Write-Host 'Windows PowerShell: launcher parse, absent store path, private store ACL, Unicode stdin bootstrap, caller environment and single-use denial PASS.'
 # Exercise the actual batch launcher against a failing local child. This proves
 # exit propagation and retained diagnostics; interactive Explorer behavior is
 # still a user-PC check. The copied child contains no credentials or server.
-$batchDirectory = New-DisposableDatabaseDirectory
+$batchDirectory = New-NonCredentialFixtureDirectory
 $batch = Join-Path $batchDirectory 'start-development.cmd'
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'start-development.cmd') -Destination $batch
 [IO.File]::WriteAllText((Join-Path $batchDirectory 'start-development.ps1'),

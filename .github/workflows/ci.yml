@@ -66,6 +66,10 @@ jobs:
         shell: powershell
         run: ./scripts/check-development-fixture.ps1
 
+      - name: Check PowerShell 7 development fixture
+        shell: pwsh
+        run: ./scripts/check-development-fixture.ps1
+
       - name: Stage development download bundle
         shell: pwsh
         run: |
