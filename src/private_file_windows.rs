@@ -1776,6 +1776,46 @@ mod tests {
         verify_private_object_on_handle(file.get()).expect("on-disk owner must be current user");
     }
 
+    /// Fixture precondition: the held object must already retain an
+    /// ACCESS_ALLOWED ACE for `sid` whose AceFlags include every bit in
+    /// `required_flags` (0 = any flags). Uses the same `GetAce` walk as
+    /// production DACL checks. Absence is a fixture error — the kernel did
+    /// not retain the ACE — never a reason to skip or pass a policy
+    /// expectation. Never prints SIDs or account names.
+    fn assert_allow_ace_retained(handle: HANDLE, sid: PSID, required_flags: ACE_FLAGS) {
+        let (_owner, dacl, _sd) =
+            fetch_owner_and_dacl(handle).expect("GetSecurityInfo for ACE precondition");
+        assert!(
+            !dacl.is_null(),
+            "fixture precondition: DACL must be present"
+        );
+        let acl = unsafe { &*dacl };
+        let mut retained = false;
+        for i in 0..acl.AceCount {
+            let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+            assert!(
+                unsafe { GetAce(dacl, i as u32, &mut ace_ptr) } != 0,
+                "GetAce index {i}"
+            );
+            assert!(!ace_ptr.is_null(), "GetAce returned a null ACE pointer");
+            let header = unsafe { &*(ace_ptr as *const ACE_HEADER) };
+            if header.AceType as u32 != ACCESS_ALLOWED_ACE_TYPE {
+                continue;
+            }
+            let ace_flags: ACE_FLAGS = header.AceFlags as ACE_FLAGS;
+            if ace_flags & required_flags == required_flags && sid_eq(ace_sid(ace_ptr), sid) {
+                retained = true;
+                break;
+            }
+        }
+        assert!(
+            retained,
+            "fixture error: kernel did not retain ACCESS_ALLOWED ACE \
+             (required flags 0x{required_flags:02X}) for the expected SID; \
+             a missing ACE must not be treated as a policy rejection"
+        );
+    }
+
     /// Install an ACE on `path` with arbitrary flags/mask/sid (test helper).
     fn add_ace(path: &Path, sid: PSID, mask: u32, ace_flags: ACE_FLAGS) {
         use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
@@ -2735,7 +2775,10 @@ mod tests {
     }
 
     /// Trusted store owner with NULL or foreign-granting DACL
-    /// must fail closed.
+    /// must fail closed. The foreign-grant case uses a real store file and
+    /// an actual current-write ACE (`AceFlags == 0`). Leaf INHERIT_ONLY
+    /// retention is not a reliable native carrier (INHERIT_ONLY is a
+    /// child-inheritance ACE; see the dedicated ACL-carrier test).
     #[test]
     fn trusted_store_owner_with_untrusted_dacl_is_refused() {
         let _privilege = enable_restore_privilege();
@@ -2759,9 +2802,9 @@ mod tests {
             );
         }
 
-        // Foreign granting ACE (including inherit-only must already fail via
-        // existing SID allowlist; current-write foreign grant proves the
-        // owner exception does not open DACL).
+        // Foreign current-write granting ACE on a real store file: the
+        // trusted-owner exception never opens the DACL. GetAce must show
+        // the ACE first; absence is a fixture error, never a policy pass.
         {
             let (_dir, base) = tmpdir();
             let dir = base.join("store");
@@ -2769,19 +2812,82 @@ mod tests {
             let db = dir.join("hs-server.db");
             create_private_store_file(&db).expect("create");
             set_owner(&db, admin.as_psid());
-            add_ace(
-                &db,
-                users.as_psid(),
-                0x001F_01FF,
-                INHERIT_ONLY_ACE | OBJECT_INHERIT_ACE,
-            );
+            add_ace(&db, users.as_psid(), 0x001F_01FF, 0);
+            {
+                let (parent, name) =
+                    open_parent_nofollow(&db, DirRole::ProductDir).expect("parent");
+                let file = open_relative(
+                    parent.get(),
+                    &name,
+                    false,
+                    false,
+                    None,
+                    OpenRights::FileRead,
+                )
+                .expect("open store file for ACE precondition");
+                assert_allow_ace_retained(file.get(), users.as_psid(), 0);
+            }
             let err = verify_private_store_file(&db)
-                .expect_err("trusted owner + foreign inherit-only granting ACE must refuse");
+                .expect_err("trusted owner + foreign granting ACE must refuse");
             assert!(
                 err.to_string().contains("allowlist") || err.to_string().contains("refusing"),
                 "err={err}"
             );
         }
+    }
+
+    /// Trusted store owner never skips the unknown INHERIT_ONLY SID check.
+    ///
+    /// INHERIT_ONLY is a child-inheritance ACE (Microsoft ACE inheritance
+    /// rules): it does not apply to the attached object and is retained for
+    /// child propagation. A real directory is used **only** as a valid OS
+    /// ACL carrier that keeps that ACE; production SQLite stores are
+    /// regular files and `windows_verify_private_store_file` keeps its
+    /// public file-kind guard (asserted below). The shared store-file
+    /// verifier after that guard (`verify_private_store_file_on_handle`)
+    /// is the same owner+DACL seam used for actual files.
+    #[test]
+    fn trusted_store_owner_with_unknown_inherit_only_on_acl_carrier_is_refused() {
+        let _privilege = enable_restore_privilege();
+        let (_dir, base) = tmpdir();
+        let carrier = base.join("acl-carrier");
+        std::fs::create_dir(&carrier).expect("acl carrier directory");
+
+        let admin = well_known_sid(WinBuiltinAdministratorsSid).expect("admins");
+        let users = well_known_sid(WinBuiltinUsersSid).expect("users");
+        let required_flags = INHERIT_ONLY_ACE | OBJECT_INHERIT_ACE;
+        add_ace(&carrier, users.as_psid(), 0x001F_01FF, required_flags);
+        set_owner(&carrier, admin.as_psid());
+
+        let (parent, name) = open_parent_nofollow(&carrier, DirRole::ObjectParent).expect("parent");
+        let held = open_relative(parent.get(), &name, true, false, None, OpenRights::FileRead)
+            .expect("open acl carrier directory");
+
+        // Explicit on-disk precondition: the kernel must have retained the
+        // unknown INHERIT_ONLY ACE. Absence is a fixture error, never a
+        // policy pass or skip.
+        assert_allow_ace_retained(held.get(), users.as_psid(), required_flags);
+
+        let err = verify_private_store_file_on_handle(held.get())
+            .expect_err("trusted owner + retained foreign INHERIT_ONLY granting ACE must refuse");
+        assert!(
+            err.to_string().contains("allowlist") || err.to_string().contains("refusing"),
+            "err={err}"
+        );
+
+        // Public file-kind guard is unchanged: a directory is never a
+        // store file. This does not claim production SQLite accepts dirs.
+        let err = verify_private_store_file(&carrier)
+            .expect_err("public store-file verify must refuse a directory");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("regular file")
+                || msg.contains("not a directory")
+                || msg.contains("open private store file")
+                || msg.contains("ntstatus")
+                || msg.contains("refusing"),
+            "msg={msg}"
+        );
     }
 
     /// Foreign / TrustedInstaller store owners fail even with an otherwise
