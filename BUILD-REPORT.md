@@ -1,5 +1,16 @@
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
+## Native MFA factor recovery acceptance, 13 October 2026
+
+Complete [CI38441619920](https://github.com/Helicoid-Systems/server/actions/runs/38441619920) passes at exact source `c30c9e2b96ce6b7bf0b41f4ef59f67b8ec79149d`: **270 Linux / 278 Windows tests**, no failures or ignores, formatting, strict Clippy, Windows release and both PowerShell launchers. All five new recovery regressions and all26 prior package tests pass on both native runners. Literal-loopback HTTPS and native private-store guards remain green. Independent frozen-source coordinator checks pass **31 auth_v2 /277 full Mac tests**, fmt, strict Clippy and build. The same two coordinator regressions fail on accepted44a8ecc and pass in a separate exact-baseline archive with only the actual candidate production auth source replaced.
+
+Cancellation consumes the pending enrollment without demoting an established factor/account. Confirmation copies the verified new secret inside the existing transaction. Tests use actual TOTP, retained approved manager signing keys and private-store reopen; the disposable account_mfa update fault occurs after TOTP/enrollment writes and proves rollback plus the persistent security latch. Coordinator additionally reads the consumed recovery-code row through that latch and samples login TOTP after password verification; no production auth edits were added by the coordinator.
+
+Coordinator inspection verifies [artifact11837145033](https://github.com/Helicoid-Systems/server/actions/runs/38441619920/artifacts/11837145033), ZIP SHA256 `82f694c78bdf95481005f8c48af8164b0e246bb6654be8def5e2c61859fb105d`, actual9,175,040-byte PE x64 executable SHA256 `dd3893e9925c76aa1bf0cfb06bd8dbb3b2c2a4e5897777bdfa1a04c159c74002`, and all three companion scripts against native-tested source after line-ending normalization. All61 exported MiMo assistant records identify `xiaomi/mimo-v2.6-pro`; sanitized export SHA256 `45fb445bf5a339bc2211f77b6f37088915e7f7d862a8c423b1ab1be7648cb323`. This acceptance commit changes only README/BUILD-REPORT from the tested source.
+
+This is bounded factor recovery evidence, not installed authority recovery or host cutover. Configurable operator MFA, scoped delegation, actual capture/input, Windows/macOS service installation, public authentication/routing, updates/floors/rollback, encrypted backups/recovery cutover, signing and release security review remain unavailable or Not Verified. Selected stock RustDesk adoption remains Failed / Closed. No VM or public-listener changes. Earlier candidate/local-only statements below describe their dated stage and are superseded by this native acceptance.
+
+
 ## MFA recovery cancellation + factor replacement, 13 October 2026
 
 Bounded repair at baseline `44a8ecc` (accepted documentation-only descendant of native-tested `21d2ff3`). Owned writes: `src/auth_v2.rs`, `tests/auth_v2.rs`, `contracts/http-v2.md`, `README.md`, this file, and `/tmp/hs-production-20261012/**`. No commits/push. No main/core/apps/installer/dependencies/schema/migration/wire DTO changes.

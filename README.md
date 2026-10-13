@@ -14,7 +14,7 @@ security-state-unavailable behavior.
 
 Repository: https://github.com/Helicoid-Systems/server. Durable release identifiers remain pending.
 
-Product/release/target-bound signed package verification and literal-loopback HTTPS pass complete [CI38320441248](https://github.com/Helicoid-Systems/server/actions/runs/38320441248) at code `21d2ff337e0b02c4dd01ea8a3bed5213fad3dacf`: **265 Linux and 273 Windows tests**, strict Clippy, release build and both PowerShell launchers. The coordinator independently passes **272 Mac tests**, verifies the downloaded archive digest, PE x64 executable and companion scripts, and checks all26 signed-package metadata tests on both native platforms. [Download the development server bundle](https://github.com/Helicoid-Systems/server/actions/runs/38320441248/artifacts/11778357880). Otherwise-valid signed wrong-product, malformed-version and empty packages accepted by the unchanged baseline are now refused. Metadata verification supports four trusted targets; installation commands remain Linux-only and Windows/macOS service installation remains unavailable. Windows process cleanup proves owned-child kill/reap; installed service-stop and Windows11 acceptance remain Not Verified.
+Bounded MFA factor recovery, product/release/target-bound package verification and literal-loopback HTTPS pass complete [CI38441619920](https://github.com/Helicoid-Systems/server/actions/runs/38441619920) at exact code `c30c9e2b96ce6b7bf0b41f4ef59f67b8ec79149d`: **270 Linux / 278 Windows tests**, formatting, strict Clippy, release and both PowerShell launchers. Five new regressions prove cancellation preserves the established factor, confirmation installs the replacement, real device-key login works, private-store restart retains those boundaries, and storage failure after transaction writes rolls back while blocking new authority. The coordinator independently passes **277 Mac tests**, reproduces both baseline defects and verifies the exact production fix with the same regressions. [Download the development server bundle](https://github.com/Helicoid-Systems/server/actions/runs/38441619920/artifacts/11837145033); its digest, actual PE x64 executable and companion scripts are independently inspected. All26 package tests and prior TLS/private-store guards stay green. Metadata verification supports four trusted targets; installation commands remain Linux-only and Windows/macOS service setup remains unavailable. Public authentication/media/control, installed acceptance, configurable operator MFA, delegation, authority recovery/cutover and signing remain gated. Owned-child kill/reap is not installed service-stop acceptance.
 
 Existing SQLite store files accept only currentUser/SYSTEM/Administrators ownership together with the strict held DACL/shape/link and protected-parent boundary. New objects, recovery/key reads and product directories remain current-user owned; foreign and TrustedInstaller store owners remain refused. The launcher chooses a missing path and lets the server create its protected folder. Literal-loopback HTTPS (`serve-tls`) on Unix and Windows uses the native-verified private_file held reader. Public authentication/listeners, installed services, recovery cutover and signing remain unavailable. This is a native private-store/MFA/CLI prerequisite plus a verified Windows loopback TLS prerequisite, not a completed deployment or worker/admission checkpoint. Historical failures and acceptance boundaries are in [BUILD-REPORT.md](BUILD-REPORT.md).
 
@@ -59,7 +59,7 @@ Ed25519 challenges, administrator enrollment, transaction boundaries and recover
 limits. Literal-loopback HTTPS transport is implemented on Unix and Windows as a
 loopback prerequisite. Production trust adoption, public authentication and
 public routes remain unavailable.
-The v1 HTTP wire contract remains version1; health separately reports storage schema2. Current complete acceptance is **242 Mac,235 Linux and243 Windows tests** at `1d99669`. Native checks come from CI38259032769; Mac checks and artifact inspection were reproduced by the coordinator. Earlier `f01019f` (private-store) and `ccaf29a` (Unix TLS) artifacts refused Windows TLS and remain historical evidence in BUILD-REPORT.md.
+The v1 HTTP wire contract remains version1; health separately reports storage schema2. Earlier TLS acceptance at `1d99669` passed **242 Mac,235 Linux and243 Windows tests** in CI38259032769 and coordinator checks. That result, and the `f01019f`/`ccaf29a` artifacts which refused Windows TLS, are historical evidence. Current complete acceptance is recorded above and in BUILD-REPORT.md.
 
 Platform-split of `tests/installer_adapter.rs` (29 total): **19 portable**
 (listener/parser/systemctl decode, read bounds, injected query faults) run on
@@ -68,7 +68,7 @@ regressions cover the descriptor-relative atomic writer (`write_file_atomic`).
 There is no Windows native service installer and no Windows atomic writer —
 host installation on Windows/macOS remains unavailable.
 
-Current native private-store/MFA/CLI and loopback HTTPS prerequisite:
+Historical native private-store/MFA/CLI and loopback HTTPS acceptance at `1d99669`:
 
 | Platform | Verified total | Notes |
 | --- | --- | --- |
