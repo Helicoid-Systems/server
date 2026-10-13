@@ -1,5 +1,29 @@
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
+## MFA recovery cancellation + factor replacement, 13 October 2026
+
+Bounded repair at baseline `44a8ecc` (accepted documentation-only descendant of native-tested `21d2ff3`). Owned writes: `src/auth_v2.rs`, `tests/auth_v2.rs`, `contracts/http-v2.md`, `README.md`, this file, and `/tmp/hs-production-20261012/**`. No commits/push. No main/core/apps/installer/dependencies/schema/migration/wire DTO changes.
+
+Two independently reproduced defects at unchanged baseline (coordinator evidence `/tmp/hs-production-20261012/mfa-recovery-baseline-evidence.json`, exit 101, 0 passed / 2 failed):
+
+1. **Pending recovery cancellation deactivated the established active factor.** `cancel_mfa_enrollment` ran `UPDATE account_mfa SET status='pending' WHERE account_id=?` for any unconsumed enrollment, so cancelling a recovery re-enrollment demoted `active` → `pending` and locked the administrator out of challenge login.
+2. **Recovery confirmation verified the new secret but never installed it.** `confirm_mfa_enrollment` checked TOTP against the pending enrollment secret, then `UPDATE account_mfa` activated the row without copying `totp_secret`, leaving the old factor installed.
+
+Minimal shared-site fixes in `src/auth_v2.rs`:
+
+- Cancellation only restates **pending** material (`AND status = 'pending'`). An established active factor and already-active account are never touched. Bootstrap cancel still disables `pending_mfa` accounts only.
+- Confirmation installs the verified enrollment `totp_secret` into `account_mfa` in the same final IMMEDIATE transaction that consumes the TOTP step, consumes the enrollment and activates the factor.
+
+Bounded semantics are documented in [contracts/http-v2.md](contracts/http-v2.md). Recovery begin/confirm/cancel still never mint a session; enrollment remains single-use and lifetime-bounded; recovery codes stay consumed; bootstrap cancellation and manager/signature/owner/capacity/replay guards are unchanged.
+
+Agent (xiaomi/mimo-v2.6-pro) Mac checks after the fix: `cargo test --locked --test auth_v2` **31 passed** (26 prior + 5 new regressions); `cargo test --locked` **277 passed** (65 lib + 2 main + 31 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter + 26 installer_package_targets + 12 installer_review + 6 mfa_legacy_boundary + 21 review_findings + 29 tls_transport); `cargo fmt -- --check` clean; `cargo clippy --locked --all-targets -- -D warnings` clean; `cargo build --locked` clean. New regressions: `cancelled_recovery_enrollment_preserves_active_mfa`, `factor_recovery_confirm_then_cancel_keeps_winning_factor`, `failed_recovery_confirm_leaves_old_factor_and_unconsumed_enrollment`, `cancelled_recovery_enrollment_preserves_active_mfa_across_restart`, `replacement_factor_survives_private_store_restart`. Red was factor-state (not compilation): cancel left `mfa status active→pending`; confirm left a non-replacement `totp_secret`. TOTP steps are selected by read-only ledger inspection inside the real ±1 skew window; no consumption-row mutation and no sleep-based timing.
+
+Coordinator review follow-ups applied: raw-secret asserts use bounded boolean comparisons (no Debug/Display of secrets); the rollback regression uses a disposable-test-only `BEFORE UPDATE ON account_mfa` `RAISE(ABORT)` trigger (no ledger mutation, no production schema/clock hook) and asserts old factor, unconsumed enrollment, absent attempted step, no session, and security latch denial of new authority; restart cancellation confirms denial with the genuine cancelled pending replacement secret and asserts consumed enrollment persists; the v2 contract states preservation of established account state and factor (cancellation never reactivates a disabled account). Named tests, full `auth_v2`, full `cargo test`, fmt, strict Clippy and build re-run green after those changes.
+
+Coordinator independently passes **31 auth_v2 /277 full Mac tests**, formatting, strict Clippy and build against frozen source hashes in a separate target. The exact two baseline regressions fail against accepted44a8ecc and pass with only the actual production auth source replaced. Coordinator review additionally reads the consumed recovery-code row through the security latch and samples login TOTP after password verification. All61 exported assistant records identify `xiaomi/mimo-v2.6-pro`; sanitized export SHA256 `45fb445bf5a339bc2211f77b6f37088915e7f7d862a8c423b1ab1be7648cb323`.
+
+**Not Verified:** native Windows/Linux CI, installed services, public authentication/routing, recovery cutover, signing/release. Public routes/media/control remain unavailable. Full report: `/tmp/hs-production-20261012/mfa-recovery-cancellation-report.md`.
+
 ## Native package identity acceptance, 13 October 2026
 
 Complete [CI38320441248](https://github.com/Helicoid-Systems/server/actions/runs/38320441248) passes at exact source `21d2ff337e0b02c4dd01ea8a3bed5213fad3dacf`: **265 Linux /273 Windows tests**, no failures or ignored tests, format, strict all-target Clippy, Windows release and both PowerShell launchers. All26 signed-package tests pass on both native platforms, including otherwise-valid hostile product/version/empty-artifact packages. The independent coordinator passes272 Mac tests, all26 package tests, format, Clippy and build against frozen source hashes in a separate build directory.

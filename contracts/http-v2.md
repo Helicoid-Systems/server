@@ -145,14 +145,30 @@ only SHA-256 hashes.
 }
 ```
 
-This endpoint never issues a session token.
+This endpoint never issues a session token. Confirmation installs the
+verified enrollment TOTP secret into the account factor row in the same
+final transaction that consumes the enrollment and activates the factor.
 
 ---
 
 ## `POST /v2/mfa/enroll/cancel`
 
-Cancel a pending enrollment (bootstrap cancellation). Consumes the enrollment;
-account is disabled if it never completed MFA.
+Cancel a pending enrollment (bootstrap cancellation or pending recovery).
+Consumes the enrollment (single-use).
+
+Bounded cancellation semantics:
+
+- **Bootstrap cancel:** the account is disabled only while it never
+  completed MFA (`pending_mfa`). Pending material stays inactive.
+- **Recovery cancel:** the **established account state and factor are
+  preserved**. An active factor is never deactivated or replaced; an
+  already-active account keeps authenticating with the original factor.
+  An account that was disabled after recovery began remains disabled and
+  cannot authenticate. Cancellation never reactivates an account.
+- Confirmation after cancel returns `409`. Cancel after a successful
+  confirm also returns `409` (the confirmed factor wins).
+- `begin` / `confirm` / `cancel` of recovery never mint a session.
+- Login still requires an eligible active account and active MFA factor.
 
 ```json
 { "mfa_enrollment_id": "…" }
@@ -311,8 +327,9 @@ through this path.
 
 Confirm the new TOTP secret after factor recovery. Same request/response as
 `/v2/mfa/enroll/confirm`. `recovery_material_stored` must be `true` (existing
-codes remain valid unless individually consumed). **No session token** is
-issued.
+codes remain valid unless individually consumed). The verified pending
+enrollment secret is installed as the account factor in the same final
+transaction (old-to-new replacement). **No session token** is issued.
 
 ---
 

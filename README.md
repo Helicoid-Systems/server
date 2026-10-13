@@ -32,7 +32,7 @@ Existing SQLite store files accept only currentUser/SYSTEM/Administrators owners
 | Security State Unavailable | Durable latch; restart never resets it; no auto-recovery |
 | Required read/commit failures | Latch + `503 security_state_unavailable` (not bare 500) |
 | v2 administrator MFA | TOTP enrollment, Ed25519 device proof and atomic challenge completion implemented for loopback development. Native private-store tests pass on Unix and Windows; public authentication remains gated |
-| v2 recovery credentials | Bounded, single-use factor recovery only; cannot issue normal sessions |
+| v2 recovery credentials | Bounded, single-use factor recovery only; cannot issue normal sessions. Cancel of a pending recovery never deactivates an established active factor; confirmation installs the verified replacement secret |
 | Configurable operator MFA / scoped delegation | Unavailable; production policy still gated |
 | File jobs / authority recovery and cutover | Explicitly unavailable (`501`) |
 | Remote control / screen observation | Not present (B02/B03/RD03 proofs pending) |

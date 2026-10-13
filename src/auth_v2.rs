@@ -363,7 +363,8 @@ impl Service {
 
     /// Confirm pending MFA enrollment: valid TOTP + independently stored recovery.
     ///
-    /// Activates the administrator. The enrollment is single-use and bounded.
+    /// Installs the verified enrollment TOTP secret into `account_mfa` and
+    /// activates the administrator. The enrollment is single-use and bounded.
     /// This path never mints an ordinary session — confirmation only.
     pub fn confirm_mfa_enrollment(&self, req: MfaConfirmRequest) -> AppResult<MfaConfirmResponse> {
         // Enrollment confirm activates/copies reusable TOTP material into the
@@ -424,10 +425,10 @@ impl Service {
             )?;
             conn.execute(
                 "UPDATE account_mfa
-                 SET totp_confirmed_at = ?1, recovery_stored_at = ?1,
-                     status = 'active', updated_at = ?1
-                 WHERE account_id = ?2",
-                params![now, account_id],
+                 SET totp_secret = ?1, totp_confirmed_at = ?2, recovery_stored_at = ?2,
+                     status = 'active', updated_at = ?2
+                 WHERE account_id = ?3",
+                params![totp_secret, now, account_id],
             )?;
             conn.execute(
                 "UPDATE accounts
@@ -448,8 +449,10 @@ impl Service {
 
     /// Cancel a pending MFA enrollment (bootstrap cancellation / timeout).
     ///
-    /// Rolls the account back to disabled if it never completed MFA and no
-    /// other active MFA factor exists. Fail-closed: errors deny the cancel.
+    /// Consumes the enrollment. Rolls the account back to disabled if it
+    /// never completed MFA (`pending_mfa` only). Never deactivates or
+    /// replaces an established active factor (recovery cancellation).
+    /// Fail-closed: errors deny the cancel.
     pub fn cancel_mfa_enrollment(&self, enrollment_id: &str) -> AppResult<()> {
         self.require_security_ok()?;
         let now = now_unix();
@@ -475,9 +478,12 @@ impl Service {
                 "UPDATE mfa_enrollments SET consumed_at = ?1 WHERE id = ?2 AND consumed_at IS NULL",
                 params![now, enrollment_id],
             )?;
-            // Account stays inactive; wipe pending MFA material.
+            // Never deactivate an established active factor. Only pending
+            // material (bootstrap cancellation / timeout) is restated pending;
+            // recovery cancellation leaves the winning factor installed.
             conn.execute(
-                "UPDATE account_mfa SET status = 'pending', updated_at = ?1 WHERE account_id = ?2",
+                "UPDATE account_mfa SET status = 'pending', updated_at = ?1
+                 WHERE account_id = ?2 AND status = 'pending'",
                 params![now, account_id],
             )?;
             conn.execute(
