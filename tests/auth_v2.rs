@@ -698,6 +698,609 @@ fn recovery_requires_password_and_is_not_a_session() {
     // Response carries purpose only — no token field exists on the type.
 }
 
+// ----- pending recovery cancellation preserves established MFA -----
+
+/// Durable account + factor row. Compared field-by-field so assertion
+/// failures never dump raw TOTP secrets.
+struct FactorSnapshot {
+    account_state: String,
+    mfa_status: String,
+    totp_secret: String,
+    totp_confirmed_at: Option<i64>,
+    recovery_stored_at: Option<i64>,
+}
+
+fn factor_snapshot(service: &Service, account_id: &str) -> FactorSnapshot {
+    let db = service.db_handle();
+    let conn = db.lock().expect("lock");
+    let account_state: String = conn
+        .query_row(
+            "SELECT state FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .expect("account state");
+    let (mfa_status, totp_secret, totp_confirmed_at, recovery_stored_at) = conn
+        .query_row(
+            "SELECT status, totp_secret, totp_confirmed_at, recovery_stored_at
+             FROM account_mfa WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .expect("account_mfa");
+    FactorSnapshot {
+        account_state,
+        mfa_status,
+        totp_secret,
+        totp_confirmed_at,
+        recovery_stored_at,
+    }
+}
+
+fn assert_factor_unchanged(before: &FactorSnapshot, after: &FactorSnapshot, ctx: &str) {
+    assert_eq!(
+        before.account_state, after.account_state,
+        "{ctx}: account state"
+    );
+    assert_eq!(before.mfa_status, after.mfa_status, "{ctx}: mfa status");
+    // Raw TOTP secrets: bounded boolean asserts only (never Debug/Display).
+    assert!(
+        before.totp_secret == after.totp_secret,
+        "{ctx}: totp secret preserved"
+    );
+    assert_eq!(
+        before.totp_confirmed_at, after.totp_confirmed_at,
+        "{ctx}: totp_confirmed_at"
+    );
+    assert_eq!(
+        before.recovery_stored_at, after.recovery_stored_at,
+        "{ctx}: recovery_stored_at"
+    );
+}
+
+fn totp_step_used(service: &Service, account_id: &str, step: i64) -> bool {
+    let db = service.db_handle();
+    let conn = db.lock().expect("lock");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM totp_consumptions
+             WHERE account_id = ?1 AND time_step = ?2",
+            rusqlite::params![account_id, step],
+            |r| r.get(0),
+        )
+        .expect("consumption count");
+    count > 0
+}
+
+fn session_count(service: &Service) -> i64 {
+    let db = service.db_handle();
+    let conn = db.lock().expect("lock");
+    conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+        .expect("session count")
+}
+
+fn enrollment_consumed_at(service: &Service, enrollment_id: &str) -> Option<i64> {
+    let db = service.db_handle();
+    let conn = db.lock().expect("lock");
+    conn.query_row(
+        "SELECT consumed_at FROM mfa_enrollments WHERE id = ?1",
+        rusqlite::params![enrollment_id],
+        |r| r.get(0),
+    )
+    .expect("enrollment")
+}
+
+/// Pick an unused TOTP time step inside the real ±1 skew window by
+/// read-only inspection of the disposable consumption ledger.
+fn unused_totp_time(service: &Service, account_id: &str) -> u64 {
+    let current = totp_time_step(unix_now());
+    let db = service.db_handle();
+    let conn = db.lock().expect("lock");
+    for step in [current + 1, current - 1, current] {
+        let used: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM totp_consumptions
+                 WHERE account_id = ?1 AND time_step = ?2",
+                rusqlite::params![account_id, step],
+                |r| r.get(0),
+            )
+            .expect("consumption count");
+        if used == 0 {
+            return (step as u64) * 30;
+        }
+    }
+    panic!("no unused totp time step inside the skew window");
+}
+
+/// Challenge-login with the approved manager device key and a fresh code.
+fn complete_session_login(
+    service: &Service,
+    enrolled: &Enrolled,
+    secret: &str,
+) -> Result<LoginResponse, hs_server::AppError> {
+    let dep = deployment_id(service);
+    let challenge = service.begin_auth_challenge(AuthChallengeBeginRequest {
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        operation: "session".into(),
+        manager_public_key: enrolled.public_key.clone(),
+    })?;
+    let sig = sign_challenge(
+        &enrolled.signer,
+        &dep,
+        &challenge.challenge_id,
+        "session",
+        &enrolled.public_key,
+    );
+    // Password verification can cross a TOTP step; sample after it finishes.
+    let at = unused_totp_time(service, &enrolled.account_id);
+    let code = totp_generate_at(secret, at).expect("totp code");
+    service.complete_auth_challenge(AuthChallengeCompleteRequest {
+        challenge_id: challenge.challenge_id,
+        challenge_token: challenge.challenge_token,
+        manager_signature: sig,
+        totp_code: code,
+    })
+}
+
+/// Cancel-before-confirm: cancelling a pending recovery enrollment must
+/// leave the established active factor and account untouched. Login still
+/// works, the cancelled enrollment cannot confirm/replay, the consumed
+/// recovery code stays refused, and begin/cancel mint no session.
+#[test]
+fn cancelled_recovery_enrollment_preserves_active_mfa() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let before = factor_snapshot(&service, &enrolled.account_id);
+    assert_eq!(before.account_state, "active");
+    assert_eq!(before.mfa_status, "active");
+    let sessions_before = session_count(&service);
+
+    let code = enrolled.recovery_codes[0].clone();
+    let begin = service
+        .begin_factor_recovery(FactorRecoveryBeginRequest {
+            username: "admin".into(),
+            password: PASSWORD.into(),
+            recovery_code: code.clone(),
+        })
+        .expect("recovery begin");
+    assert_eq!(begin.account_id, enrolled.account_id);
+    assert!(
+        begin.totp_secret_base32 != before.totp_secret,
+        "recovery begin issues a pending replacement secret"
+    );
+    assert_eq!(
+        session_count(&service),
+        sessions_before,
+        "recovery begin must not mint a session"
+    );
+
+    service
+        .cancel_mfa_enrollment(&begin.mfa_enrollment_id)
+        .expect("cancel pending recovery enrollment");
+
+    let after = factor_snapshot(&service, &enrolled.account_id);
+    assert_factor_unchanged(
+        &before,
+        &after,
+        "cancel must not deactivate or replace the established active factor",
+    );
+    assert_eq!(
+        session_count(&service),
+        sessions_before,
+        "recovery cancel must not mint a session"
+    );
+    assert!(
+        enrollment_consumed_at(&service, &begin.mfa_enrollment_id).is_some(),
+        "cancel consumes the enrollment"
+    );
+
+    // Cancelled enrollment cannot confirm or replay.
+    let confirm_at = unused_totp_time(&service, &enrolled.account_id);
+    let confirm_code = totp_generate_at(&begin.totp_secret_base32, confirm_at).expect("code");
+    let confirm = service.complete_factor_recovery(MfaConfirmRequest {
+        mfa_enrollment_id: begin.mfa_enrollment_id.clone(),
+        totp_code: confirm_code,
+        recovery_material_stored: true,
+    });
+    assert!(
+        confirm.is_err(),
+        "cancelled recovery enrollment must not confirm"
+    );
+    let cancel_replay = service.cancel_mfa_enrollment(&begin.mfa_enrollment_id);
+    assert!(
+        cancel_replay.is_err(),
+        "cancelled recovery enrollment is single-use"
+    );
+
+    // The original recovery code was consumed at begin and stays refused.
+    let replay = service.begin_factor_recovery(FactorRecoveryBeginRequest {
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        recovery_code: code,
+    });
+    assert!(
+        replay.is_err(),
+        "consumed recovery code must stay refused after cancel"
+    );
+
+    // Established approved manager + original factor can still log in.
+    let login = complete_session_login(&service, &enrolled, &enrolled.totp_secret)
+        .expect("original factor login after recovery cancel");
+    assert_eq!(login.account.id, enrolled.account_id);
+    assert_eq!(
+        session_count(&service),
+        sessions_before + 1,
+        "exactly one login session after successful challenge"
+    );
+}
+
+/// Confirm-before-cancel: confirmation installs the replacement secret and
+/// wins the single-use enrollment; cancel is refused and the winning factor
+/// is the one that can still log in.
+#[test]
+fn factor_recovery_confirm_then_cancel_keeps_winning_factor() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let before = factor_snapshot(&service, &enrolled.account_id);
+    let sessions_before = session_count(&service);
+
+    let code = enrolled.recovery_codes[1].clone();
+    let begin = service
+        .begin_factor_recovery(FactorRecoveryBeginRequest {
+            username: "admin".into(),
+            password: PASSWORD.into(),
+            recovery_code: code.clone(),
+        })
+        .expect("recovery begin");
+    let replacement_secret = begin.totp_secret_base32.clone();
+
+    let confirm_at = unused_totp_time(&service, &enrolled.account_id);
+    let confirm_code = totp_generate_at(&replacement_secret, confirm_at).expect("confirm code");
+    let confirm = service
+        .complete_factor_recovery(MfaConfirmRequest {
+            mfa_enrollment_id: begin.mfa_enrollment_id.clone(),
+            totp_code: confirm_code,
+            recovery_material_stored: true,
+        })
+        .expect("factor replacement confirmation");
+    assert_eq!(confirm.account_id, enrolled.account_id);
+    assert_eq!(confirm.mfa_status, "active");
+    assert_eq!(confirm.account_state, "active");
+    assert_eq!(
+        session_count(&service),
+        sessions_before,
+        "recovery confirmation must not mint a session"
+    );
+
+    let after = factor_snapshot(&service, &enrolled.account_id);
+    assert_eq!(after.account_state, "active");
+    assert_eq!(after.mfa_status, "active");
+    assert!(
+        after.totp_secret == replacement_secret,
+        "confirmation must install the verified pending enrollment secret"
+    );
+    assert!(
+        after.totp_secret != before.totp_secret,
+        "replacement must swap the established secret"
+    );
+    assert!(after.totp_confirmed_at.is_some());
+
+    // Cancel after confirm is refused: enrollment is single-use consumed.
+    let cancel = service.cancel_mfa_enrollment(&begin.mfa_enrollment_id);
+    assert!(
+        cancel.is_err(),
+        "cancel after confirm must refuse the consumed enrollment"
+    );
+    let winning = factor_snapshot(&service, &enrolled.account_id);
+    assert_factor_unchanged(
+        &after,
+        &winning,
+        "cancel-after-confirm must preserve the winning replacement factor",
+    );
+
+    // Consumed recovery code stays refused; no session from begin/confirm/cancel.
+    let replay = service.begin_factor_recovery(FactorRecoveryBeginRequest {
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        recovery_code: code,
+    });
+    assert!(replay.is_err(), "consumed recovery code must stay refused");
+
+    // Winning replacement factor logs in with a genuine device-key challenge.
+    let login = complete_session_login(&service, &enrolled, &replacement_secret)
+        .expect("replacement factor login after confirm-before-cancel");
+    assert_eq!(login.account.id, enrolled.account_id);
+}
+
+/// Failed confirmation after TOTP-step + enrollment consumption must roll
+/// back those writes: old factor stays installed, enrollment stays
+/// unconsumed, the attempted step is absent, no session is minted, and the
+/// security latch denies new authority. Fault is a disposable-test-only
+/// `BEFORE UPDATE ON account_mfa` trigger (no production schema/clock hook).
+#[test]
+fn failed_recovery_confirm_leaves_old_factor_and_unconsumed_enrollment() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let before = factor_snapshot(&service, &enrolled.account_id);
+    let sessions_before = session_count(&service);
+
+    let code = enrolled.recovery_codes[2].clone();
+    let begin = service
+        .begin_factor_recovery(FactorRecoveryBeginRequest {
+            username: "admin".into(),
+            password: PASSWORD.into(),
+            recovery_code: code.clone(),
+        })
+        .expect("recovery begin");
+
+    // Fault only in this disposable store: abort the account_mfa UPDATE so
+    // confirmation fails after consuming the TOTP step and enrollment.
+    {
+        let db = service.db_handle();
+        let conn = db.lock().expect("lock");
+        conn.execute_batch(
+            "CREATE TRIGGER account_mfa_confirm_fault BEFORE UPDATE ON account_mfa
+             BEGIN
+               SELECT RAISE(ABORT, 'test_account_mfa_update_fault');
+             END;",
+        )
+        .expect("install disposable confirm fault trigger");
+    }
+
+    // Actual unused allowed step from the real ledger (read-only selection).
+    let confirm_at = unused_totp_time(&service, &enrolled.account_id);
+    let confirm_step = totp_time_step(confirm_at);
+    assert!(
+        !totp_step_used(&service, &enrolled.account_id, confirm_step),
+        "confirm step must start unused"
+    );
+
+    let confirm_code = totp_generate_at(&begin.totp_secret_base32, confirm_at).expect("code");
+    let failed = service.complete_factor_recovery(MfaConfirmRequest {
+        mfa_enrollment_id: begin.mfa_enrollment_id.clone(),
+        totp_code: confirm_code,
+        recovery_material_stored: true,
+    });
+    assert!(
+        failed.is_err(),
+        "account_mfa update fault must deny confirmation"
+    );
+
+    let after = factor_snapshot(&service, &enrolled.account_id);
+    assert_factor_unchanged(
+        &before,
+        &after,
+        "failed confirmation must leave the old factor installed",
+    );
+    assert!(
+        enrollment_consumed_at(&service, &begin.mfa_enrollment_id).is_none(),
+        "failed confirmation must leave the enrollment unconsumed"
+    );
+    assert!(
+        !totp_step_used(&service, &enrolled.account_id, confirm_step),
+        "attempted totp step must be absent after rollback"
+    );
+    assert_eq!(
+        session_count(&service),
+        sessions_before,
+        "failed confirmation must not mint a session"
+    );
+    assert!(
+        service.security_state() == hs_server::SecurityState::Unavailable,
+        "storage uncertainty must latch security state unavailable"
+    );
+    let denied = service.begin_auth_challenge(AuthChallengeBeginRequest {
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        operation: "session".into(),
+        manager_public_key: enrolled.public_key.clone(),
+    });
+    assert!(
+        denied.is_err(),
+        "latched security state must deny new authority"
+    );
+
+    // The latch alone also denies replay. Read the durable row to prove that
+    // rollback did not restore the recovery code consumed by the earlier begin.
+    {
+        let db = service.db_handle();
+        let conn = db.lock().expect("lock");
+        let used_at: Option<i64> = conn
+            .query_row(
+                "SELECT used_at FROM recovery_codes WHERE account_id = ?1 AND code_hash = ?2",
+                rusqlite::params![
+                    enrolled.account_id,
+                    hs_server::auth_v2::recovery_code_hash_for_test(&code)
+                ],
+                |row| row.get(0),
+            )
+            .expect("consumed recovery code row");
+        assert!(
+            used_at.is_some(),
+            "recovery code consumption must survive rollback"
+        );
+    }
+    let replay = service.begin_factor_recovery(FactorRecoveryBeginRequest {
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        recovery_code: code,
+    });
+    assert!(
+        replay.is_err(),
+        "recovery code must stay consumed through the failed confirm"
+    );
+}
+
+/// Persistent private-store restart after cancel-before-confirm: the
+/// established factor survives reopen and the cancelled enrollment stays
+/// refused. The genuine approved manager signing key and the cancelled
+/// pending replacement secret are retained in this test scope across the
+/// store restart.
+#[cfg(any(windows, unix))]
+#[test]
+fn cancelled_recovery_enrollment_preserves_active_mfa_across_restart() {
+    let (_dir, base) = private_tempdir();
+    let path = base.join("hs-server.db");
+    let (enrolled, sessions_before, before, cancelled_id, consumed_code, cancelled_pending_secret);
+
+    {
+        let db = db::open(&path).expect("open private store");
+        assert_eq!(
+            db.store_capability(),
+            db::StoreCapability::PersistentPrivate
+        );
+        let service = Service::new(db);
+        enrolled = bootstrap_enrolled(&service);
+        before = factor_snapshot(&service, &enrolled.account_id);
+        sessions_before = session_count(&service);
+        consumed_code = enrolled.recovery_codes[3].clone();
+
+        let begin = service
+            .begin_factor_recovery(FactorRecoveryBeginRequest {
+                username: "admin".into(),
+                password: PASSWORD.into(),
+                recovery_code: consumed_code.clone(),
+            })
+            .expect("recovery begin");
+        cancelled_id = begin.mfa_enrollment_id.clone();
+        cancelled_pending_secret = begin.totp_secret_base32.clone();
+        assert!(
+            cancelled_pending_secret != before.totp_secret,
+            "pending replacement secret is distinct from the established factor"
+        );
+        service
+            .cancel_mfa_enrollment(&begin.mfa_enrollment_id)
+            .expect("cancel pending recovery");
+
+        let after = factor_snapshot(&service, &enrolled.account_id);
+        assert_factor_unchanged(
+            &before,
+            &after,
+            "cancel must preserve the established factor before restart",
+        );
+        assert_eq!(
+            session_count(&service),
+            sessions_before,
+            "begin/cancel mint no session before restart"
+        );
+    }
+
+    // Reopen the same private store; sign with the retained original key.
+    let db = db::open(&path).expect("reopen private store");
+    assert_eq!(
+        db.store_capability(),
+        db::StoreCapability::PersistentPrivate
+    );
+    let service = Service::new(db);
+    let after = factor_snapshot(&service, &enrolled.account_id);
+    assert_factor_unchanged(
+        &before,
+        &after,
+        "reopened store must retain the established active factor",
+    );
+    assert!(
+        enrollment_consumed_at(&service, &cancelled_id).is_some(),
+        "cancelled enrollment consumption must persist across reopen"
+    );
+
+    // Denial uses the genuine cancelled pending replacement secret (the
+    // secret that confirmation would have installed), not the original.
+    let confirm_at = unused_totp_time(&service, &enrolled.account_id);
+    let confirm_code =
+        totp_generate_at(&cancelled_pending_secret, confirm_at).expect("pending confirm code");
+    let confirm = service.complete_factor_recovery(MfaConfirmRequest {
+        mfa_enrollment_id: cancelled_id.clone(),
+        totp_code: confirm_code,
+        recovery_material_stored: true,
+    });
+    assert!(
+        confirm.is_err(),
+        "cancelled enrollment must stay unconfirmable after reopen"
+    );
+    let cancel_replay = service.cancel_mfa_enrollment(&cancelled_id);
+    assert!(
+        cancel_replay.is_err(),
+        "cancelled enrollment stays single-use"
+    );
+    let code_replay = service.begin_factor_recovery(FactorRecoveryBeginRequest {
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        recovery_code: consumed_code,
+    });
+    assert!(
+        code_replay.is_err(),
+        "consumed recovery code must stay refused after reopen"
+    );
+
+    let login = complete_session_login(&service, &enrolled, &enrolled.totp_secret)
+        .expect("original factor login after recovery cancel and restart");
+    assert_eq!(login.account.id, enrolled.account_id);
+    assert_eq!(
+        session_count(&service),
+        sessions_before + 1,
+        "restart path mints only the successful login session"
+    );
+}
+
+/// Persistent private-store restart after replacement confirmation: the
+/// installed replacement secret survives reopen and logs in.
+#[cfg(any(windows, unix))]
+#[test]
+fn replacement_factor_survives_private_store_restart() {
+    let (_dir, base) = private_tempdir();
+    let path = base.join("hs-server.db");
+    let (enrolled, replacement_secret, sessions_before);
+
+    {
+        let db = db::open(&path).expect("open private store");
+        let service = Service::new(db);
+        enrolled = bootstrap_enrolled(&service);
+        sessions_before = session_count(&service);
+
+        let code = enrolled.recovery_codes[4].clone();
+        let begin = service
+            .begin_factor_recovery(FactorRecoveryBeginRequest {
+                username: "admin".into(),
+                password: PASSWORD.into(),
+                recovery_code: code.clone(),
+            })
+            .expect("recovery begin");
+        replacement_secret = begin.totp_secret_base32.clone();
+
+        let confirm_at = unused_totp_time(&service, &enrolled.account_id);
+        let confirm_code = totp_generate_at(&replacement_secret, confirm_at).expect("code");
+        service
+            .complete_factor_recovery(MfaConfirmRequest {
+                mfa_enrollment_id: begin.mfa_enrollment_id.clone(),
+                totp_code: confirm_code,
+                recovery_material_stored: true,
+            })
+            .expect("replacement confirmation");
+    }
+
+    let db = db::open(&path).expect("reopen private store");
+    let service = Service::new(db);
+    let after = factor_snapshot(&service, &enrolled.account_id);
+    assert_eq!(after.mfa_status, "active");
+    assert!(
+        after.totp_secret == replacement_secret,
+        "reopened store must retain the replacement factor secret"
+    );
+
+    let login = complete_session_login(&service, &enrolled, &replacement_secret)
+        .expect("replacement factor login after restart");
+    assert_eq!(login.account.id, enrolled.account_id);
+    assert_eq!(session_count(&service), sessions_before + 1);
+}
+
 // ----- rate limit -----
 
 #[test]
