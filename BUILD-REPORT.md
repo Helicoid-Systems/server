@@ -1,3 +1,66 @@
+## Coordinator final fixture verification, 16 October 2026
+
+Coordinator independently passed all **309 Rust tests**, format, strict Clippy
+and the release build after the native fixture correction. Actual CLI regression
+proves correct Unicode stdin reaches the mandatory-MFA denial while incorrect
+Unicode stdin fails credentials, with no session minted. Production authority
+code is unchanged by this fixture-only follow-up.
+
+Fresh MiMo export verifies 51 assistant records from
+`xiaomi-token-plan-ams/mimo-v2.6-pro`, `high`. Native Windows PowerShell5.1/7 CI
+is pending on the successor revision; the original38922425224 fixture failure
+remains recorded below. No production data/VM or signing state changed.
+
+## Server native CI fixture MFA alignment, 16 October 2026
+
+Native CI `38922425224` at `65ed9a2` failed only
+`scripts/check-development-fixture.ps1` (line 112):
+`Unicode bootstrap password did not authenticate.` The fixture still expected
+password-only administrator `check-login` success, which mandatory MFA now
+deliberately refuses. Linux fmt/test/clippy and Windows Rust tests/clippy/
+release were green in that run.
+
+Bounded CI-only repair in `modules/server` (no product auth/schema/installer
+behavior change; mandatory MFA retained). Owned writes:
+`scripts/check-development-fixture.ps1`, `tests/review_findings.rs`,
+`README.md`, `scripts/windows-tester.md`, this file, and
+`/tmp/hs-finish-20261013/server-native-ci-fixture-report.md`.
+
+The fixture keeps real Unicode stdin bootstrap, private store ACL, caller
+environment preservation, single-use bootstrap denial, batch launcher
+diagnostics and child cleanup. It now runs the actual `check-login` CLI twice
+over the same private UTF-8 stdin path and asserts bounded safe `AppError`
+markers without dumping stdout/stderr or the password:
+
+1. Correct Unicode password → nonzero, exact
+   `multi-factor authentication is required; password-only login is refused`
+   (password verification precedes the MFA gate), not `invalid credentials`,
+   not `login ok`.
+2. Wrong Unicode password → nonzero, `invalid credentials`, not the MFA
+   denial, not `login ok`.
+
+Actual-CLI regression `cli_unicode_password_reaches_mfa_denial_and_wrong_password_fails_credentials`
+in `tests/review_findings.rs` proves the same seam on disposable stores with
+the real `hs-server` child (no mock service, no password-hash bypass) and
+asserts `sessions` stays empty after both denials.
+
+Agent (`xiaomi-token-plan-ams/mimo-v2.6-pro`, variant `high`) checks on this
+Mac: `cargo fmt -- --check` clean; `cargo test --locked` **309 passed**
+(65 lib + 2 main + 61 auth_v2 + 12 http_api + 44 installer + 29 installer_adapter
++ 26 installer_package_targets + 12 installer_review + 7 mfa_legacy_boundary
++ 22 review_findings + 29 tls_transport); `cargo clippy --locked --all-targets
+-- -D warnings` clean; `cargo build --locked` clean. PowerShell
+`Parser::ParseFile` accepts `check-development-fixture.ps1` and
+`start-development.ps1`; PS7-only syntax markers are absent (target dialect
+remains Windows PowerShell 5.1+, also intended for PowerShell 7).
+
+**Not Verified:** native Windows/Linux CI re-run of the repaired fixture.
+The prior Windows failure is recorded; do not treat the fixture as accepted
+until `38922425224`'s successor is green under both `powershell` and `pwsh`.
+Public authority, installed services, delegation, media/control, authority
+recovery cutover and production signing remain unavailable or Not Verified.
+No production data or VM was changed. No commit/push/deploy.
+
 ## Coordinator MFA candidate verification, 16 October 2026
 
 Coordinator independently reproduced all five authority regressions and the full

@@ -801,6 +801,155 @@ fn legacy_loopback_init_and_bootstrap_still_work() {
     );
 }
 
+/// Actual CLI regression for the Unicode stdin bootstrap/credential seam.
+///
+/// `service.login` verifies the password before the effective MFA gate, and
+/// the CLI prints the safe `AppError` on stderr. A correct Unicode password
+/// must therefore reach the mandatory MFA denial (not `invalid credentials`),
+/// while a wrong Unicode password must fail as `invalid credentials` and not
+/// as the MFA denial. Neither path mints a session. No mock service and no
+/// password-hash bypass — real `hs-server` child processes only.
+#[test]
+fn cli_unicode_password_reaches_mfa_denial_and_wrong_password_fails_credentials() {
+    use std::io::Write;
+
+    let (_dir, base) = private_tempdir();
+    let db_path = base.join("hs-server.db");
+
+    // Unicode shapes the PowerShell fixture sends (Latin-1 + CJK).
+    let password = "fixture-cafebabe-\u{E9}\u{6F22}";
+    let wrong_password = "fixture-wrong-deadbeef-\u{E9}\u{6F22}";
+
+    let init = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("init")
+        .output()
+        .expect("init");
+    assert!(init.status.success());
+    let init_out = String::from_utf8_lossy(&init.stdout);
+    let mut lines = init_out.lines();
+    assert!(lines.any(|line| line == "single-use bootstrap token (shown once, stored hashed):"));
+    let token = lines
+        .find(|line| !line.trim().is_empty())
+        .expect("token follows header")
+        .trim()
+        .to_string();
+
+    let mut bootstrap = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("bootstrap")
+        .arg("--token")
+        .arg(&token)
+        .arg("--username")
+        .arg("admin")
+        .arg("--password-stdin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn bootstrap");
+    {
+        let stdin = bootstrap.stdin.as_mut().expect("stdin");
+        stdin
+            .write_all(format!("{password}\n").as_bytes())
+            .expect("write password");
+    }
+    let out = bootstrap.wait_with_output().expect("wait");
+    assert!(out.status.success(), "Unicode stdin bootstrap must succeed");
+
+    // Correct Unicode password: password verifies, then mandatory MFA denies.
+    let mut correct = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("check-login")
+        .arg("--username")
+        .arg("admin")
+        .arg("--password-stdin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn correct login");
+    {
+        let stdin = correct.stdin.as_mut().expect("stdin");
+        stdin
+            .write_all(format!("{password}\n").as_bytes())
+            .expect("write password");
+    }
+    let out = correct.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "mandatory administrator MFA must refuse password-only CLI check-login"
+    );
+    assert!(
+        stderr.contains("multi-factor authentication is required; password-only login is refused"),
+        "correct Unicode password must reach the safe MFA-required denial"
+    );
+    assert!(
+        !stderr.contains("invalid credentials"),
+        "correct Unicode password must not be reported as invalid credentials"
+    );
+    assert!(!stdout.contains("login ok"), "no login success on denial");
+    assert!(
+        !stdout.contains(password) && !stderr.contains(password),
+        "password must not appear in captured output"
+    );
+
+    // Wrong Unicode password via the same stdin path: credentials failure,
+    // distinct from the MFA denial (proves password verification runs first).
+    let mut wrong = std::process::Command::new(hs_server_bin())
+        .arg("--data")
+        .arg(&db_path)
+        .arg("check-login")
+        .arg("--username")
+        .arg("admin")
+        .arg("--password-stdin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn wrong login");
+    {
+        let stdin = wrong.stdin.as_mut().expect("stdin");
+        stdin
+            .write_all(format!("{wrong_password}\n").as_bytes())
+            .expect("write wrong password");
+    }
+    let out = wrong.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "wrong password must not authenticate"
+    );
+    assert!(
+        stderr.contains("invalid credentials"),
+        "wrong Unicode password must fail as invalid credentials"
+    );
+    assert!(
+        !stderr.contains("multi-factor authentication is required"),
+        "wrong Unicode password must not receive the MFA-required denial"
+    );
+    assert!(!stdout.contains("login ok"), "no login success on denial");
+    assert!(
+        !stdout.contains(wrong_password) && !stderr.contains(wrong_password),
+        "password must not appear in captured output"
+    );
+
+    // Neither denial path mints a session.
+    let conn = db::open(&db_path).expect("reopen disposable store");
+    let service = Service::new(conn);
+    let handle = service.db_handle().lock().expect("store");
+    let sessions: i64 = handle
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("session count");
+    assert_eq!(sessions, 0, "check-login denials must not mint sessions");
+}
+
 /// Windows CLI bootstrap-v2 with an invalid token must refuse without
 /// creating a recovery file or printing secrets. The private store boundary
 /// is native; auth still rejects a dummy token before any secret material.

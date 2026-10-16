@@ -69,6 +69,84 @@ function Assert-PrivateStoreDirectory {
     }
 }
 
+# Run the actual check-login CLI over private UTF-8 stdin. Streams are
+# captured for bounded assertions and are never echoed (no secret output).
+function Invoke-HsServerCheckLogin {
+    param(
+        [string]$Exe,
+        [string]$DbPath,
+        [string]$Password
+    )
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $Exe
+    $info.Arguments = '--data "{0}" check-login --username admin --password-stdin' -f $DbPath
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $info
+    $bytes = $null
+    try {
+        if (-not $process.Start()) { throw 'Could not start login check.' }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Password + "`n")
+        $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $process.StandardInput.Close()
+        if (-not $process.WaitForExit(15000)) {
+            $process.Kill()
+            throw 'Login check exceeded its 15-second deadline.'
+        }
+        $outText = $stdout.GetAwaiter().GetResult()
+        $errText = $stderr.GetAwaiter().GetResult()
+        return @{
+            ExitCode = $process.ExitCode
+            Stdout = $outText
+            Stderr = $errText
+        }
+    }
+    finally {
+        if ($null -ne $bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }
+        $process.Dispose()
+    }
+}
+
+# Safe denial markers from the actual CLI (AppError Display on stderr).
+$script:MfaRequiredDenial = 'multi-factor authentication is required; password-only login is refused'
+$script:InvalidCredentialsDenial = 'invalid credentials'
+
+# Assert a captured check-login result without dumping secret or raw output.
+function Assert-CheckLoginDenial {
+    param(
+        [hashtable]$Result,
+        [string]$ExpectedDenial,
+        [string]$ForbiddenDenial,
+        [string]$Password,
+        [string]$CaseName
+    )
+    if ($Result.ExitCode -eq 0) {
+        throw "$CaseName : check-login must not exit 0 under mandatory MFA / failed credentials."
+    }
+    if ($Result.Stdout.Contains('login ok')) {
+        throw "$CaseName : check-login must not print 'login ok'."
+    }
+    if (-not $Result.Stderr.Contains($ExpectedDenial)) {
+        throw "$CaseName : expected safe denial was not present on stderr."
+    }
+    if ($Result.Stderr.Contains($ForbiddenDenial)) {
+        throw "$CaseName : denial must be distinct from the other failure mode."
+    }
+    if ($Result.Stdout.Contains($Password) -or $Result.Stderr.Contains($Password)) {
+        throw "$CaseName : captured output must not contain the password."
+    }
+    # Bounded diagnostic shape: the safe AppError line only.
+    if ($Result.Stderr.Length -gt 256 -or $Result.Stdout.Length -gt 256) {
+        throw "$CaseName : captured output exceeded the bounded diagnostic size."
+    }
+}
+
 $script:Username = 'admin'
 $script:ManagerIdentity = 'dev-manager-key'
 $script:FriendlyName = 'CI development fixture'
@@ -89,29 +167,27 @@ Invoke-HsServerBootstrap -Exe $exe -DbPath $database -Password $password
 if ([Environment]::GetEnvironmentVariable('HS_BOOTSTRAP_TOKEN') -cne $priorEnvironment) {
     throw 'Bootstrap modified the caller environment.'
 }
-$info = New-Object System.Diagnostics.ProcessStartInfo
-$info.FileName = $exe
-$info.Arguments = '--data "{0}" check-login --username admin --password-stdin' -f $database
-$info.UseShellExecute = $false
-$info.RedirectStandardInput = $true
-$info.RedirectStandardOutput = $true
-$info.RedirectStandardError = $true
-$login = New-Object System.Diagnostics.Process
-$login.StartInfo = $info
+# Correct Unicode password reaches password verification, then the
+# mandatory administrator MFA gate: nonzero safe MFA-required denial.
+# Wrong Unicode password stays a credentials failure, distinct from MFA.
+# Neither path mints a session; stdout/stderr are captured, never dumped.
+$correctLogin = Invoke-HsServerCheckLogin -Exe $exe -DbPath $database -Password $password
+Assert-CheckLoginDenial -Result $correctLogin -ExpectedDenial $script:MfaRequiredDenial `
+    -ForbiddenDenial $script:InvalidCredentialsDenial -Password $password `
+    -CaseName 'correct Unicode password'
+$correctLogin = $null
+
+$wrongPassword = 'fixture-wrong-' + [guid]::NewGuid().ToString('N') + [char]0xE9 + [char]0x6F22
 try {
-    if (-not $login.Start()) { throw 'Could not start login check.' }
-    $stdout = $login.StandardOutput.ReadToEndAsync()
-    $stderr = $login.StandardError.ReadToEndAsync()
-    $bytes = [Text.Encoding]::UTF8.GetBytes($password + "`n")
-    $login.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
-    $login.StandardInput.Close()
-    [Array]::Clear($bytes, 0, $bytes.Length)
-    if (-not $login.WaitForExit(15000)) { $login.Kill(); throw 'Login check timed out.' }
-    $null = $stdout.GetAwaiter().GetResult()
-    $null = $stderr.GetAwaiter().GetResult()
-    if ($login.ExitCode -ne 0) { throw 'Unicode bootstrap password did not authenticate.' }
+    $wrongLogin = Invoke-HsServerCheckLogin -Exe $exe -DbPath $database -Password $wrongPassword
+    Assert-CheckLoginDenial -Result $wrongLogin -ExpectedDenial $script:InvalidCredentialsDenial `
+        -ForbiddenDenial $script:MfaRequiredDenial -Password $wrongPassword `
+        -CaseName 'wrong Unicode password'
+    $wrongLogin = $null
 }
-finally { $login.Dispose() }
+finally {
+    $wrongPassword = $null
+}
 # The same real helper must refuse reused bootstrap, without leaking output.
 $rejected = $false
 try { Invoke-HsServerBootstrap -Exe $exe -DbPath $database -Password $password }
@@ -119,7 +195,7 @@ catch { $rejected = $true }
 if (-not $rejected) { throw 'Repeated bootstrap was accepted.' }
 $script:BootstrapToken = $null
 $password = $null
-Write-Host 'Windows PowerShell: launcher parse, absent store path, private store ACL, Unicode stdin bootstrap, caller environment and single-use denial PASS.'
+Write-Host 'Windows PowerShell: launcher parse, absent store path, private store ACL, Unicode stdin bootstrap, mandatory MFA denial vs invalid-credentials, caller environment and single-use denial PASS.'
 # Exercise the actual batch launcher against a failing local child. This proves
 # exit propagation and retained diagnostics; interactive Explorer behavior is
 # still a user-PC check. The copied child contains no credentials or server.
