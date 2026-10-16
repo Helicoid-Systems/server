@@ -1,3 +1,22 @@
+## Native conditional-MFA prerequisite acceptance, 16 October 2026
+
+[CI38932191897](https://github.com/Helicoid-Systems/server/actions/runs/38932191897)
+passes at source `89a35c4fd920d576fb724e8a620222463b4c011b`:302 Linux tests,
+310 Windows tests, format, strict Clippy, release and real development fixtures
+under Windows PowerShell5.1 and PowerShell7. The coordinator independently
+passed309 Mac Rust tests and actual Rust HTTPS interoperability (7 Swift,
+6 C# checks). Counts differ by platform-specific cases; no native skip is
+converted into a pass.
+
+The [Windows development server](https://github.com/Helicoid-Systems/server/actions/runs/38932191897/artifacts/12059988937)
+archive matches SHA256 `3fa671b497f6d6e4c4c8413ecc4b9400857c2ed3633a117791cf8a4f25ed94fb`.
+Its actual executable is PE x64, SHA256
+`df36af553560210ac9f1321734f3cf5284e75a35e7eeeb9b2ed4a6af741e7a0b`.
+The CMD launcher matches source bytes; PS1 matches source text after documented
+Windows-checkout CRLF normalization. These are unsigned prerequisites, not
+installed hosting, public deployment, scoped delegation, admission or recovery
+cutover acceptance. Earlier failed runs remain historical below.
+
 ## Coordinator final fixture verification, 16 October 2026
 
 Coordinator independently passed all **309 Rust tests**, format, strict Clippy
@@ -8,7 +27,7 @@ code is unchanged by this fixture-only follow-up.
 
 Fresh MiMo export verifies 51 assistant records from
 `xiaomi-token-plan-ams/mimo-v2.6-pro`, `high`. Native Windows PowerShell5.1/7 CI
-is pending on the successor revision; the original38922425224 fixture failure
+subsequently passed in38932191897; the original38922425224 fixture failure
 remains recorded below. No production data/VM or signing state changed.
 
 ## Server native CI fixture MFA alignment, 16 October 2026
