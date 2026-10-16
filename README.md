@@ -1,18 +1,22 @@
 # Helicoid Systems — coordination server foundation
 
-The operator-MFA candidate now passes **309 coordinator tests**, formatting,
-strict Clippy and the release build on macOS. Independent regressions confirm
-that future MFA assurance, legacy login and historical password-only sessions
-cannot bypass mandatory MFA or approved manager-key proof. Operator MFA is
-optional by default; administrator and already-enrolled factors remain mandatory.
-Schema 3 requires an explicit migration; no production database was migrated.
-Native Windows CI still failed `scripts/check-development-fixture.ps1` at
-revision `65ed9a2` because that fixture expected password-only administrator
-`check-login` success; the fixture now asserts the deliberate mandatory-MFA
-denial and a distinct invalid-credentials denial for a wrong Unicode password
-(actual CLI, stdin only). Native Windows/Linux CI acceptance of the repaired
-fixture remains **Not Verified** until the next real CI run.
-The 14 October billing interruption and earlier failed candidates are historical.
+Current conditional-MFA prerequisite: [CI38932191897](https://github.com/Helicoid-Systems/server/actions/runs/38932191897)
+passes302 Linux and310 Windows tests plus format/strict Clippy, release and both
+PowerShell fixtures at `89a35c4fd920d576fb724e8a620222463b4c011b`. Coordinator309
+Mac tests and real Rust HTTPS native-client interoperability (7 Swift/6 C#) pass.
+[Unsigned Windows server download](https://github.com/Helicoid-Systems/server/actions/runs/38932191897/artifacts/12059988937)
+is digest/PE/launcher verified. Mandatory administrator MFA and conditional
+operator MFA remain enforced; installed/public hosting and complete release
+checkpoints remain Not Verified. See BUILD-REPORT for exact limits.
+
+The coordinator's309 macOS tests include independent regressions proving that
+future MFA assurance, legacy login and historical password-only sessions cannot
+bypass mandatory MFA or approved manager-key proof. Operator MFA is optional by
+default; administrator and already-enrolled factors remain mandatory. Schema3
+requires explicit migration; no production database was migrated. The initial
+Windows fixture failure and14 October billing interruption are historical; the
+corrected fixture reaches the mandatory-MFA denial for the correct Unicode
+password and credentials denial for a wrong password, without minting a session.
 
 `hs-server` is an independently buildable Rust service owned by `modules/server`.
 It provides the first durable slice of the Helicoid Systems coordination plane:
@@ -28,7 +32,7 @@ security-state-unavailable behavior.
 
 Repository: https://github.com/Helicoid-Systems/server. Durable release identifiers remain pending.
 
-Bounded MFA factor recovery, product/release/target-bound package verification and literal-loopback HTTPS pass complete [CI38441619920](https://github.com/Helicoid-Systems/server/actions/runs/38441619920) at exact code `c30c9e2b96ce6b7bf0b41f4ef59f67b8ec79149d`: **270 Linux / 278 Windows tests**, formatting, strict Clippy, release and both PowerShell launchers. Five new regressions prove cancellation preserves the established factor, confirmation installs the replacement, real device-key login works, private-store restart retains those boundaries, and storage failure after transaction writes rolls back while blocking new authority. The coordinator independently passes **277 Mac tests**, reproduces both baseline defects and verifies the exact production fix with the same regressions. [Download the development server bundle](https://github.com/Helicoid-Systems/server/actions/runs/38441619920/artifacts/11837145033); its digest, actual PE x64 executable and companion scripts are independently inspected. All26 package tests and prior TLS/private-store guards stay green. Metadata verification supports four trusted targets; installation commands remain Linux-only and Windows/macOS service setup remains unavailable. Public authentication/media/control, installed acceptance, configurable operator MFA, delegation, authority recovery/cutover and signing remain gated. Owned-child kill/reap is not installed service-stop acceptance.
+Earlier accepted prerequisite evidence: bounded MFA factor recovery, product/release/target-bound package verification and literal-loopback HTTPS passed complete [CI38441619920](https://github.com/Helicoid-Systems/server/actions/runs/38441619920) at exact code `c30c9e2b96ce6b7bf0b41f4ef59f67b8ec79149d`: **270 Linux / 278 Windows tests**, formatting, strict Clippy, release and both PowerShell launchers. Five new regressions prove cancellation preserves the established factor, confirmation installs the replacement, real device-key login works, private-store restart retains those boundaries, and storage failure after transaction writes rolls back while blocking new authority. The coordinator independently passes **277 Mac tests**, reproduces both baseline defects and verifies the exact production fix with the same regressions. [Download the development server bundle](https://github.com/Helicoid-Systems/server/actions/runs/38441619920/artifacts/11837145033); its digest, actual PE x64 executable and companion scripts are independently inspected. All26 package tests and prior TLS/private-store guards stay green. Metadata verification supports four trusted targets; installation commands remain Linux-only and Windows/macOS service setup remains unavailable. Public authentication/media/control, installed acceptance, delegation, authority recovery/cutover and signing remain gated. Configurable operator MFA is verified in the current prerequisite above. Owned-child kill/reap is not installed service-stop acceptance.
 
 Existing SQLite store files accept only currentUser/SYSTEM/Administrators ownership together with the strict held DACL/shape/link and protected-parent boundary. New objects, recovery/key reads and product directories remain current-user owned; foreign and TrustedInstaller store owners remain refused. The launcher chooses a missing path and lets the server create its protected folder. Literal-loopback HTTPS (`serve-tls`) on Unix and Windows uses the native-verified private_file held reader. Public authentication/listeners, installed services, recovery cutover and signing remain unavailable. This is a native private-store/MFA/CLI prerequisite plus a verified Windows loopback TLS prerequisite, not a completed deployment or worker/admission checkpoint. Historical failures and acceptance boundaries are in [BUILD-REPORT.md](BUILD-REPORT.md).
 
