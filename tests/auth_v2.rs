@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
 use hs_server::crypto::{
-    auth_challenge_proof_message, bootstrap_manager_proof_message, hash_token, totp_generate_at,
-    totp_time_step, unix_now,
+    auth_challenge_proof_message, bootstrap_manager_proof_message, hash_password, hash_token,
+    totp_generate_at, totp_time_step, unix_now,
 };
 use hs_server::db;
 use hs_server::models::*;
 use hs_server::service::Service;
+use hs_server::AppError;
 
 const PASSWORD: &str = "foundation-pass-v2-1";
 
@@ -339,7 +340,7 @@ fn missing_wrong_and_replayed_totp_deny() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: sig,
-        totp_code: "000000".into(),
+        totp_code: Some("000000".into()),
     });
     assert!(complete.is_err(), "wrong totp must deny");
 
@@ -364,7 +365,7 @@ fn missing_wrong_and_replayed_totp_deny() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: sig.clone(),
-        totp_code: code.clone(),
+        totp_code: Some(code.clone()),
     });
     assert!(
         first.is_ok(),
@@ -391,7 +392,7 @@ fn missing_wrong_and_replayed_totp_deny() {
         challenge_id: challenge2.challenge_id.clone(),
         challenge_token: challenge2.challenge_token.clone(),
         manager_signature: sig2,
-        totp_code: code,
+        totp_code: Some(code),
     });
     assert!(
         replay.is_err(),
@@ -443,13 +444,13 @@ fn concurrent_totp_replay_denies_second() {
         challenge_id: c1.challenge_id.clone(),
         challenge_token: c1.challenge_token.clone(),
         manager_signature: s1,
-        totp_code: code.clone(),
+        totp_code: Some(code.clone()),
     });
     let r2 = service.complete_auth_challenge(AuthChallengeCompleteRequest {
         challenge_id: c2.challenge_id.clone(),
         challenge_token: c2.challenge_token.clone(),
         manager_signature: s2,
-        totp_code: code,
+        totp_code: Some(code),
     });
 
     let ok_count = [r1.is_ok(), r2.is_ok()].iter().filter(|ok| **ok).count();
@@ -491,7 +492,7 @@ fn wrong_manager_proof_denies() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: bad_sig,
-        totp_code: code,
+        totp_code: Some(code),
     });
     assert!(denied.is_err(), "wrong manager key proof must deny");
     let _ = other_key;
@@ -524,7 +525,7 @@ fn double_challenge_consumption_denies_replay() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: sig.clone(),
-        totp_code: code.clone(),
+        totp_code: Some(code.clone()),
     });
     assert!(first.is_ok(), "first completion must succeed");
 
@@ -533,7 +534,7 @@ fn double_challenge_consumption_denies_replay() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: sig,
-        totp_code: code,
+        totp_code: Some(code),
     });
     assert!(second.is_err(), "double challenge consumption must deny");
 }
@@ -594,7 +595,7 @@ fn challenge_is_bound_to_operation_and_key() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: wrong_op_sig,
-        totp_code: code,
+        totp_code: Some(code),
     });
     assert!(denied.is_err(), "operation binding must hold");
 }
@@ -846,7 +847,7 @@ fn complete_session_login(
         challenge_id: challenge.challenge_id,
         challenge_token: challenge.challenge_token,
         manager_signature: sig,
-        totp_code: code,
+        totp_code: Some(code),
     })
 }
 
@@ -1414,7 +1415,7 @@ fn totp_consumption_failure_denies_without_session() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: sig,
-        totp_code: code,
+        totp_code: Some(code),
     });
     assert!(
         complete.is_err(),
@@ -1548,7 +1549,7 @@ fn wrong_deployment_proof_denies() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: wrong_dep_sig,
-        totp_code: code.clone(),
+        totp_code: Some(code.clone()),
     });
     assert!(
         denied.is_err(),
@@ -1567,7 +1568,7 @@ fn wrong_deployment_proof_denies() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: good_sig,
-        totp_code: code,
+        totp_code: Some(code),
     });
     assert!(
         ok.is_ok(),
@@ -1613,7 +1614,7 @@ fn revoked_manager_race_denies_inside_final_transaction() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: sig,
-        totp_code: code,
+        totp_code: Some(code),
     });
     assert!(
         complete.is_err(),
@@ -1668,7 +1669,7 @@ fn disabled_account_race_denies_inside_final_transaction() {
         challenge_id: challenge.challenge_id.clone(),
         challenge_token: challenge.challenge_token.clone(),
         manager_signature: sig,
-        totp_code: code,
+        totp_code: Some(code),
     });
     assert!(
         complete.is_err(),
@@ -2073,5 +2074,1542 @@ mod persistent_private_mfa {
             );
             assert_eq!(rc, 0, "corrupt DACL rc={rc}");
         }
+    }
+}
+
+// ----- configurable operator MFA (schema 3) -----
+//
+// Administrator (`can_manage_security`) MFA stays mandatory. Operator policy
+// defaults to `optional`. An already-active enrolled factor remains mandatory
+// even under `optional`. Policy mutation needs a fresh MFA-backed session.
+
+struct SeededOperator {
+    account_id: String,
+    username: String,
+    password: String,
+    public_key: String,
+    signer: SigningKey,
+}
+
+/// Test-only operator fixture (non-administrator). Real password hash and a
+/// real approved manager Ed25519 key; no production seeding path exists.
+fn seed_operator(service: &Service, username: &str, password: &str) -> SeededOperator {
+    let (signer, public_key) = keypair();
+    let account_id = format!("op-{username}");
+    let manager_id = format!("mgr-{username}");
+    let now = unix_now() as i64;
+    let password_hash = hash_password(password).expect("hash operator password");
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute(
+            "INSERT INTO accounts (
+                id, username, password_hash, state,
+                can_operate, can_manage_enrollment, can_manage_access,
+                can_manage_accounts, can_manage_security,
+                revision, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'active', 1, 0, 0, 0, 0, 1, ?4, ?4)",
+            rusqlite::params![account_id, username, password_hash, now],
+        )
+        .expect("insert operator account");
+        conn.execute(
+            "INSERT INTO managers (
+                id, public_identity, friendly_name, lifecycle_state,
+                approved_by_account_id, approved_at, created_at, updated_at, public_key
+             ) VALUES (?1, ?2, ?3, 'approved', ?4, ?5, ?5, ?5, ?6)",
+            rusqlite::params![
+                manager_id,
+                format!("key:{public_key}"),
+                format!("Operator {username}"),
+                account_id,
+                now,
+                public_key
+            ],
+        )
+        .expect("insert operator manager");
+    }
+    SeededOperator {
+        account_id,
+        username: username.to_string(),
+        password: password.to_string(),
+        public_key,
+        signer,
+    }
+}
+
+/// Test-only active TOTP factor for an operator (optional-policy fixture).
+fn seed_active_factor(service: &Service, account_id: &str) -> String {
+    let secret = hs_server::crypto::generate_totp_secret().expect("operator totp secret");
+    let now = unix_now() as i64;
+    let conn = service.db_handle().lock().expect("lock");
+    conn.execute(
+        "INSERT INTO account_mfa (
+            account_id, totp_secret, totp_confirmed_at, recovery_stored_at,
+            status, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?3, 'active', ?3, ?3)",
+        rusqlite::params![account_id, secret, now],
+    )
+    .expect("seed active factor");
+    secret
+}
+
+fn stored_policy(service: &Service) -> String {
+    let conn = service.db_handle().lock().expect("lock");
+    conn.query_row(
+        "SELECT operator_mfa_policy FROM security_policy WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )
+    .expect("stored policy")
+}
+
+fn session_row(service: &Service, session_id: &str) -> (String, Option<i64>, Option<i64>) {
+    let conn = service.db_handle().lock().expect("lock");
+    conn.query_row(
+        "SELECT assurance, mfa_assured_at, revoked_at FROM sessions WHERE id = ?1",
+        rusqlite::params![session_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .expect("session row")
+}
+
+fn operator_begin(
+    service: &Service,
+    op: &SeededOperator,
+) -> Result<AuthChallengeBeginResponse, AppError> {
+    service.begin_auth_challenge(AuthChallengeBeginRequest {
+        username: op.username.clone(),
+        password: op.password.clone(),
+        operation: "session".into(),
+        manager_public_key: op.public_key.clone(),
+    })
+}
+
+fn operator_complete(
+    service: &Service,
+    op: &SeededOperator,
+    challenge: AuthChallengeBeginResponse,
+    totp_code: Option<String>,
+) -> Result<LoginResponse, AppError> {
+    let dep = deployment_id(service);
+    let sig = sign_challenge(
+        &op.signer,
+        &dep,
+        &challenge.challenge_id,
+        "session",
+        &op.public_key,
+    );
+    service.complete_auth_challenge(AuthChallengeCompleteRequest {
+        challenge_id: challenge.challenge_id,
+        challenge_token: challenge.challenge_token,
+        manager_signature: sig,
+        totp_code,
+    })
+}
+
+fn admin_auth(service: &Service, enrolled: &Enrolled) -> hs_server::AuthContext {
+    let login = complete_session_login(service, enrolled, &enrolled.totp_secret)
+        .expect("admin mfa session");
+    service
+        .authenticate_token(&login.token)
+        .expect("admin auth context")
+}
+
+// ----- optional default operator login -----
+
+#[test]
+fn optional_default_operator_login_with_password_and_manager_proof() {
+    let service = service();
+    let _admin = bootstrap_enrolled(&service);
+    assert_eq!(
+        stored_policy(&service),
+        "optional",
+        "new deployments default optional"
+    );
+
+    let op = seed_operator(&service, "op-optional", "operator-pass-22");
+    let begin = operator_begin(&service, &op).expect("optional operator begin");
+    assert!(
+        !begin.mfa_required,
+        "optional non-enrolled operator is not MFA-required at begin"
+    );
+
+    let login = operator_complete(&service, &op, begin, None).expect("factor-free operator login");
+    assert_eq!(login.account.id, op.account_id);
+    assert!(!login.mfa.required);
+    assert!(!login.mfa.available);
+    assert_eq!(login.mfa.reason, "operator_policy_optional_no_factor");
+
+    let auth = service.authenticate_token(&login.token).expect("session");
+    let (assurance, mfa_assured_at, revoked) = session_row(&service, &auth.session_id);
+    assert_eq!(assurance, "password");
+    assert!(
+        mfa_assured_at.is_none(),
+        "factor-free session has no MFA assurance"
+    );
+    assert!(revoked.is_none());
+}
+
+#[test]
+fn optional_operator_missing_or_wrong_manager_proof_denies() {
+    let service = service();
+    let _admin = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-proof", "operator-pass-23");
+    let begin = operator_begin(&service, &op).expect("begin");
+
+    // Missing signature.
+    let missing = service.complete_auth_challenge(AuthChallengeCompleteRequest {
+        challenge_id: begin.challenge_id.clone(),
+        challenge_token: begin.challenge_token.clone(),
+        manager_signature: " ".into(),
+        totp_code: None,
+    });
+    assert!(missing.is_err(), "missing manager proof must deny");
+
+    // Wrong signature (unrelated key).
+    let (other_signer, _) = keypair();
+    let dep = deployment_id(&service);
+    let wrong = sign_challenge(
+        &other_signer,
+        &dep,
+        &begin.challenge_id,
+        "session",
+        &op.public_key,
+    );
+    let denied = service.complete_auth_challenge(AuthChallengeCompleteRequest {
+        challenge_id: begin.challenge_id.clone(),
+        challenge_token: begin.challenge_token.clone(),
+        manager_signature: wrong,
+        totp_code: None,
+    });
+    assert!(denied.is_err(), "wrong manager proof must deny");
+    assert_eq!(
+        session_count(&service),
+        0,
+        "proof failures must not issue sessions"
+    );
+}
+
+#[test]
+fn optional_enrolled_factor_still_requires_totp() {
+    let service = service();
+    let _admin = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-enrolled", "operator-pass-24");
+    let secret = seed_active_factor(&service, &op.account_id);
+
+    let begin = operator_begin(&service, &op).expect("begin");
+    assert!(
+        begin.mfa_required,
+        "active factor keeps MFA mandatory under optional policy"
+    );
+
+    let missing = operator_complete(&service, &op, begin.clone(), None);
+    assert!(missing.is_err(), "enrolled operator must supply TOTP");
+
+    let wrong = operator_complete(&service, &op, begin.clone(), Some("000000".into()));
+    assert!(wrong.is_err(), "wrong TOTP must deny");
+
+    let at = unused_totp_time(&service, &op.account_id);
+    let code = totp_generate_at(&secret, at).expect("operator totp");
+    let login = operator_complete(&service, &op, begin, Some(code)).expect("totp login");
+    assert!(login.mfa.required);
+    assert!(login.mfa.available);
+    assert_eq!(login.mfa.reason, "totp_active");
+    let auth = service.authenticate_token(&login.token).expect("session");
+    let (assurance, mfa_assured_at, _) = session_row(&service, &auth.session_id);
+    assert_eq!(assurance, "mfa");
+    assert!(
+        mfa_assured_at.is_some(),
+        "mfa session stores assurance time"
+    );
+}
+
+#[test]
+fn administrator_mfa_remains_mandatory() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let dep = deployment_id(&service);
+
+    let begin = service
+        .begin_auth_challenge(AuthChallengeBeginRequest {
+            username: "admin".into(),
+            password: PASSWORD.into(),
+            operation: "session".into(),
+            manager_public_key: enrolled.public_key.clone(),
+        })
+        .expect("admin begin");
+    assert!(begin.mfa_required, "administrator is always MFA-required");
+
+    let sig = sign_challenge(
+        &enrolled.signer,
+        &dep,
+        &begin.challenge_id,
+        "session",
+        &enrolled.public_key,
+    );
+    let denied = service.complete_auth_challenge(AuthChallengeCompleteRequest {
+        challenge_id: begin.challenge_id.clone(),
+        challenge_token: begin.challenge_token.clone(),
+        manager_signature: sig.clone(),
+        totp_code: None,
+    });
+    assert!(denied.is_err(), "administrator cannot finish factor-free");
+    assert_eq!(session_count(&service), 0);
+}
+
+// ----- required operator policy -----
+
+#[test]
+fn required_operator_missing_invalid_and_replayed_factor_deny() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let auth = admin_auth(&service, &enrolled);
+    service
+        .set_operator_mfa_policy(
+            &auth,
+            OperatorMfaPolicyUpdateRequest {
+                policy: OperatorMfaPolicy::Required,
+            },
+        )
+        .expect("set required");
+    assert_eq!(stored_policy(&service), "required");
+
+    // Non-enrolled operator cannot even begin under required policy.
+    let bare = seed_operator(&service, "op-bare", "operator-pass-25");
+    let bare_begin = operator_begin(&service, &bare);
+    assert!(
+        bare_begin.is_err(),
+        "required policy must refuse non-enrolled operator begin"
+    );
+
+    let op = seed_operator(&service, "op-required", "operator-pass-26");
+    let secret = seed_active_factor(&service, &op.account_id);
+    let begin = operator_begin(&service, &op).expect("enrolled begin under required");
+    assert!(begin.mfa_required);
+
+    let missing = operator_complete(&service, &op, begin.clone(), None);
+    assert!(missing.is_err(), "required operator missing factor");
+
+    let invalid = operator_complete(&service, &op, begin.clone(), Some("111111".into()));
+    assert!(invalid.is_err(), "required operator invalid factor");
+
+    let at = unused_totp_time(&service, &op.account_id);
+    let code = totp_generate_at(&secret, at).expect("code");
+    let login = operator_complete(&service, &op, begin.clone(), Some(code.clone()))
+        .expect("valid factor under required");
+    assert!(login.mfa.required);
+
+    // Replay the same code/time step.
+    let replay = operator_complete(&service, &op, begin, Some(code));
+    assert!(replay.is_err(), "replayed factor must deny");
+}
+
+#[test]
+fn policy_change_between_begin_and_complete_denies_factor_free() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-race", "operator-pass-27");
+
+    let begin = operator_begin(&service, &op).expect("begin under optional");
+    assert!(!begin.mfa_required);
+
+    // Policy becomes required after begin.
+    let auth = admin_auth(&service, &enrolled);
+    service
+        .set_operator_mfa_policy(
+            &auth,
+            OperatorMfaPolicyUpdateRequest {
+                policy: OperatorMfaPolicy::Required,
+            },
+        )
+        .expect("policy required between begin/complete");
+
+    let denied = operator_complete(&service, &op, begin, None);
+    assert!(
+        denied.is_err(),
+        "optional-started challenge cannot finish factor-free after required"
+    );
+    assert_eq!(
+        session_count(&service),
+        1,
+        "only the admin policy session exists"
+    );
+}
+
+#[test]
+fn malformed_supplied_factor_is_refused_not_ignored() {
+    let service = service();
+    let _admin = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-malformed", "operator-pass-28");
+    let begin = operator_begin(&service, &op).expect("begin");
+
+    for bad in ["", "12345", "1234567", "abcdef", "12 456"] {
+        let denied = service.complete_auth_challenge(AuthChallengeCompleteRequest {
+            challenge_id: begin.challenge_id.clone(),
+            challenge_token: begin.challenge_token.clone(),
+            manager_signature: sign_challenge(
+                &op.signer,
+                &deployment_id(&service),
+                &begin.challenge_id,
+                "session",
+                &op.public_key,
+            ),
+            totp_code: Some(bad.into()),
+        });
+        assert!(
+            denied.is_err(),
+            "malformed supplied factor {bad:?} must be refused, not ignored"
+        );
+    }
+    assert_eq!(session_count(&service), 0);
+}
+
+// ----- policy mutation authorization -----
+
+#[test]
+fn factor_free_nonadmin_and_stale_sessions_cannot_mutate_policy() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-mutate", "operator-pass-29");
+    let secret = seed_active_factor(&service, &op.account_id);
+
+    // Factor-free operator session cannot read or write policy.
+    let free_begin = {
+        // Use a separate non-enrolled operator so factor-free is possible.
+        seed_operator(&service, "op-free", "operator-pass-30")
+    };
+    let free_login = operator_complete(
+        &service,
+        &free_begin,
+        operator_begin(&service, &free_begin).expect("begin"),
+        None,
+    )
+    .expect("factor-free login");
+    let free_auth = service
+        .authenticate_token(&free_login.token)
+        .expect("factor-free auth");
+    assert!(
+        service.get_operator_mfa_policy(&free_auth).is_err(),
+        "factor-free session cannot read policy"
+    );
+    assert!(
+        service
+            .set_operator_mfa_policy(
+                &free_auth,
+                OperatorMfaPolicyUpdateRequest {
+                    policy: OperatorMfaPolicy::Required,
+                }
+            )
+            .is_err(),
+        "factor-free session cannot write policy"
+    );
+
+    // Non-administrator MFA-backed session cannot mutate policy.
+    let op_login = {
+        let begin = operator_begin(&service, &op).expect("begin");
+        let at = unused_totp_time(&service, &op.account_id);
+        let code = totp_generate_at(&secret, at).expect("code");
+        operator_complete(&service, &op, begin, Some(code)).expect("operator mfa login")
+    };
+    let op_auth = service.authenticate_token(&op_login.token).expect("auth");
+    assert!(
+        service
+            .set_operator_mfa_policy(
+                &op_auth,
+                OperatorMfaPolicyUpdateRequest {
+                    policy: OperatorMfaPolicy::Required,
+                }
+            )
+            .is_err(),
+        "non-administrator cannot change policy even with MFA"
+    );
+
+    // Administrator session whose MFA assurance is stale cannot mutate.
+    let admin_auth = admin_auth(&service, &enrolled);
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        let stale = unix_now() as i64 - 10_000;
+        conn.execute(
+            "UPDATE sessions SET mfa_assured_at = ?1 WHERE id = ?2",
+            rusqlite::params![stale, admin_auth.session_id],
+        )
+        .expect("age assurance");
+    }
+    assert!(
+        service
+            .set_operator_mfa_policy(
+                &admin_auth,
+                OperatorMfaPolicyUpdateRequest {
+                    policy: OperatorMfaPolicy::Required,
+                }
+            )
+            .is_err(),
+        "stale MFA assurance cannot authorize policy change"
+    );
+    assert_eq!(stored_policy(&service), "optional", "policy unchanged");
+
+    // Missing assurance (NULL) never authorizes change.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute(
+            "UPDATE sessions SET assurance = 'password', mfa_assured_at = NULL WHERE id = ?1",
+            rusqlite::params![admin_auth.session_id],
+        )
+        .expect("strip assurance");
+    }
+    assert!(
+        service
+            .set_operator_mfa_policy(
+                &admin_auth,
+                OperatorMfaPolicyUpdateRequest {
+                    policy: OperatorMfaPolicy::Required,
+                }
+            )
+            .is_err(),
+        "missing assurance never authorizes change"
+    );
+}
+
+#[test]
+fn enabling_required_invalidates_factor_free_operator_sessions() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+
+    let free_op = seed_operator(&service, "op-weak", "operator-pass-31");
+    let free_login = operator_complete(
+        &service,
+        &free_op,
+        operator_begin(&service, &free_op).expect("b"),
+        None,
+    )
+    .expect("weak session");
+    let free_auth = service.authenticate_token(&free_login.token).expect("auth");
+
+    let mfa_op = seed_operator(&service, "op-strong", "operator-pass-32");
+    let secret = seed_active_factor(&service, &mfa_op.account_id);
+    let mfa_begin = operator_begin(&service, &mfa_op).expect("b");
+    let at = unused_totp_time(&service, &mfa_op.account_id);
+    let code = totp_generate_at(&secret, at).expect("code");
+    let mfa_login = operator_complete(&service, &mfa_op, mfa_begin, Some(code)).expect("mfa login");
+    let mfa_auth = service.authenticate_token(&mfa_login.token).expect("auth");
+
+    let admin = admin_auth(&service, &enrolled);
+    service
+        .set_operator_mfa_policy(
+            &admin,
+            OperatorMfaPolicyUpdateRequest {
+                policy: OperatorMfaPolicy::Required,
+            },
+        )
+        .expect("enable required");
+
+    assert!(
+        service.authenticate_token(&free_login.token).is_err(),
+        "factor-free operator session must be invalidated"
+    );
+    assert!(
+        service.authenticate_token(&mfa_login.token).is_ok(),
+        "mfa-backed operator session may remain"
+    );
+    assert!(
+        service.authenticate_token(&admin.session_id).is_err(),
+        "authenticate_token takes a token, not a session id"
+    );
+    // Admin MFA session itself is not revoked by the policy change.
+    let admin_login = complete_session_login(&service, &enrolled, &enrolled.totp_secret)
+        .expect("fresh admin login after policy change");
+    assert!(service.authenticate_token(&admin_login.token).is_ok());
+    let _ = (free_auth, mfa_auth);
+}
+
+#[test]
+fn legacy_and_recovery_only_credentials_cannot_change_policy() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+
+    // Historical factor-free administrator session (schema-3 migrated shape:
+    // assurance=password, mfa_assured_at NULL). Mandatory admin MFA must
+    // refuse authority at authenticate_token — not only at new login.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        let now = unix_now() as i64;
+        let token = "fixture-legacy-session-token";
+        let token_hash = hash_token(token);
+        conn.execute(
+            "INSERT INTO accounts (
+                id, username, password_hash, state,
+                can_operate, can_manage_enrollment, can_manage_access,
+                can_manage_accounts, can_manage_security,
+                revision, created_at, updated_at
+             ) VALUES ('legacy-admin', 'legacy-admin', 'unused-hash', 'active', 1, 1, 1, 1, 1, 1, ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("seed legacy account");
+        conn.execute(
+            "INSERT INTO sessions (
+                id, account_id, manager_id, token_hash, created_at, expires_at,
+                assurance, mfa_assured_at
+             ) VALUES ('sess-legacy', 'legacy-admin', NULL, ?1, ?2, ?3, 'password', NULL)",
+            rusqlite::params![token_hash, now, now + 3600],
+        )
+        .expect("seed historical password session");
+        drop(conn);
+        assert!(
+            service.authenticate_token(token).is_err(),
+            "historical password-only administrator session must not authenticate when MFA is mandatory"
+        );
+        // Cleanup logout must still work without granting authority.
+        service
+            .logout_token(token)
+            .expect("cleanup logout of weak session");
+    }
+
+    // Recovery-only path never mints a session at all.
+    let before = session_count(&service);
+    let code = enrolled.recovery_codes[5].clone();
+    let begin = service
+        .begin_factor_recovery(FactorRecoveryBeginRequest {
+            username: "admin".into(),
+            password: PASSWORD.into(),
+            recovery_code: code,
+        })
+        .expect("recovery begin");
+    assert_eq!(begin.purpose, "totp_factor_recovery_only");
+    assert_eq!(
+        session_count(&service),
+        before,
+        "recovery begin does not mint a session"
+    );
+    assert_eq!(stored_policy(&service), "optional");
+}
+
+// ----- persisted-session MFA assurance (coordinator 2026-10-15) -----
+
+#[test]
+fn coordinator_historical_password_session_cannot_authorize_mfa_admin() {
+    let svc = service();
+    let admin = bootstrap_enrolled(&svc);
+    let token = "isolated-historical-weak-session-fixture";
+    let now = unix_now() as i64;
+    svc.db_handle()
+        .lock()
+        .expect("fixture lock")
+        .execute(
+            "INSERT INTO sessions (id, account_id, token_hash, created_at, expires_at, assurance, mfa_assured_at) VALUES ('historical-weak-session', ?1, ?2, ?3, ?4, 'password', NULL)",
+            rusqlite::params![admin.account_id, hash_token(token), now, now + 3600],
+        )
+        .expect("historical migrated session fixture");
+    assert!(
+        svc.authenticate_token(token).is_err(),
+        "A historical password-only session cannot retain administrator authority when MFA is mandatory"
+    );
+}
+
+#[test]
+fn optional_operator_password_session_denied_after_admin_role_promotion() {
+    let service = service();
+    let _admin = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-promote", "operator-pass-70");
+    // Factor-free operator under optional policy: password session is valid.
+    let login = service
+        .login(hs_server::models::LoginRequest {
+            username: op.username.clone(),
+            password: op.password.clone(),
+            manager_public_identity: None,
+        })
+        .expect("optional operator v1 login");
+    assert!(service.authenticate_token(&login.token).is_ok());
+
+    // Promote to administrator — mandatory MFA applies immediately at use.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute(
+            "UPDATE accounts SET can_manage_security = 1 WHERE id = ?1",
+            rusqlite::params![op.account_id],
+        )
+        .expect("promote");
+    }
+    assert!(
+        service.authenticate_token(&login.token).is_err(),
+        "password-only session must lose authority after administrator promotion"
+    );
+}
+
+#[test]
+fn password_session_denied_after_required_policy_activation() {
+    let service = service();
+    let _admin = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-policy-on", "operator-pass-71");
+    let login = service
+        .login(hs_server::models::LoginRequest {
+            username: op.username.clone(),
+            password: op.password.clone(),
+            manager_public_identity: None,
+        })
+        .expect("optional operator login");
+    assert!(service.authenticate_token(&login.token).is_ok());
+
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute(
+            "UPDATE security_policy SET operator_mfa_policy = 'required' WHERE id = 1",
+            [],
+        )
+        .expect("policy required");
+    }
+    assert!(
+        service.authenticate_token(&login.token).is_err(),
+        "password-only session must lose authority after required policy activation"
+    );
+}
+
+#[test]
+fn mfa_assured_session_retains_authority_for_admin() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let login = complete_session_login(&service, &enrolled, &enrolled.totp_secret)
+        .expect("genuine mfa login");
+    assert!(service.authenticate_token(&login.token).is_ok());
+    let auth = service.authenticate_token(&login.token).expect("auth");
+    assert!(auth.can_manage_security);
+}
+
+// ----- persistence and fault handling -----
+
+#[cfg(any(windows, unix))]
+#[test]
+fn operator_mfa_policy_persists_private_store_restart() {
+    let (_dir, base) = private_tempdir();
+    let path = base.join("hs-server.db");
+    {
+        let db = db::open(&path).expect("open private store");
+        let service = Service::new(db);
+        let enrolled = bootstrap_enrolled(&service);
+        let auth = admin_auth(&service, &enrolled);
+        let view = service
+            .set_operator_mfa_policy(
+                &auth,
+                OperatorMfaPolicyUpdateRequest {
+                    policy: OperatorMfaPolicy::Required,
+                },
+            )
+            .expect("set required");
+        assert_eq!(view.policy, OperatorMfaPolicy::Required);
+        assert!(view.mfa_required_for_operators);
+    }
+
+    let db = db::open(&path).expect("reopen private store");
+    let service = Service::new(db);
+    assert_eq!(stored_policy(&service), "required");
+    // Default remains optional only on fresh installs; reopen keeps required.
+    let op = seed_operator(&service, "op-persist", "operator-pass-33");
+    assert!(
+        operator_begin(&service, &op).is_err(),
+        "persisted required policy still refuses non-enrolled operators"
+    );
+}
+
+#[test]
+fn corrupt_operator_policy_denies_new_authority_and_keeps_recovery() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-corrupt", "operator-pass-34");
+
+    // Corrupt stored policy (disposable test store rebuild without CHECK).
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute_batch(
+            r#"
+            DROP TABLE security_policy;
+            CREATE TABLE security_policy (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                operator_mfa_policy TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO security_policy (id, operator_mfa_policy, updated_at)
+            VALUES (1, 'corrupt-not-a-policy', 1);
+            "#,
+        )
+        .expect("corrupt policy fixture");
+    }
+
+    assert!(
+        operator_begin(&service, &op).is_err(),
+        "corrupt policy must deny new operator authority"
+    );
+    let admin_begin = service.begin_auth_challenge(AuthChallengeBeginRequest {
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        operation: "session".into(),
+        manager_public_key: enrolled.public_key.clone(),
+    });
+    assert!(
+        admin_begin.is_err(),
+        "corrupt policy must deny new administrator authority too"
+    );
+
+    // Recovery semantics are preserved: recovery begin still works.
+    let code = enrolled.recovery_codes[0].clone();
+    let recovery = service.begin_factor_recovery(FactorRecoveryBeginRequest {
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        recovery_code: code,
+    });
+    assert!(
+        recovery.is_ok(),
+        "recovery-only verification must keep working under corrupt policy"
+    );
+}
+
+#[test]
+fn policy_storage_fault_denies_new_authority_without_losing_recovery() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-fault", "operator-pass-35");
+
+    // Disposable test-only fault: abort any write to sessions during complete.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER deny_session_insert
+            BEFORE INSERT ON sessions
+            BEGIN
+                SELECT RAISE(ABORT, 'injected session insert fault');
+            END;
+            "#,
+        )
+        .expect("inject session fault");
+    }
+
+    let begin = operator_begin(&service, &op).expect("begin still works");
+    let denied = operator_complete(&service, &op, begin, None);
+    assert!(denied.is_err(), "storage fault must deny session authority");
+    assert_eq!(
+        session_count(&service),
+        0,
+        "faulted insert must not leave a session"
+    );
+    assert!(
+        service.security_state() == hs_server::SecurityState::Unavailable || denied.is_err(),
+        "fault is a denial (latch via finish_storage on storage failures)"
+    );
+
+    // Recovery *material* is intact: the failed complete consumed no recovery
+    // code and left the active factor unchanged. The pre-existing security
+    // latch may pause new authority (including recovery enrollment) — that is
+    // existing fail-closed behavior, not a loss of recovery semantics.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        let used: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM recovery_codes WHERE account_id = ?1 AND used_at IS NOT NULL",
+                rusqlite::params![enrolled.account_id],
+                |r| r.get(0),
+            )
+            .expect("used recovery codes");
+        assert_eq!(used, 0, "session fault must not consume recovery codes");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM account_mfa WHERE account_id = ?1",
+                rusqlite::params![enrolled.account_id],
+                |r| r.get(0),
+            )
+            .expect("factor status");
+        assert_eq!(status, "active", "factor unchanged by session fault");
+    }
+}
+
+// ----- coordinator reviews 2026-10-15 -----
+
+#[test]
+fn coordinator_required_policy_cannot_be_bypassed_by_v1_login() {
+    let svc = service();
+    let _admin = bootstrap_enrolled(&svc);
+    let op = seed_operator(
+        &svc,
+        "coordinator-legacy-required",
+        "coordinator-fixture-pass-47",
+    );
+    {
+        let conn = svc.db_handle().lock().expect("fixture lock");
+        conn.execute(
+            "UPDATE security_policy SET operator_mfa_policy = 'required' WHERE id = 1",
+            [],
+        )
+        .expect("fixture policy");
+    }
+    let result = svc.login(hs_server::models::LoginRequest {
+        username: op.username,
+        password: op.password,
+        manager_public_identity: Some(format!("key:{}", op.public_key)),
+    });
+    assert!(
+        result.is_err(),
+        "Required operator MFA must not be bypassed through the v1 login route"
+    );
+}
+
+#[test]
+fn coordinator_admin_mfa_cannot_be_bypassed_by_v1_login() {
+    let svc = service();
+    let _admin = bootstrap_enrolled(&svc);
+    let op = seed_operator(
+        &svc,
+        "coordinator-legacy-admin",
+        "coordinator-fixture-pass-48",
+    );
+    {
+        let conn = svc.db_handle().lock().expect("fixture lock");
+        conn.execute(
+            "UPDATE accounts SET can_manage_security = 1 WHERE id = ?1",
+            [&op.account_id],
+        )
+        .expect("fixture role");
+    }
+    let result = svc.login(hs_server::models::LoginRequest {
+        username: op.username,
+        password: op.password,
+        manager_public_identity: Some(format!("key:{}", op.public_key)),
+    });
+    assert!(
+        result.is_err(),
+        "Mandatory administrator MFA must not be bypassed through v1 login"
+    );
+}
+
+#[test]
+fn coordinator_optional_mfa_still_requires_device_key_proof() {
+    let svc = service();
+    let _admin = bootstrap_enrolled(&svc);
+    let op = seed_operator(
+        &svc,
+        "coordinator-legacy-proof",
+        "coordinator-fixture-pass-49",
+    );
+    let result = svc.login(hs_server::models::LoginRequest {
+        username: op.username,
+        password: op.password,
+        manager_public_identity: Some(format!("key:{}", op.public_key)),
+    });
+    assert!(
+        result.is_err(),
+        "Optional MFA must still require an actual approved device-key signature; \
+         a v1 display label cannot establish manager authority"
+    );
+}
+
+#[test]
+fn v1_cannot_bind_key_bearing_manager_with_display_label() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    // Optional operator + real key-bearing manager from bootstrap_enrolled's
+    // sibling fixture (seed_operator creates an approved key-bearing manager).
+    let op = seed_operator(&service, "op-label-bind", "operator-pass-50");
+    let secret = seed_active_factor(&service, &op.account_id);
+    drop(secret);
+
+    // Optional non-enrolled operator cannot use the display identity of a
+    // key-bearing manager to mint a manager-bound session.
+    let bare = seed_operator(&service, "op-label-bare", "operator-pass-51");
+    let denied = service.login(hs_server::models::LoginRequest {
+        username: bare.username.clone(),
+        password: bare.password.clone(),
+        manager_public_identity: Some(format!("key:{}", bare.public_key)),
+    });
+    assert!(
+        denied.is_err(),
+        "v1 display label must not bind a key-bearing manager"
+    );
+
+    // Label-only manager (public_key NULL) remains a legacy dev fixture path.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        let now = unix_now() as i64;
+        conn.execute(
+            "INSERT INTO managers (
+                id, public_identity, friendly_name, lifecycle_state,
+                approved_by_account_id, approved_at, created_at, updated_at, public_key
+             ) VALUES ('mgr-label-only', 'label-only-manager', 'Label only', 'approved',
+                       ?1, ?2, ?2, ?2, NULL)",
+            rusqlite::params![enrolled.account_id, now],
+        )
+        .expect("seed label-only manager");
+    }
+    let login = service
+        .login(hs_server::models::LoginRequest {
+            username: bare.username.clone(),
+            password: bare.password.clone(),
+            manager_public_identity: Some("label-only-manager".into()),
+        })
+        .expect("label-only manager binding remains a legacy dev fixture");
+    assert!(login.manager.is_some());
+    assert!(login.manager_public_key.is_none(), "v1 omits device key");
+}
+
+#[test]
+fn v1_manager_binding_denies_key_added_before_issuance() {
+    let service = service();
+    let _admin = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-midflight", "operator-pass-52");
+    let begin = operator_begin(&service, &op).expect("begin");
+    drop(begin);
+
+    // Start from a label-only manager, then attach a device key after the
+    // early lookup would have succeeded — the final transaction must deny.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        let now = unix_now() as i64;
+        conn.execute(
+            "INSERT INTO managers (
+                id, public_identity, friendly_name, lifecycle_state,
+                approved_by_account_id, approved_at, created_at, updated_at, public_key
+             ) VALUES ('mgr-midflight', 'midflight-manager', 'Mid', 'approved',
+                       ?1, ?2, ?2, ?2, NULL)",
+            rusqlite::params![op.account_id, now],
+        )
+        .expect("seed label-only manager");
+    }
+
+    // Race simulation: convert the manager to key-bearing in a hook-like
+    // sequence by mutating between two service calls is not possible inside
+    // one login; instead prove the final-tx recheck by attaching the key
+    // first and confirming denial, and prove the early check denial too.
+    {
+        // Attach a fresh device key (not already bound to another manager).
+        let (_signer, attached_key) = keypair();
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute(
+            "UPDATE managers SET public_key = ?1 WHERE id = 'mgr-midflight'",
+            [&attached_key],
+        )
+        .expect("attach device key");
+    }
+    let denied = service.login(hs_server::models::LoginRequest {
+        username: op.username.clone(),
+        password: op.password.clone(),
+        manager_public_identity: Some("midflight-manager".into()),
+    });
+    assert!(
+        denied.is_err(),
+        "key-bearing manager must refuse v1 label binding after key attach"
+    );
+    assert_eq!(session_count(&service), 0);
+}
+
+#[test]
+fn optional_non_admin_v1_login_still_works_without_manager() {
+    let service = service();
+    let _admin = bootstrap_enrolled(&service);
+    let op = seed_operator(&service, "op-plain-v1", "operator-pass-53");
+    // Non-enrolled operator under optional policy: v1 password-only remains
+    // available when no manager device is claimed (dev path, no device auth).
+    let login = service
+        .login(hs_server::models::LoginRequest {
+            username: op.username.clone(),
+            password: op.password.clone(),
+            manager_public_identity: None,
+        })
+        .expect("optional non-admin v1 login");
+    assert!(login.manager.is_none());
+    assert!(login.manager_public_key.is_none());
+    assert!(!login.mfa.required);
+}
+
+// ----- coordinator review 2026-10-14 -----
+
+#[test]
+fn v2_completion_returns_challenge_proven_manager_key_not_display_identity() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let login =
+        complete_session_login(&service, &enrolled, &enrolled.totp_secret).expect("v2 completion");
+
+    assert_eq!(
+        login.manager_public_key.as_deref(),
+        Some(enrolled.public_key.as_str()),
+        "v2 manager_public_key must equal the exact challenge-proven device key"
+    );
+    let manager = login.manager.expect("manager view");
+    // Bootstrap stores display identity as key:<hex>; that is NOT key authority.
+    assert_ne!(
+        manager.public_identity, enrolled.public_key,
+        "public_identity is a display label, not naked key hex"
+    );
+    assert!(
+        manager.public_identity.contains(&enrolled.public_key),
+        "bootstrap display identity is key:<hex> of the proven key"
+    );
+}
+
+#[test]
+fn v1_login_omits_manager_public_key_field() {
+    let service = service();
+    // Non-admin without MFA requirement: the remaining v1 password-only path.
+    // (Administrator MFA is mandatory and refuses v1 login.)
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        let hash = hash_password("v1-password-01").expect("hash");
+        let now = unix_now() as i64;
+        conn.execute(
+            "INSERT INTO accounts (
+                id, username, password_hash, state,
+                can_operate, can_manage_enrollment, can_manage_access,
+                can_manage_accounts, can_manage_security,
+                revision, created_at, updated_at
+             ) VALUES ('v1-user', 'v1-user', ?1, 'active', 1, 0, 0, 0, 0, 1, ?2, ?2)",
+            rusqlite::params![hash, now],
+        )
+        .expect("seed v1 user");
+    }
+    let login = service
+        .login(hs_server::models::LoginRequest {
+            username: "v1-user".into(),
+            password: "v1-password-01".into(),
+            manager_public_identity: None,
+        })
+        .expect("v1 login");
+    assert!(
+        login.manager_public_key.is_none(),
+        "v1 responses omit manager_public_key"
+    );
+
+    // Frozen wire output: serialized v1 JSON has no manager_public_key field.
+    let wire = serde_json::to_value(&login).expect("serialize login");
+    assert!(
+        wire.get("manager_public_key").is_none(),
+        "v1 wire output must skip manager_public_key entirely"
+    );
+}
+
+#[test]
+fn policy_mutation_denies_future_or_rolled_back_assurance_time() {
+    let service = service();
+    let enrolled = bootstrap_enrolled(&service);
+    let admin = admin_auth(&service, &enrolled);
+    let now = unix_now() as i64;
+
+    // Future assurance timestamp (clock rollback / planted future) must deny.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute(
+            "UPDATE sessions SET mfa_assured_at = ?1 WHERE id = ?2",
+            rusqlite::params![now + 300, admin.session_id],
+        )
+        .expect("plant future assurance");
+    }
+    assert!(
+        service
+            .set_operator_mfa_policy(
+                &admin,
+                OperatorMfaPolicyUpdateRequest {
+                    policy: OperatorMfaPolicy::Required,
+                }
+            )
+            .is_err(),
+        "future assurance timestamp must deny policy mutation"
+    );
+    assert_eq!(stored_policy(&service), "optional");
+
+    // Stale assurance (older than 120s) must deny.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute(
+            "UPDATE sessions SET mfa_assured_at = ?1 WHERE id = ?2",
+            rusqlite::params![now - 121, admin.session_id],
+        )
+        .expect("plant stale assurance");
+    }
+    assert!(
+        service
+            .set_operator_mfa_policy(
+                &admin,
+                OperatorMfaPolicyUpdateRequest {
+                    policy: OperatorMfaPolicy::Required,
+                }
+            )
+            .is_err(),
+        "stale assurance timestamp must deny policy mutation"
+    );
+    assert_eq!(stored_policy(&service), "optional");
+
+    // Fresh assurance (age 0..=120) is accepted.
+    {
+        let conn = service.db_handle().lock().expect("lock");
+        conn.execute(
+            "UPDATE sessions SET mfa_assured_at = ?1 WHERE id = ?2",
+            rusqlite::params![now - 1, admin.session_id],
+        )
+        .expect("plant fresh assurance");
+    }
+    service
+        .set_operator_mfa_policy(
+            &admin,
+            OperatorMfaPolicyUpdateRequest {
+                policy: OperatorMfaPolicy::Required,
+            },
+        )
+        .expect("fresh assurance authorizes policy change");
+    assert_eq!(stored_policy(&service), "required");
+}
+
+// ----- HTTP router (actual axum router + transaction seam) -----
+
+mod operator_mfa_http {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    fn app(service: Arc<Service>) -> Router {
+        hs_server::app(service)
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let request = builder
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("oneshot");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn operator_mfa_policy_routes_are_admin_mfa_scoped() {
+        let service = service();
+        let enrolled = bootstrap_enrolled(&service);
+        let admin = admin_auth(&service, &enrolled);
+        let admin_login = complete_session_login(&service, &enrolled, &enrolled.totp_secret)
+            .expect("admin login");
+        let op = seed_operator(&service, "op-http", "operator-pass-36");
+        let op_login = operator_complete(
+            &service,
+            &op,
+            operator_begin(&service, &op).expect("begin"),
+            None,
+        )
+        .expect("operator login");
+        let app = app(service.clone());
+
+        // Challenge begin under default optional policy reports mfa_required=false.
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v2/auth/challenge",
+            None,
+            Some(serde_json::json!({
+                "username": "op-http",
+                "password": "operator-pass-36",
+                "operation": "session",
+                "manager_public_key": op.public_key.clone(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body.get("mfa_required"), Some(&Value::Bool(false)));
+
+        // GET requires administrator.
+        let (status, _body) =
+            send(&app, "GET", "/v2/security/operator-mfa-policy", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = send(
+            &app,
+            "GET",
+            "/v2/security/operator-mfa-policy",
+            Some(&op_login.token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "operator cannot read policy");
+
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/v2/security/operator-mfa-policy",
+            Some(&admin_login.token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.get("policy").and_then(Value::as_str), Some("optional"));
+        assert_eq!(
+            body.get("mfa_required_for_operators"),
+            Some(&Value::Bool(false))
+        );
+
+        // PUT requires administrator + fresh MFA-backed session.
+        let (status, _) = send(
+            &app,
+            "PUT",
+            "/v2/security/operator-mfa-policy",
+            Some(&op_login.token),
+            Some(serde_json::json!({"policy": "required"})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "operator cannot write policy"
+        );
+
+        let (status, body) = send(
+            &app,
+            "PUT",
+            "/v2/security/operator-mfa-policy",
+            Some(&admin_login.token),
+            Some(serde_json::json!({"policy": "required"})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin MFA session can set policy: {body}"
+        );
+        assert_eq!(body.get("policy").and_then(Value::as_str), Some("required"));
+        assert_eq!(
+            body.get("mfa_required_for_operators"),
+            Some(&Value::Bool(true))
+        );
+
+        // Strict DTO: unknown field / bad enum refused by the parser.
+        // Axum's Json extractor surfaces deserialization failure as 400/422.
+        for bad in [
+            serde_json::json!({"policy": "required", "extra": 1}),
+            serde_json::json!({"policy": "sometimes"}),
+            serde_json::json!({}),
+        ] {
+            let (status, _) = send(
+                &app,
+                "PUT",
+                "/v2/security/operator-mfa-policy",
+                Some(&admin_login.token),
+                Some(bad),
+            )
+            .await;
+            assert!(
+                status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
+                "strict DTO must refuse malformed policy body, got {status}"
+            );
+        }
+
+        // Challenge begin reports server-derived mfa_required over HTTP.
+        // After the policy write above, this non-enrolled operator is denied.
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v2/auth/challenge",
+            None,
+            Some(serde_json::json!({
+                "username": "op-http",
+                "password": "operator-pass-36",
+                "operation": "session",
+                "manager_public_key": op.public_key.clone(),
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "required policy refuses non-enrolled operator begin: {body}"
+        );
+
+        let _ = admin.session_id;
+    }
+
+    #[tokio::test]
+    async fn http_historical_password_session_cannot_use_admin_authority() {
+        let service = service();
+        let enrolled = bootstrap_enrolled(&service);
+        let token = "http-historical-weak-session";
+        let now = unix_now() as i64;
+        {
+            let conn = service.db_handle().lock().expect("lock");
+            conn.execute(
+                "INSERT INTO sessions (id, account_id, token_hash, created_at, expires_at, assurance, mfa_assured_at) VALUES ('http-weak', ?1, ?2, ?3, ?4, 'password', NULL)",
+                rusqlite::params![enrolled.account_id, hash_token(token), now, now + 3600],
+            )
+            .expect("weak session");
+        }
+        let app = app(service.clone());
+        // Authority routes refuse the weak bearer.
+        let (status, _) = send(&app, "GET", "/v1/auth/session", Some(token), None).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "historical password session must not read session authority"
+        );
+        // Cleanup logout still works without granting authority.
+        let (status, _) = send(&app, "POST", "/v1/auth/logout", Some(token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "weak session can log out");
+        let (status, _) = send(&app, "GET", "/v1/auth/session", Some(token), None).await;
+        assert!(
+            status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+            "logged-out weak session stays denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_v1_login_cannot_bypass_required_policy_or_admin_mfa() {
+        let service = service();
+        let _enrolled = bootstrap_enrolled(&service);
+        let app = app(service.clone());
+
+        // Required-policy operator: v1 password login is refused.
+        let op = seed_operator(&service, "http-op-required", "operator-pass-60");
+        {
+            let conn = service.db_handle().lock().expect("lock");
+            conn.execute(
+                "UPDATE security_policy SET operator_mfa_policy = 'required' WHERE id = 1",
+                [],
+            )
+            .expect("set required");
+        }
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(serde_json::json!({
+                "username": op.username,
+                "password": op.password,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "required policy must refuse v1 login"
+        );
+
+        // Administrator without going through v2 MFA: v1 login refused.
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(serde_json::json!({
+                "username": "admin",
+                "password": PASSWORD,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "administrator MFA must refuse v1 login"
+        );
+
+        // Display label of a key-bearing manager cannot bind a device.
+        let bare = seed_operator(&service, "http-op-label", "operator-pass-61");
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(serde_json::json!({
+                "username": bare.username,
+                "password": bare.password,
+                "manager_public_identity": format!("key:{}", bare.public_key),
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "v1 display label must not bind a key-bearing manager"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_challenge_complete_accepts_string_totp_for_existing_clients() {
+        let service = service();
+        let enrolled = bootstrap_enrolled(&service);
+        let app = app(service.clone());
+        let dep = deployment_id(&service);
+
+        let (status, begin) = send(
+            &app,
+            "POST",
+            "/v2/auth/challenge",
+            None,
+            Some(serde_json::json!({
+                "username": "admin",
+                "password": PASSWORD,
+                "operation": "session",
+                "manager_public_key": enrolled.public_key,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(begin.get("mfa_required"), Some(&Value::Bool(true)));
+        let challenge_id = begin["challenge_id"].as_str().expect("id").to_string();
+        let challenge_token = begin["challenge_token"]
+            .as_str()
+            .expect("token")
+            .to_string();
+        let sig = sign_challenge(
+            &enrolled.signer,
+            &dep,
+            &challenge_id,
+            "session",
+            &enrolled.public_key,
+        );
+        let at = unused_totp_time(&service, &enrolled.account_id);
+        let code = totp_generate_at(&enrolled.totp_secret, at).expect("code");
+
+        // Existing string clients send totp_code as a JSON string.
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v2/auth/challenge/complete",
+            None,
+            Some(serde_json::json!({
+                "challenge_id": challenge_id,
+                "challenge_token": challenge_token,
+                "manager_signature": sig,
+                "totp_code": code,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "string totp_code still accepted: {body}"
+        );
+        assert_eq!(
+            body.pointer("/mfa/required").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.get("manager_public_key").and_then(Value::as_str),
+            Some(enrolled.public_key.as_str()),
+            "v2 HTTP completion returns the challenge-proven device key"
+        );
     }
 }

@@ -12,6 +12,24 @@ use hs_server::{require_loopback_bind, AppError};
 
 const PASSWORD: &str = "foundation-pass-1";
 
+/// Seed a non-administrator (test-only). Administrator MFA is mandatory, so
+/// seams that need a successful password login use a non-admin account.
+fn seed_non_admin(service: &Service, username: &str, password: &str) {
+    let hash = hs_server::crypto::hash_password(password).expect("hash");
+    let now = hs_server::crypto::unix_now() as i64;
+    let conn = service.db_handle().lock().expect("store");
+    conn.execute(
+        "INSERT INTO accounts (
+            id, username, password_hash, state,
+            can_operate, can_manage_enrollment, can_manage_access,
+            can_manage_accounts, can_manage_security,
+            revision, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, 'active', 1, 0, 0, 0, 0, 1, ?4, ?4)",
+        rusqlite::params![format!("acct-{username}"), username, hash, now],
+    )
+    .expect("seed non-admin");
+}
+
 fn bootstrap_service(service: &Service) {
     let token = service.create_bootstrap_token().expect("bootstrap token");
     service
@@ -145,10 +163,11 @@ fn required_read_failure_latches_and_denies_without_deadlock() {
     let db = db::open_in_memory().expect("open");
     let service = std::sync::Arc::new(Service::new(db));
     bootstrap_service(&service);
+    seed_non_admin(&service, "latch-op", "latch-operator-pass-1");
     let login = service
         .login(LoginRequest {
-            username: "admin".into(),
-            password: PASSWORD.into(),
+            username: "latch-op".into(),
+            password: "latch-operator-pass-1".into(),
             manager_public_identity: None,
         })
         .expect("login");
@@ -520,14 +539,15 @@ fn throttle_prunes_expired_idle_entries() {
     let db = db::open_in_memory().expect("open");
     let service = Service::new(db);
     bootstrap_service(&service);
+    seed_non_admin(&service, "throttle-op", "throttle-operator-pass-1");
     let _ = service.login(LoginRequest {
-        username: "admin".into(),
+        username: "throttle-op".into(),
         password: "wrong-password-x".into(),
         manager_public_identity: None,
     });
     let ok = service.login(LoginRequest {
-        username: "admin".into(),
-        password: PASSWORD.into(),
+        username: "throttle-op".into(),
+        password: "throttle-operator-pass-1".into(),
         manager_public_identity: None,
     });
     assert!(ok.is_ok(), "success clears throttle for that key: {ok:?}");
@@ -749,7 +769,10 @@ fn legacy_loopback_init_and_bootstrap_still_work() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // check-login: credentials authenticate without starting HTTP.
+    // check-login for the v1 administrator is refused: mandatory
+    // administrator MFA blocks password-only session minting (explicit
+    // safety decision — not a legacy admin bypass). Init and bootstrap above
+    // remain successful on the legacy loopback development path.
     let mut login = std::process::Command::new(hs_server_bin())
         .arg("--data")
         .arg(&db_path)
@@ -772,7 +795,10 @@ fn legacy_loopback_init_and_bootstrap_still_work() {
             .expect("write password");
     }
     let out = login.wait_with_output().expect("wait");
-    assert!(out.status.success(), "legacy check-login");
+    assert!(
+        !out.status.success(),
+        "mandatory administrator MFA must refuse password-only CLI check-login"
+    );
 }
 
 /// Windows CLI bootstrap-v2 with an invalid token must refuse without

@@ -91,6 +91,13 @@ pub struct LoginResponse {
     pub account: AccountView,
     pub manager: Option<ManagerView>,
     pub mfa: MfaStatus,
+    /// v2 completion only: exact challenge-proven Ed25519 device key from the
+    /// final approved-key transaction. Never client-selected and never taken
+    /// from `manager.public_identity` (that is a display label, e.g.
+    /// `key:<hex>`). `#[serde(skip_serializing_if = "Option::is_none")]` keeps
+    /// frozen v1 wire output unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manager_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -274,16 +281,25 @@ pub struct AuthChallengeBeginResponse {
     /// Server-owned deployment identity. Included in the signed proof message.
     pub deployment_id: String,
     pub expires_at_unix: i64,
+    /// Server-derived effective MFA requirement for this account at begin.
+    /// Completion rechecks current policy, role, and factor state.
+    pub mfa_required: bool,
 }
 
-/// Complete a challenge with device proof + TOTP. Consumes the challenge.
+/// Complete a challenge with device proof + optional TOTP. Consumes the
+/// challenge. `totp_code` stays a JSON string for existing clients; it is
+/// omitted only for an optional non-enrolled operator.
 #[derive(Clone, Deserialize)]
 pub struct AuthChallengeCompleteRequest {
     pub challenge_id: String,
     pub challenge_token: String,
     /// Hex Ed25519 signature over the domain-separated challenge message.
     pub manager_signature: String,
-    pub totp_code: String,
+    /// Genuine TOTP factor. Required for administrators, `required` operator
+    /// policy, and any already-active enrolled factor. A malformed supplied
+    /// factor is refused — never silently ignored.
+    #[serde(default)]
+    pub totp_code: Option<String>,
 }
 
 /// Recovery-only factor re-enrollment. Never issues a session.
@@ -300,4 +316,44 @@ pub struct FactorRecoveryBeginResponse {
     pub totp_secret_base32: String,
     pub account_id: String,
     pub purpose: String,
+}
+
+// ----- operator MFA policy (contracts/http-v2.md) -----
+
+/// Deployment policy for non-administrator (operator) accounts.
+///
+/// New deployments default to `optional`. Administrator MFA stays mandatory
+/// regardless of this value. An already-active enrolled factor remains
+/// mandatory even under `optional`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorMfaPolicy {
+    Optional,
+    Required,
+}
+
+impl OperatorMfaPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OperatorMfaPolicy::Optional => "optional",
+            OperatorMfaPolicy::Required => "required",
+        }
+    }
+}
+
+/// `GET /v2/security/operator-mfa-policy`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorMfaPolicyResponse {
+    pub policy: OperatorMfaPolicy,
+    pub updated_at_unix: Option<i64>,
+    /// True when a non-enrolled operator cannot complete challenge login.
+    pub mfa_required_for_operators: bool,
+}
+
+/// `PUT /v2/security/operator-mfa-policy`. Strict bounded DTO: unknown
+/// fields and non-enum policy values are refused by the parser.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorMfaPolicyUpdateRequest {
+    pub policy: OperatorMfaPolicy,
 }

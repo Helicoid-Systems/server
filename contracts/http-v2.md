@@ -57,11 +57,15 @@ Never log `password`, `token`, `challenge_token`, `bootstrap_token`,
 
 ## Schema and migrations
 
-Schema version is **2**. `hs-server migrate` performs an explicit
-schema-versioned upgrade after a consistent pre-migration backup
-(`VACUUM INTO`, WAL checkpointed). **Startup never auto-migrates** a nonempty
-database: `hs-server open/serve/init` refuse an older schema and direct the
-operator to `migrate`. Fresh empty databases install v2 directly.
+Storage schema version is **3** (v2 wire contract unchanged). `hs-server migrate`
+performs an explicit schema-versioned upgrade after a consistent pre-migration
+backup (`VACUUM INTO`, WAL checkpointed). **Startup never auto-migrates** a
+nonempty database: `hs-server open/serve/init` refuse an older schema and
+direct the operator to `migrate`. Fresh empty databases install v3 directly.
+
+v3 adds deployment `security_policy` (operator MFA policy, default
+`optional`) and session `assurance` / `mfa_assured_at` (real stored
+assurance/time for policy mutation freshness).
 
 Accounts gain state `pending_mfa` (inactive until MFA confirmation **and**
 independently stored recovery material). Managers gain an optional Ed25519
@@ -206,13 +210,21 @@ Allowed `operation` values: `session`, `enroll_manager`, `manage_access`.
   "operation": "session",
   "manager_public_key": "<ed25519 hex>",
   "deployment_id": "<server-owned deployment key>",
-  "expires_at_unix": 1760000120
+  "expires_at_unix": 1760000120,
+  "mfa_required": true
 }
 ```
 
+`mfa_required` is **server-derived** effective mandatory MFA for this account
+at begin (administrator OR operator policy `required` OR an already-active
+enrolled factor). Completion rechecks current policy, role, account state and
+device approval — a challenge started under `optional` cannot finish
+factor-free after policy becomes `required`. Clients that treat a missing
+`mfa_required` as required are compatible; never treat absence as optional.
+
 Challenge lifetime: **120 seconds**. Pending/revoked managers, inactive
-accounts, and missing MFA deny. Username and challenge attempts are rate
-limited with the **same** error shape for unknown and known accounts (no
+accounts, and missing mandatory MFA deny. Username and challenge attempts are
+rate limited with the **same** error shape for unknown and known accounts (no
 enumeration).
 
 ---
@@ -238,6 +250,12 @@ hs-auth-v2|deployment:<deployment_id>|challenge:<challenge_id>|operation:<operat
 }
 ```
 
+`totp_code` is a JSON string for existing clients and is **optional** only for
+an optional non-enrolled operator (password + approved manager signature still
+required; no v1/legacy bypass). Required MFA, `required` policy, or any
+already-active enrolled factor still verifies and atomically consumes genuine
+TOTP. A malformed supplied factor is **refused**, never silently ignored.
+
 **200**
 
 ```json
@@ -246,9 +264,16 @@ hs-auth-v2|deployment:<deployment_id>|challenge:<challenge_id>|operation:<operat
   "expires_at_unix": 1760007200,
   "account": { "…": "AccountView" },
   "manager": { "…": "ManagerView" },
-  "mfa": { "required": true, "available": true, "reason": "totp_active" }
+  "mfa": { "required": true, "available": true, "reason": "totp_active" },
+  "manager_public_key": "<ed25519 hex 32 bytes>"
 }
 ```
+
+`manager_public_key` is **v2 completion only** and is sourced from the final
+IMMEDIATE transaction's approved device key — the exact challenge-proven
+Ed25519 key. It is never client-selected and never taken from
+`manager.public_identity` (bootstrap stores that display label as
+`key:<hex>`). **v1 responses omit this field entirely** (frozen wire).
 
 Token TTL: **2 hours** (short-lived by design).
 
@@ -258,9 +283,11 @@ Crypto verification runs first. Then **one final IMMEDIATE transaction**:
 
 1. Rechecks challenge binding (account, manager key, operation, deployment)
 2. Rechecks manager still `approved` and account still `active`
-3. Rechecks MFA still `active`
-4. Consumes the TOTP time step and the challenge
-5. Inserts the session
+3. Rechecks current operator policy, role and factor state (effective MFA)
+4. Verifies + consumes the TOTP time step when required, or accepts factor-free
+   completion only under optional policy with no active factor
+5. Consumes the challenge and inserts the session with real stored assurance
+   (`mfa` + `mfa_assured_at`, or `password`)
 
 No separate read/commit window can bypass revocation. Failure before commit
 rolls back everything and issues no token.
@@ -337,14 +364,89 @@ transaction (old-to-new replacement). **No session token** is issued.
 
 | Role | Policy |
 | --- | --- |
-| Administrator | **Mandatory MFA.** Challenge login requires active TOTP enrollment. v2 bootstrap creates `pending_mfa` until confirmation + independently stored recovery material. |
-| Configured operator policy (per-account MFA optional/required settings) | **Not implemented** in this foundation — explicitly unavailable. |
+| Administrator (`can_manage_security`) | **Mandatory MFA.** Challenge login requires active TOTP enrollment. v2 bootstrap creates `pending_mfa` until confirmation + independently stored recovery material. |
+| Operator (non-administrator) | Deployment policy `optional` (default) or `required`. Effective mandatory MFA = administrator OR policy `required` OR an already-active enrolled factor. Optional policy never removes factor protection from an account that already has an active factor. |
+
+Unknown/corrupt persisted policy and storage faults **deny authority**
+(fail closed). New deployments default operator policy to `optional`.
 
 MFA-enrolled accounts cannot use v1 password-only login. The final session
-transaction rechecks the database-owned MFA requirement before inserting a
-session. Legacy accounts without MFA still use explicitly loopback-only v1
-development login (`/v1/auth/login`); they do not establish production MFA
-policy or authorize public compatibility access.
+transaction rechecks the shared MFA requirement (administrator OR operator
+policy `required` OR any persisted MFA material) before inserting a session.
+**Required-policy operators and administrators without factors are refused v1
+password login** — mandatory administrator MFA and operator policy cannot be
+bypassed through the legacy route. Only non-administrator accounts with no MFA
+requirement retain explicitly loopback-only v1 development login
+(`/v1/auth/login`); they do not establish production MFA policy or authorize
+public compatibility access.
+
+### Manager device binding on v1
+
+A v1 `manager_public_identity` display label **never** establishes authority
+for an approved cryptographic device. Legacy login may bind only label-only
+managers (`managers.public_key IS NULL`) — genuine separate development
+fixtures. Key-bearing managers require an Ed25519 proof via v2 challenge
+completion. The final transaction rechecks this binding (a device key added
+between validation and issuance denies). v1 sessions are not device-proven.
+
+## `GET /v2/security/operator-mfa-policy`
+
+Bearer authentication. **Administrator only** (`can_manage_security`).
+
+**200**
+
+```json
+{
+  "policy": "optional",
+  "updated_at_unix": 1760000000,
+  "mfa_required_for_operators": false
+}
+```
+
+Operator, legacy, or recovery-only credentials cannot read or change the
+policy (`403`).
+
+---
+
+## `PUT /v2/security/operator-mfa-policy`
+
+Bearer authentication. Requires **all** of:
+
+1. Administrator (`can_manage_security`) and active account
+2. A fresh successful **MFA-backed v2 session** — real stored session
+   assurance `mfa` with `mfa_assured_at` age in `0..=120` seconds
+   (future timestamps / clock rollback deny)
+3. An approved manager device binding (still `approved` at mutation time)
+4. Trusted private persistence
+
+Missing assurance never authorizes change. Authenticate + policy mutation run
+in **one IMMEDIATE transaction**.
+
+Strict bounded DTO (`deny_unknown_fields`; policy is the enum
+`optional` | `required`):
+
+```json
+{ "policy": "required" }
+```
+
+**200** — same body as GET.
+
+Enabling `required` **invalidates factor-free operator sessions** (assurance
+≠ `mfa` on non-administrator accounts). Administrator MFA-backed sessions are
+not revoked by the policy change.
+
+| Condition | Result |
+| --- | --- |
+| Missing/invalid bearer | `401` |
+| Non-administrator | `403` |
+| Factor-free or legacy session | `403` |
+| Stale (`>120s`) or future assurance time | `403` |
+| Unapproved / missing manager device | `403` |
+| Unknown field / invalid policy value | `400`/`422` |
+| Corrupt or missing stored policy | `422` |
+| Storage fault | `503` (security state latch) |
+
+---
 
 ## Unchanged unavailable surfaces
 

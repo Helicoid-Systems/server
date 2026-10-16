@@ -1,3 +1,96 @@
+## Coordinator MFA candidate verification, 16 October 2026
+
+Coordinator independently reproduced all five authority regressions and the full
+308-test suite. `cargo fmt -- --check`,
+`cargo clippy --locked --all-targets -- -D warnings` and
+`cargo build --locked --release` all exited 0. Evidence:
+`/tmp/hs-finish-20261013/coordinator-authority-five-after.log`,
+`coordinator-server-assurance-full.log` and
+`coordinator-server-assurance-checks.json`.
+
+Implementation used `xiaomi-token-plan-ams/mimo-v2.6-pro`, variant `high`.
+Native Linux/Windows CI for this revision is pending. Public authority, installed
+services, delegation, media/control, authority recovery cutover and production
+signing remain unavailable or Not Verified. No production data or VM was changed.
+Earlier entries below retain their dated acceptance boundaries.
+
+## Persisted-session MFA assurance, 15 October 2026
+
+Coordinator follow-up `coordinator-server-session-assurance-review-20261015.md`.
+Independent regression `coordinator_historical_password_session_cannot_authorize_mfa_admin`
+now passes. Historical/schema-migrated `assurance=password` sessions (including
+administrators) can no longer hold authority when current mandatory MFA applies.
+
+`authenticate_token` rechecks current account role, operator policy and factor
+state against **real persisted session assurance** (`assurance='mfa'` and
+`mfa_assured_at` present). Password/legacy sessions are never treated as
+MFA-assured. Covers administrator tokens, role promotion to administrator, and
+required-policy activation. Cleanup-only `logout_token` / `POST /v1/auth/logout`
+still revokes weaker sessions without granting authority.
+
+New regressions at service and actual router seams; admin test contexts use
+genuine MFA-backed session records. Full suite 308 passed; fmt, strict Clippy,
+build clean. **Not Verified:** native Windows/Linux CI, installed/public
+authority. No commit/push/deploy.
+
+## Coordinator legacy + device-proof acceptance fixes, 15 October 2026
+
+Acceptance findings from `coordinator-server-legacy-review-20261015.md` and
+`coordinator-server-device-proof-review-20261015.md` applied on top of the
+operator-MFA candidate (baseline `51c005ea…`, no commits/push).
+
+1. **Shared MFA gate.** `account_has_mfa_requirement` now uses the same
+   effective decision as v2 (administrator OR operator policy `required` OR
+   any persisted MFA material), so required-policy operators and factor-less
+   administrators cannot mint sessions through v1 password login. Missing or
+   corrupt policy fails closed. Coordinator repro tests are preserved verbatim.
+2. **Device-proof binding.** v1 `manager_public_identity` may bind only
+   label-only managers (`public_key IS NULL`). Key-bearing managers require a
+   v2 Ed25519 challenge proof. The final IMMEDIATE transaction rechecks the
+   binding so a key attached mid-flight denies. v1 responses are not labeled
+   device-proven.
+
+Tests that previously demanded a real v1 administrator login now seed
+historical fixture sessions (or exercise non-admin label-only manager
+binding) rather than requiring a legacy admin bypass. CLI `check-login` for a
+v1 administrator is an explicit safety denial. Regressions run at the service
+login seam and the actual axum router.
+
+**Not Verified:** native Windows/Linux CI, installed services, public
+authentication/routing, recovery cutover, signing/release.
+
+## Configurable operator MFA + v2 completion key binding, 14 October 2026
+
+Bounded package at baseline `51c005ea2aba8cf0a35787f519159fdb55100e61`.
+Owned writes: `src/models.rs`, `src/db.rs`, `src/auth_v2.rs`, `src/service.rs`,
+`src/http.rs`, `tests/auth_v2.rs`, `contracts/http-v2.md`, `README.md`, this
+file, and `/tmp/hs-finish-20261013/**`. No commits/push. No media/relay/carrier/
+installer/delegation/public-listener work. Capability/health wire schema stays 1;
+production observation/control flags remain false.
+
+Operator MFA is now configurable, **optional by default**, while administrator
+MFA and approved-manager Ed25519 proof stay mandatory. Effective mandatory MFA
+= administrator (`can_manage_security`) OR deployment operator policy
+`required` OR an already-active enrolled factor. Schema 3 (explicit
+`hs-server migrate` only; startup never auto-migrates nonempty stores) adds
+`security_policy` and session `assurance`/`mfa_assured_at`.
+
+Wire: v2 challenge-begin returns server-derived `mfa_required`;
+challenge-complete `totp_code` is optional (string clients unchanged) with
+malformed supplied factors refused; v2 completion returns top-level
+`manager_public_key` from the final transaction's approved device key
+(v1 omits the field). `GET`/`PUT /v2/security/operator-mfa-policy` require
+administrator; PUT additionally requires a fresh MFA-backed session
+(assurance age in 0..=120s — future/rollback denied), approved manager and
+trusted private persistence. Enabling `required` invalidates factor-free
+operator sessions.
+
+Coordinator review 2026-10-14 findings applied: v2 completion-only
+`manager_public_key` binding (not `public_identity`); checked assurance-age
+submutation denies future/rollback timestamps; corrupt policy values are no
+longer logged. **Not Verified:** native Windows/Linux CI, installed services,
+public authentication/routing, recovery cutover, signing/release.
+
 # BUILD-REPORT — Helicoid `hs-server` auth v2 prerequisite
 
 ## Native MFA factor recovery acceptance, 13 October 2026

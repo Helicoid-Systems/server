@@ -63,10 +63,13 @@ async fn send(
     (status, value)
 }
 
-/// Bootstrap the first administrator (single-use) and return an authenticated context.
+/// Bootstrap the first administrator (single-use) and return an authenticated
+/// context via a historical fixture session. Administrator MFA is mandatory, so
+/// a real v1 password login is refused; these tests need a session row, not a
+/// legacy administrator bypass.
 fn bootstrap_admin(service: &Service) -> hs_server::service::AuthContext {
     let token = service.create_bootstrap_token().expect("bootstrap token");
-    service
+    let created = service
         .bootstrap(BootstrapRequest {
             bootstrap_token: token,
             username: "admin".into(),
@@ -75,14 +78,60 @@ fn bootstrap_admin(service: &Service) -> hs_server::service::AuthContext {
             manager_friendly_name: Some("Admin manager".into()),
         })
         .expect("bootstrap");
-    let login = service
-        .login(LoginRequest {
-            username: "admin".into(),
-            password: PASSWORD.into(),
-            manager_public_identity: None,
-        })
-        .expect("login");
-    service.authenticate_token(&login.token).expect("auth")
+    seed_fixture_session(service, &created.account.id, None)
+}
+
+/// Seed a non-administrator with a known password (test-only). Used where the
+/// seam under test is manager binding on v1 login — administrator MFA is
+/// mandatory and cannot be exercised through password-only login.
+fn seed_non_admin(service: &Service, username: &str, password: &str) {
+    let hash = hs_server::crypto::hash_password(password).expect("hash");
+    let now = hs_server::crypto::unix_now() as i64;
+    let conn = service.db_handle().lock().expect("store");
+    conn.execute(
+        "INSERT INTO accounts (
+            id, username, password_hash, state,
+            can_operate, can_manage_enrollment, can_manage_access,
+            can_manage_accounts, can_manage_security,
+            revision, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, 'active', 1, 0, 0, 0, 0, 1, ?4, ?4)",
+        rusqlite::params![format!("acct-{username}"), username, hash, now],
+    )
+    .expect("seed non-admin");
+}
+
+/// Insert a historical session fixture (test-only). Never a production path.
+fn seed_fixture_session(
+    service: &Service,
+    account_id: &str,
+    manager_id: Option<&str>,
+) -> hs_server::service::AuthContext {
+    let session_id = format!("sess-{account_id}");
+    let token = format!("fixture-token-{account_id}");
+    let token_hash = hs_server::crypto::hash_token(&token);
+    let now = hs_server::crypto::unix_now() as i64;
+    {
+        let conn = service.db_handle().lock().expect("store");
+        // Historical MFA-assured session row (test-only). Administrator MFA is
+        // mandatory at the authority-use boundary; these tests need a genuine
+        // MFA-backed session record, not a legacy password bypass.
+        conn.execute(
+            "INSERT INTO sessions (
+                id, account_id, manager_id, token_hash, created_at, expires_at,
+                assurance, mfa_assured_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'mfa', ?5)",
+            rusqlite::params![
+                session_id,
+                account_id,
+                manager_id,
+                token_hash,
+                now,
+                now + 3600
+            ],
+        )
+        .expect("seed fixture session");
+    }
+    service.authenticate_token(&token).expect("fixture auth")
 }
 
 /// Tempdir whose `base` is store-parent ready: Unix owner-private (0700);
@@ -210,9 +259,11 @@ async fn pending_manager_cannot_login_until_approved() {
     assert_eq!(pending.lifecycle_state, "pending");
 
     // Login with pending manager is denied (D20: deny before approval).
+    // Seam is v1 manager binding on a non-admin (administrator MFA is mandatory).
+    seed_non_admin(&service, "mgr-operator", "operator-password-1");
     let denied = service.login(LoginRequest {
-        username: "admin".into(),
-        password: PASSWORD.into(),
+        username: "mgr-operator".into(),
+        password: "operator-password-1".into(),
         manager_public_identity: Some("pending-manager".into()),
     });
     assert!(
@@ -226,11 +277,11 @@ async fn pending_manager_cannot_login_until_approved() {
         .expect("approve");
     assert_eq!(approved.lifecycle_state, "approved");
 
-    // Now login with the approved manager succeeds.
+    // Now login with the approved label-only manager succeeds.
     let login = service
         .login(LoginRequest {
-            username: "admin".into(),
-            password: PASSWORD.into(),
+            username: "mgr-operator".into(),
+            password: "operator-password-1".into(),
             manager_public_identity: Some("pending-manager".into()),
         })
         .expect("login after approve");
@@ -333,10 +384,11 @@ async fn competing_unique_claims_conflict() {
 async fn revoked_manager_session_is_invalid() {
     let service = service();
     let admin = bootstrap_admin(&service);
+    seed_non_admin(&service, "revoked-op", "operator-password-2");
     let login = service
         .login(LoginRequest {
-            username: "admin".into(),
-            password: PASSWORD.into(),
+            username: "revoked-op".into(),
+            password: "operator-password-2".into(),
             manager_public_identity: Some("admin-manager".into()),
         })
         .expect("login with manager");
