@@ -27,7 +27,7 @@ use crate::error::{AppError, AppResult};
 use crate::private_file::{self, StorePathPresence};
 
 /// Schema version installed by this build. Refuses to open a newer schema.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Capability of the opened store for NEW persisted v2 MFA credentials.
 ///
@@ -348,6 +348,11 @@ fn install_schema(conn: &Connection) -> AppResult<()> {
          ) VALUES (1, 0, 1, ?1, ?2)",
         params![now_unix(), new_deployment_key()],
     )?;
+    tx.execute(
+        "INSERT INTO security_policy (id, operator_mfa_policy, updated_at)
+         VALUES (1, 'optional', ?1)",
+        params![now_unix()],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -538,11 +543,43 @@ fn apply_migrations(conn: &Connection, from: i64) -> AppResult<()> {
             params![key],
         )?;
     }
+    if from < 3 {
+        migrate_v2_to_v3(&tx)?;
+    }
     tx.execute(
         "UPDATE schema_meta SET schema_version = ?1 WHERE id = 1",
         params![SCHEMA_VERSION],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+/// v2 → v3: deployment operator MFA policy + stored session assurance.
+///
+/// New deployments default operator policy to `optional`. Existing sessions
+/// minted before this migration carry assurance `password` (factor-free) so
+/// they cannot authorize a policy change until an MFA-backed login.
+fn migrate_v2_to_v3(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE security_policy (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            operator_mfa_policy TEXT NOT NULL
+                CHECK (operator_mfa_policy IN ('optional', 'required')),
+            updated_at INTEGER NOT NULL
+        );
+        "#,
+    )?;
+    conn.execute(
+        "INSERT INTO security_policy (id, operator_mfa_policy, updated_at)
+         VALUES (1, 'optional', ?1)",
+        params![now_unix()],
+    )?;
+    conn.execute(
+        "ALTER TABLE sessions ADD COLUMN assurance TEXT NOT NULL DEFAULT 'password'",
+        [],
+    )?;
+    conn.execute("ALTER TABLE sessions ADD COLUMN mfa_assured_at INTEGER", [])?;
     Ok(())
 }
 
@@ -723,7 +760,9 @@ CREATE TABLE sessions (
     token_hash TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
-    revoked_at INTEGER
+    revoked_at INTEGER,
+    assurance TEXT NOT NULL DEFAULT 'password',
+    mfa_assured_at INTEGER
 );
 
 CREATE UNIQUE INDEX sessions_token_hash_unique ON sessions (token_hash);
@@ -827,6 +866,13 @@ CREATE TABLE challenge_throttle (
     throttle_key TEXT PRIMARY KEY,
     failure_count INTEGER NOT NULL DEFAULT 0,
     locked_until INTEGER,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE security_policy (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    operator_mfa_policy TEXT NOT NULL
+        CHECK (operator_mfa_policy IN ('optional', 'required')),
     updated_at INTEGER NOT NULL
 );
 "#;

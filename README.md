@@ -1,5 +1,14 @@
 # Helicoid Systems — coordination server foundation
 
+The operator-MFA candidate now passes **308 coordinator tests**, formatting,
+strict Clippy and the release build on macOS. Independent regressions confirm
+that future MFA assurance, legacy login and historical password-only sessions
+cannot bypass mandatory MFA or approved manager-key proof. Operator MFA is
+optional by default; administrator and already-enrolled factors remain mandatory.
+Schema 3 requires an explicit migration; no production database was migrated.
+Linux/Windows CI and installed/public acceptance remain pending for this revision.
+The 14 October billing interruption and earlier failed candidates are historical.
+
 `hs-server` is an independently buildable Rust service owned by `modules/server`.
 It provides the first durable slice of the Helicoid Systems coordination plane:
 local accounts, single-use bootstrap, manager enrollment distinct from operator
@@ -28,12 +37,12 @@ Existing SQLite store files accept only currentUser/SYSTEM/Administrators owners
 | D20 deny-before-approval | Implemented (pending manager cannot bind/login) |
 | Per-computer access scopes | Implemented (explicit IDs or scope-all) |
 | Bounded inventory reads | Implemented (hard cap 100) |
-| Schema init / migration | Storage schema 2; explicit init or migration with consistent backup; never migrates on open |
+| Schema init / migration | Storage schema 3; explicit init or migration with consistent backup; never migrates on open |
 | Security State Unavailable | Durable latch; restart never resets it; no auto-recovery |
 | Required read/commit failures | Latch + `503 security_state_unavailable` (not bare 500) |
-| v2 administrator MFA | TOTP enrollment, Ed25519 device proof and atomic challenge completion implemented for loopback development. Native private-store tests pass on Unix and Windows; public authentication remains gated |
+| v2 administrator MFA | TOTP enrollment, Ed25519 device proof and atomic challenge completion implemented for loopback development. Operator MFA is configurable (optional default). v2 completion returns challenge-proven `manager_public_key`. Native private-store tests pass on Unix and Windows; public authentication remains gated |
 | v2 recovery credentials | Bounded, single-use factor recovery only; cannot issue normal sessions. Cancel of a pending recovery never deactivates an established active factor; confirmation installs the verified replacement secret |
-| Configurable operator MFA / scoped delegation | Unavailable; production policy still gated |
+| Configurable operator MFA | **Implemented for loopback development**: deployment policy `optional` (default) / `required`; administrator MFA stays mandatory; active factors stay mandatory under `optional`. Scoped delegation remains unavailable |
 | File jobs / authority recovery and cutover | Explicitly unavailable (`501`) |
 | Remote control / screen observation | Not present (B02/B03/RD03 proofs pending) |
 | Bind policy | **Literal loopback only** (`127.0.0.1` / `::1`); other binds refused |
@@ -49,9 +58,14 @@ They are development fixtures for local/loopback integration until B03 freezes
 signed endpoint/manager identity formats. Do not invent grant formats.
 
 MFA-enrolled accounts refuse legacy password-only login through the service,
-HTTP route and CLI. The final session transaction rechecks MFA state, account
-state, the verified password hash and manager approval. Legacy accounts without
-MFA remain an explicitly loopback-only development path. The Windows private store requires a protected current-user product directory, trusted child inheritance and verified trusted SQLite file ownership before explicit migration;
+HTTP route and CLI. The final session transaction rechecks the shared MFA
+requirement (administrator OR operator policy `required` OR any persisted MFA
+material), account state, the verified password hash and manager approval —
+so required-policy operators and administrators cannot bypass MFA via v1.
+Legacy login remains an explicitly loopback-only development path for
+non-administrator accounts without an MFA requirement. A v1 display label
+never binds a key-bearing manager; cryptographic device binding requires a
+v2 Ed25519 challenge proof. The Windows private store requires a protected current-user product directory, trusted child inheritance and verified trusted SQLite file ownership before explicit migration;
 native refusal tests retain both the original database bytes and no-output checks.
 
 The [v2 development contract](contracts/http-v2.md) describes deployment-bound
@@ -59,7 +73,7 @@ Ed25519 challenges, administrator enrollment, transaction boundaries and recover
 limits. Literal-loopback HTTPS transport is implemented on Unix and Windows as a
 loopback prerequisite. Production trust adoption, public authentication and
 public routes remain unavailable.
-The v1 HTTP wire contract remains version1; health separately reports storage schema2. Earlier TLS acceptance at `1d99669` passed **242 Mac,235 Linux and243 Windows tests** in CI38259032769 and coordinator checks. That result, and the `f01019f`/`ccaf29a` artifacts which refused Windows TLS, are historical evidence. Current complete acceptance is recorded above and in BUILD-REPORT.md.
+The v1 HTTP wire contract remains version1; health separately reports storage schema3. Earlier TLS acceptance at `1d99669` passed **242 Mac,235 Linux and243 Windows tests** in CI38259032769 and coordinator checks. That result, and the `f01019f`/`ccaf29a` artifacts which refused Windows TLS, are historical evidence. Current complete acceptance is recorded above and in BUILD-REPORT.md.
 
 Platform-split of `tests/installer_adapter.rs` (29 total): **19 portable**
 (listener/parser/systemctl decode, read bounds, injected query faults) run on

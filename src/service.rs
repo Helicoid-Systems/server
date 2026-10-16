@@ -26,8 +26,18 @@ const LOGIN_THROTTLE_MAX_KEYS: usize = 1024;
 /// Prune throttle entries idle longer than this when pruning.
 const LOGIN_THROTTLE_IDLE_SECS: i64 = 15 * 60;
 
-/// Session row: id, account_id, token_hash, manager_id, expires_at, revoked_at
-type SessionRow = (String, String, String, Option<String>, i64, Option<i64>);
+/// Session row for authority checks: id, account_id, token_hash, manager_id,
+/// expires_at, revoked_at, assurance, mfa_assured_at.
+type AuthoritySessionRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<i64>,
+    String,
+    Option<i64>,
+);
 /// Account auth row: id, password_hash, state
 type AccountAuthRow = (String, String, String);
 
@@ -492,19 +502,31 @@ impl Service {
         }
 
         // Manager binding is a separate approval check (D20).
+        //
+        // A v1 display label never establishes authority for an approved
+        // cryptographic device: key-bearing managers (non-null `public_key`)
+        // require an Ed25519 proof via v2 challenge completion. Label-only
+        // legacy dev fixtures (`public_key IS NULL`) remain bindable here.
         let manager_id = if let Some(public_identity) = &req.manager_public_identity {
             let row = self.with_conn(|conn| {
-                let row: Option<(String, String)> = conn
+                let row: Option<(String, String, Option<String>)> = conn
                     .query_row(
-                        "SELECT id, lifecycle_state FROM managers WHERE public_identity = ?1",
+                        "SELECT id, lifecycle_state, public_key FROM managers WHERE public_identity = ?1",
                         params![public_identity],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()?;
                 Ok(row)
             })?;
             match row {
-                Some((id, lifecycle)) if lifecycle == "approved" => Some(id),
+                Some((id, lifecycle, public_key)) if lifecycle == "approved" => {
+                    if public_key.is_some() {
+                        return Err(AppError::forbidden(
+                            "manager device key requires a signed proof; display identity cannot bind a cryptographic device",
+                        ));
+                    }
+                    Some(id)
+                }
                 Some(_) => {
                     return Err(AppError::forbidden(
                         "manager identity is not approved for this deployment",
@@ -549,15 +571,23 @@ impl Service {
                 return Err(AppError::unauthorized("invalid credentials"));
             }
             if let Some(manager_id) = &manager_id {
-                let lifecycle: Option<String> = conn
+                let manager: Option<(String, Option<String>)> = conn
                     .query_row(
-                        "SELECT lifecycle_state FROM managers WHERE id = ?1",
+                        "SELECT lifecycle_state, public_key FROM managers WHERE id = ?1",
                         params![manager_id],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
-                match lifecycle {
-                    Some(ref state) if state == "approved" => {}
+                match manager {
+                    Some((ref state, public_key)) if state == "approved" => {
+                        // Recheck device-binding provenance: a key added
+                        // between validation and issuance must deny.
+                        if public_key.is_some() {
+                            return Err(AppError::forbidden(
+                                "manager device key requires a signed proof; display identity cannot bind a cryptographic device",
+                            ));
+                        }
+                    }
                     _ => {
                         return Err(AppError::forbidden(
                             "manager identity is not approved for this deployment",
@@ -570,8 +600,9 @@ impl Service {
             }
             conn.execute(
                 "INSERT INTO sessions (
-                    id, account_id, manager_id, token_hash, created_at, expires_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    id, account_id, manager_id, token_hash, created_at, expires_at,
+                    assurance, mfa_assured_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'password', NULL)",
                 params![session_id, account_id, manager_id, token_hash, now, expires_at],
             )?;
             Ok(())
@@ -596,6 +627,8 @@ impl Service {
             account,
             manager,
             mfa: MfaStatus::unavailable(),
+            // v1 responses omit manager_public_key (frozen wire output).
+            manager_public_key: None,
         })
     }
 
@@ -612,6 +645,39 @@ impl Service {
         Ok(())
     }
 
+    /// Cleanup-only logout: revoke the session that owns this bearer token.
+    ///
+    /// Does **not** grant authority. Used so weaker historical sessions can be
+    /// dismissed even when current mandatory MFA refuses `authenticate_token`.
+    /// Still requires a live (unrevoked, unexpired) session match — never a
+    /// new identity.
+    pub fn logout_token(&self, token: &str) -> AppResult<()> {
+        self.require_security_ok()?;
+        if token.trim().is_empty() {
+            return Err(AppError::unauthorized("missing bearer token"));
+        }
+        let token_hash = hash_token(token);
+        let now = now_unix();
+        self.with_tx(|conn| {
+            let session_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM sessions
+                     WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2",
+                    params![token_hash, now],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(session_id) = session_id else {
+                return Err(AppError::unauthorized("invalid session"));
+            };
+            conn.execute(
+                "UPDATE sessions SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+                params![now, session_id],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn authenticate_token(&self, token: &str) -> AppResult<AuthContext> {
         self.require_security_ok()?;
         if token.trim().is_empty() {
@@ -621,30 +687,42 @@ impl Service {
         let now = now_unix();
 
         self.with_conn(|conn| {
-            let row: Option<SessionRow> = conn
-                .query_row(
-                    "SELECT s.id, s.account_id, s.token_hash, s.manager_id, s.expires_at, s.revoked_at
-                     FROM sessions s
-                     WHERE s.token_hash = ?1",
-                    params![token_hash],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                        ))
-                    },
-                )
-                .optional()?;
+            let row: Option<AuthoritySessionRow> =
+                conn
+                    .query_row(
+                        "SELECT s.id, s.account_id, s.token_hash, s.manager_id, s.expires_at, s.revoked_at,
+                                s.assurance, s.mfa_assured_at
+                         FROM sessions s
+                         WHERE s.token_hash = ?1",
+                        params![token_hash],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
 
-            let (session_id, account_id, stored_hash, manager_id, expires_at, revoked_at) =
-                match row {
-                    Some(row) => row,
-                    None => return Err(AppError::unauthorized("invalid session")),
-                };
+            let (
+                session_id,
+                account_id,
+                stored_hash,
+                manager_id,
+                expires_at,
+                revoked_at,
+                assurance,
+                mfa_assured_at,
+            ) = match row {
+                Some(row) => row,
+                None => return Err(AppError::unauthorized("invalid session")),
+            };
 
             if !token_hash_eq(&token_hash, &stored_hash) {
                 return Err(AppError::unauthorized("invalid session"));
@@ -701,6 +779,19 @@ impl Service {
                         "bound manager identity is no longer approved",
                     ));
                 }
+            }
+
+            // Authority-use boundary: current mandatory MFA cannot be bypassed
+            // by a persisted weaker session (historical/schema-migrated
+            // password rows, role promotion, or policy activation). Real
+            // stored assurance is required — never client flags or MFA status
+            // alone. Password/legacy sessions are never MFA-assured.
+            if account_has_mfa_requirement(conn, &account_id)?
+                && (assurance != "mfa" || mfa_assured_at.is_none())
+            {
+                return Err(AppError::forbidden(
+                    "multi-factor authentication is required; password-only session authority is refused",
+                ));
             }
 
             Ok(AuthContext {
@@ -1362,12 +1453,25 @@ pub(crate) fn validate_password(password: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Database-owned MFA requirement for legacy password-only session minting.
+/// Database-owned MFA requirement for any session mint without a genuine factor.
 ///
-/// True when the account has any persisted MFA factor (`account_mfa`, pending
-/// or active) or an unconsumed MFA enrollment. Callers must refuse v1
-/// password-only login; this is never a client flag.
+/// True when effective mandatory MFA applies (administrator OR operator policy
+/// `required` OR an already-active enrolled factor) **or** the account still
+/// carries pending MFA material (factor row or unconsumed enrollment). This is
+/// the shared decision for every session-issuance entry path (v1 password login
+/// and v2 challenge completion). Unknown/corrupt policy fails closed via
+/// `load_operator_mfa_policy`. Never a client flag.
 fn account_has_mfa_requirement(conn: &Connection, account_id: &str) -> AppResult<bool> {
+    // Fail closed on unknown/corrupt/missing policy.
+    let policy = crate::auth_v2::load_operator_mfa_policy(conn)?;
+    let is_admin: bool = conn.query_row(
+        "SELECT can_manage_security FROM accounts WHERE id = ?1",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    if is_admin || policy == crate::models::OperatorMfaPolicy::Required {
+        return Ok(true);
+    }
     let present: i64 = conn.query_row(
         "SELECT EXISTS (
             SELECT 1 FROM account_mfa WHERE account_id = ?1

@@ -38,6 +38,10 @@ pub fn router(service: SharedService) -> Router {
         .route("/v2/auth/challenge/complete", post(auth_challenge_complete))
         .route("/v2/auth/recovery/begin", post(factor_recovery_begin))
         .route("/v2/auth/recovery/complete", post(factor_recovery_complete))
+        .route(
+            "/v2/security/operator-mfa-policy",
+            get(get_operator_mfa_policy).put(put_operator_mfa_policy),
+        )
         .with_state(service)
 }
 
@@ -61,8 +65,11 @@ async fn login(
 }
 
 async fn logout(State(service): State<SharedService>, headers: HeaderMap) -> AppResult<StatusCode> {
-    let auth = authenticate(&service, &headers)?;
-    service.logout(&auth)?;
+    // Cleanup-only: revoke this bearer's session without minting authority.
+    // Weaker historical sessions must still be dismissable when mandatory
+    // MFA refuses authenticate_token.
+    let token = bearer_token(&headers)?;
+    service.logout_token(&token)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -245,6 +252,23 @@ async fn factor_recovery_complete(
     Json(req): Json<MfaConfirmRequest>,
 ) -> AppResult<Json<MfaConfirmResponse>> {
     Ok(Json(service.complete_factor_recovery(req)?))
+}
+
+async fn get_operator_mfa_policy(
+    State(service): State<SharedService>,
+    headers: HeaderMap,
+) -> AppResult<Json<OperatorMfaPolicyResponse>> {
+    let auth = authenticate(&service, &headers)?;
+    Ok(Json(service.get_operator_mfa_policy(&auth)?))
+}
+
+async fn put_operator_mfa_policy(
+    State(service): State<SharedService>,
+    headers: HeaderMap,
+    Json(req): Json<OperatorMfaPolicyUpdateRequest>,
+) -> AppResult<Json<OperatorMfaPolicyResponse>> {
+    let auth = authenticate(&service, &headers)?;
+    Ok(Json(service.set_operator_mfa_policy(&auth, req)?))
 }
 
 #[derive(Serialize)]

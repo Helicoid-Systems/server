@@ -26,7 +26,7 @@ use crate::crypto::{
 use crate::db::{deployment_key, now_unix};
 use crate::error::{AppError, AppResult};
 use crate::models::*;
-use crate::service::Service;
+use crate::service::{AuthContext, Service};
 
 /// Auth challenge lifetime (bounded durable one-use).
 const CHALLENGE_TTL_SECS: i64 = 120;
@@ -42,6 +42,17 @@ const CHALLENGE_LOCKOUT_SECS: i64 = 60;
 const TOTP_MAX_BACKWARD_STEPS: i64 = 1;
 /// Intended operations a challenge may bind to.
 const ALLOWED_OPERATIONS: &[&str] = &["session", "enroll_manager", "manage_access"];
+
+/// Session row for policy mutation recheck:
+/// assurance, mfa_assured_at, expires_at, revoked_at, manager_id, account_id.
+type PolicySessionRow = (
+    String,
+    Option<i64>,
+    i64,
+    Option<i64>,
+    Option<String>,
+    String,
+);
 
 /// Challenge row: id, token_hash, account_id, manager_public_key, operation,
 /// expires_at, consumed_at, deployment_key.
@@ -77,6 +88,69 @@ fn validate_totp_code(code: &str) -> AppResult<()> {
         return Err(AppError::bad_request("totp code must be exactly 6 digits"));
     }
     Ok(())
+}
+
+/// Freshness window for an MFA-backed session that may mutate operator MFA policy.
+const POLICY_MUTATION_MFA_FRESH_SECS: i64 = 120;
+
+/// Load the deployment operator MFA policy.
+///
+/// Unknown or corrupt stored values deny authority (`unprocessable`) rather
+/// than silently defaulting. Missing `security_policy` is equally fatal.
+pub(crate) fn load_operator_mfa_policy(
+    conn: &rusqlite::Connection,
+) -> AppResult<OperatorMfaPolicy> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT operator_mfa_policy FROM security_policy WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match raw.as_deref() {
+        Some("optional") => Ok(OperatorMfaPolicy::Optional),
+        Some("required") => Ok(OperatorMfaPolicy::Required),
+        Some(_) => {
+            // Never log the raw stored value — only safe failure metadata.
+            tracing::error!("corrupt operator_mfa_policy; denying authority");
+            Err(AppError::unprocessable(
+                "operator mfa policy is corrupt; denying authority until repaired",
+            ))
+        }
+        None => {
+            tracing::error!("security_policy row missing; denying authority");
+            Err(AppError::unprocessable(
+                "operator mfa policy is missing; denying authority",
+            ))
+        }
+    }
+}
+
+/// Effective mandatory MFA for one account.
+///
+/// Administrator (`can_manage_security`) OR operator policy `required` OR an
+/// already-active enrolled factor. An `optional` policy never removes factor
+/// protection from an account that already has an active factor.
+fn effective_mfa_required(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> AppResult<(bool, bool)> {
+    let policy = load_operator_mfa_policy(conn)?;
+    let is_admin: bool = conn.query_row(
+        "SELECT can_manage_security FROM accounts WHERE id = ?1",
+        params![account_id],
+        |r| r.get(0),
+    )?;
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM account_mfa WHERE account_id = ?1",
+            params![account_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let has_active_factor = status.as_deref() == Some("active");
+    let required = is_admin || policy == OperatorMfaPolicy::Required || has_active_factor;
+    Ok((required, has_active_factor))
 }
 
 impl Service {
@@ -586,18 +660,12 @@ impl Service {
             ));
         }
 
-        // MFA must be active for v2 challenge login.
-        let mfa_active: bool = self.with_conn(|conn| {
-            let status: Option<String> = conn
-                .query_row(
-                    "SELECT status FROM account_mfa WHERE account_id = ?1",
-                    params![account_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            Ok(status.as_deref() == Some("active"))
-        })?;
-        if !mfa_active {
+        // Effective mandatory MFA: administrator OR operator policy required
+        // OR an already-active enrolled factor. Optional policy still allows
+        // begin for a non-enrolled operator (password + manager proof only).
+        let (mfa_required, has_active_factor) =
+            self.with_conn(|conn| effective_mfa_required(conn, &account_id))?;
+        if mfa_required && !has_active_factor {
             return Err(AppError::forbidden(
                 "multi-factor enrollment is required before challenge login",
             ));
@@ -640,6 +708,7 @@ impl Service {
             manager_public_key,
             deployment_id: dep_key,
             expires_at_unix: expires_at,
+            mfa_required,
         })
     }
 
@@ -656,7 +725,10 @@ impl Service {
         req: AuthChallengeCompleteRequest,
     ) -> AppResult<LoginResponse> {
         self.require_security_ok()?;
-        validate_totp_code(&req.totp_code)?;
+        // A malformed supplied factor is refused — never silently ignored.
+        if let Some(code) = &req.totp_code {
+            validate_totp_code(code)?;
+        }
         if req.manager_signature.trim().is_empty() {
             return Err(AppError::bad_request("manager_signature is required"));
         }
@@ -839,7 +911,11 @@ impl Service {
                 None => return Err(AppError::unauthorized("invalid challenge")),
             }
 
-            // MFA must still be active; load secret inside the transaction.
+            // Recheck current policy, role, and factor state inside the final
+            // transaction. A challenge started under optional policy cannot
+            // finish factor-free after policy becomes required. Corrupt or
+            // missing policy denies authority.
+            let (mfa_required, has_active_factor) = effective_mfa_required(conn, &ch_account)?;
             let mfa_row: Option<(String, String)> = conn
                 .query_row(
                     "SELECT totp_secret, status FROM account_mfa WHERE account_id = ?1",
@@ -847,56 +923,98 @@ impl Service {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let totp_secret = match mfa_row {
-                Some((secret, status)) if status == "active" => secret,
+            let active_secret = match mfa_row {
+                Some((secret, status)) if status == "active" => Some(secret),
                 Some(_) => {
                     return Err(AppError::forbidden("multi-factor enrollment is not active"))
                 }
-                None => return Err(AppError::forbidden("multi-factor enrollment is required")),
+                None => None,
             };
+            if has_active_factor != active_secret.is_some() {
+                return Err(AppError::forbidden("multi-factor enrollment is not active"));
+            }
 
-            // Verify + consume TOTP time step in the same transaction.
-            let matched_step = match verify_totp_at(&totp_secret, &req.totp_code, unix_now())? {
-                Some(step) => step,
-                None => return Err(AppError::unauthorized("invalid totp code")),
+            // Factor handling: a supplied code is always verified; a missing
+            // code is accepted only when effective MFA is not required.
+            let (assurance, mfa_assured_at) = match (&req.totp_code, mfa_required) {
+                (Some(code), _) => {
+                    let secret = match &active_secret {
+                        Some(secret) => secret,
+                        None => {
+                            return Err(AppError::forbidden(
+                                "totp code supplied but no active multi-factor enrollment",
+                            ))
+                        }
+                    };
+                    let matched_step = match verify_totp_at(secret, code, unix_now())? {
+                        Some(step) => step,
+                        None => return Err(AppError::unauthorized("invalid totp code")),
+                    };
+                    Self::consume_totp_step(conn, &ch_account, matched_step, current_step)?;
+                    crate::db::prune_totp_consumptions(conn, &ch_account)?;
+                    ("mfa", Some(now))
+                }
+                (None, true) => return Err(AppError::unauthorized("totp code is required")),
+                (None, false) => ("password", None),
             };
-            Self::consume_totp_step(conn, &ch_account, matched_step, current_step)?;
-            crate::db::prune_totp_consumptions(conn, &ch_account)?;
 
             // Issue the session only after every recheck + consumption succeeded.
             conn.execute(
                 "INSERT INTO sessions (
-                    id, account_id, manager_id, token_hash, created_at, expires_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    id, account_id, manager_id, token_hash, created_at, expires_at,
+                    assurance, mfa_assured_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     session_id,
                     ch_account,
                     manager_id,
                     token_hash,
                     now,
-                    expires_at_unix
+                    expires_at_unix,
+                    assurance,
+                    mfa_assured_at
                 ],
             )?;
 
-            Ok((ch_account, manager_id, ch_op))
+            // Bind the exact challenge-proven device key for the v2 response.
+            // Source of truth is the persisted approved manager row matched to
+            // the challenge key — never a client field or display identity.
+            let proven_key: String = conn.query_row(
+                "SELECT public_key FROM managers WHERE id = ?1 AND public_key IS NOT NULL",
+                params![manager_id],
+                |r| r.get(0),
+            )?;
+            if proven_key.trim().to_ascii_lowercase() != ch_key {
+                return Err(AppError::forbidden("manager device key binding mismatch"));
+            }
+
+            Ok((
+                ch_account,
+                manager_id,
+                ch_op,
+                mfa_required,
+                has_active_factor,
+                proven_key,
+            ))
         });
 
-        let (account_id, manager_id, operation) = match outcome {
-            Ok(values) => values,
-            Err(err) => {
-                // Storage uncertainty already latches; other errors are denials.
-                if !matches!(
-                    err,
-                    AppError::Api {
-                        code: crate::error::ErrorCode::SecurityStateUnavailable,
-                        ..
+        let (account_id, manager_id, operation, mfa_required, has_active_factor, proven_key) =
+            match outcome {
+                Ok(values) => values,
+                Err(err) => {
+                    // Storage uncertainty already latches; other errors are denials.
+                    if !matches!(
+                        err,
+                        AppError::Api {
+                            code: crate::error::ErrorCode::SecurityStateUnavailable,
+                            ..
+                        }
+                    ) {
+                        self.record_challenge_failure(&req.challenge_id);
                     }
-                ) {
-                    self.record_challenge_failure(&req.challenge_id);
+                    return Err(err);
                 }
-                return Err(err);
-            }
-        };
+            };
 
         let account_view = self.load_account_view(&account_id)?;
         let manager_view = self.load_manager_view(&manager_id)?;
@@ -907,17 +1025,197 @@ impl Service {
             "auth v2 challenge completed"
         );
 
+        let reason = if has_active_factor {
+            "totp_active"
+        } else {
+            "operator_policy_optional_no_factor"
+        };
         Ok(LoginResponse {
             token,
             expires_at_unix,
             account: account_view,
             manager: Some(manager_view),
             mfa: MfaStatus {
-                required: true,
-                available: true,
-                reason: "totp_active",
+                required: mfa_required,
+                available: has_active_factor,
+                reason,
             },
+            // v2-only: exact challenge-proven device key from the final
+            // transaction. Never display identity (`key:<hex>`).
+            manager_public_key: Some(proven_key),
         })
+    }
+
+    // ----- operator MFA policy -----
+
+    /// `GET /v2/security/operator-mfa-policy`. Administrator only.
+    pub fn get_operator_mfa_policy(
+        &self,
+        auth: &AuthContext,
+    ) -> AppResult<OperatorMfaPolicyResponse> {
+        self.require_security_ok()?;
+        if !auth.can_manage_security {
+            return Err(AppError::forbidden(
+                "administrator credentials are required to read operator MFA policy",
+            ));
+        }
+        self.with_conn(|conn| {
+            let policy = load_operator_mfa_policy(conn)?;
+            let updated_at: Option<i64> = conn
+                .query_row(
+                    "SELECT updated_at FROM security_policy WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(OperatorMfaPolicyResponse {
+                policy,
+                updated_at_unix: updated_at,
+                mfa_required_for_operators: policy == OperatorMfaPolicy::Required,
+            })
+        })
+    }
+
+    /// `PUT /v2/security/operator-mfa-policy`.
+    ///
+    /// Requires administrator and a fresh successful MFA-backed v2 session
+    /// (stored assurance `mfa`, no older than [`POLICY_MUTATION_MFA_FRESH_SECS`]),
+    /// an approved manager device, and trusted private persistence. Missing
+    /// assurance never authorizes change. Operator, legacy, or recovery-only
+    /// credentials cannot change the policy. Authenticate + mutation run in
+    /// one IMMEDIATE transaction: session, role, account, device approval and
+    /// assurance freshness are rechecked before the write. Enabling
+    /// `required` invalidates factor-free operator sessions.
+    pub fn set_operator_mfa_policy(
+        &self,
+        auth: &AuthContext,
+        req: OperatorMfaPolicyUpdateRequest,
+    ) -> AppResult<OperatorMfaPolicyResponse> {
+        self.require_security_ok()?;
+        self.require_persisted_v2_credentials()?;
+        if auth.manager_id.is_none() {
+            return Err(AppError::forbidden(
+                "approved manager device binding is required to change operator MFA policy",
+            ));
+        }
+        let now = now_unix();
+        let policy = req.policy;
+        let session_id = auth.session_id.clone();
+
+        self.with_tx(|conn| {
+            let session: Option<PolicySessionRow> = conn
+                    .query_row(
+                        "SELECT assurance, mfa_assured_at, expires_at, revoked_at, manager_id, account_id
+                         FROM sessions WHERE id = ?1",
+                        params![session_id],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+            let (assurance, mfa_assured_at, expires_at, revoked_at, manager_id, account_id) =
+                match session {
+                    Some(row) => row,
+                    None => return Err(AppError::unauthorized("invalid session")),
+                };
+            if revoked_at.is_some() {
+                return Err(AppError::unauthorized("session revoked"));
+            }
+            if expires_at <= now {
+                return Err(AppError::unauthorized("session expired"));
+            }
+            if account_id != auth.account_id {
+                return Err(AppError::unauthorized("invalid session"));
+            }
+            // Real stored session assurance/time — never a caller assertion.
+            if assurance != "mfa" {
+                return Err(AppError::forbidden(
+                    "a fresh MFA-backed session is required to change operator MFA policy",
+                ));
+            }
+            // Age must be in 0..=fresh window. Future assurance timestamps
+            // (clock rollback / planted future) and stale assurance both deny.
+            match mfa_assured_at.and_then(|at| now.checked_sub(at)) {
+                Some(age) if (0..=POLICY_MUTATION_MFA_FRESH_SECS).contains(&age) => {}
+                _ => {
+                    return Err(AppError::forbidden(
+                        "a fresh MFA-backed session is required to change operator MFA policy",
+                    ))
+                }
+            }
+            // Administrator + active account, rechecked transactionally.
+            let account: Option<(String, bool)> = conn
+                .query_row(
+                    "SELECT state, can_manage_security FROM accounts WHERE id = ?1",
+                    params![account_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match account {
+                Some((ref state, true)) if state == "active" => {}
+                Some((_, true)) => return Err(AppError::forbidden("account is not active")),
+                Some((_, false)) => {
+                    return Err(AppError::forbidden(
+                        "administrator credentials are required to change operator MFA policy",
+                    ))
+                }
+                None => return Err(AppError::unauthorized("invalid session")),
+            }
+            // Approved manager device must still be bound and approved.
+            let manager_id = manager_id.ok_or_else(|| {
+                AppError::forbidden(
+                    "approved manager device binding is required to change operator MFA policy",
+                )
+            })?;
+            let lifecycle: Option<String> = conn
+                .query_row(
+                    "SELECT lifecycle_state FROM managers WHERE id = ?1",
+                    params![manager_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match lifecycle {
+                Some(ref state) if state == "approved" => {}
+                _ => {
+                    return Err(AppError::forbidden(
+                        "manager identity is no longer approved",
+                    ))
+                }
+            }
+
+            let changed = conn.execute(
+                "UPDATE security_policy
+                 SET operator_mfa_policy = ?1, updated_at = ?2
+                 WHERE id = 1",
+                params![policy.as_str(), now],
+            )?;
+            if changed != 1 {
+                return Err(AppError::unprocessable(
+                    "operator mfa policy is missing; denying authority",
+                ));
+            }
+            if policy == OperatorMfaPolicy::Required {
+                conn.execute(
+                    "UPDATE sessions SET revoked_at = ?1
+                     WHERE revoked_at IS NULL
+                       AND (assurance IS NULL OR assurance != 'mfa')
+                       AND account_id IN (
+                           SELECT id FROM accounts WHERE can_manage_security = 0
+                       )",
+                    params![now],
+                )?;
+            }
+            Ok(())
+        })?;
+
+        self.get_operator_mfa_policy(auth)
     }
 
     // ----- recovery-only verification -----
