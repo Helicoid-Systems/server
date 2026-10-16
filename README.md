@@ -1,12 +1,17 @@
 # Helicoid Systems — coordination server foundation
 
-The operator-MFA candidate now passes **308 coordinator tests**, formatting,
+The operator-MFA candidate now passes **309 coordinator tests**, formatting,
 strict Clippy and the release build on macOS. Independent regressions confirm
 that future MFA assurance, legacy login and historical password-only sessions
 cannot bypass mandatory MFA or approved manager-key proof. Operator MFA is
 optional by default; administrator and already-enrolled factors remain mandatory.
 Schema 3 requires an explicit migration; no production database was migrated.
-Linux/Windows CI and installed/public acceptance remain pending for this revision.
+Native Windows CI still failed `scripts/check-development-fixture.ps1` at
+revision `65ed9a2` because that fixture expected password-only administrator
+`check-login` success; the fixture now asserts the deliberate mandatory-MFA
+denial and a distinct invalid-credentials denial for a wrong Unicode password
+(actual CLI, stdin only). Native Windows/Linux CI acceptance of the repaired
+fixture remains **Not Verified** until the next real CI run.
 The 14 October billing interruption and earlier failed candidates are historical.
 
 `hs-server` is an independently buildable Rust service owned by `modules/server`.
@@ -127,8 +132,13 @@ printf '%s' 'your-long-password' | hs-server --data ./hs-server.db bootstrap \
 hs-server --data ./hs-server.db serve --bind 127.0.0.1:8787
 ```
 
-`hs-server check-login --username admin --password-stdin` verifies credentials
-without starting HTTP and immediately discards the ephemeral session.
+`hs-server check-login --username admin --password-stdin` runs the real
+credential path without starting HTTP. Mandatory administrator MFA refuses
+password-only sessions, so a correct password exits nonzero with the safe
+MFA-required denial (password verified first), and a wrong password exits
+nonzero with `invalid credentials` — never a session. On accounts without an
+MFA requirement, success prints `login ok` and the ephemeral session is
+discarded immediately.
 
 Never log or print `password`, `token`, `bootstrap_token`, or `Authorization`.
 

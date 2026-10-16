@@ -156,7 +156,7 @@ Then launch Helicoid Manager as shown in the quick start.
 | `hs-server --data <db> init` | Creates schema in a new DB file; prints one bootstrap token |
 | `hs-server --data <db> bootstrap` | Creates first admin; optional `--manager-public-identity` |
 | `hs-server --data <db> serve --bind 127.0.0.1:8787` | Foreground HTTP; non-loopback binds are refused |
-| `hs-server --data <db> check-login` | Verifies credentials without starting HTTP |
+| `hs-server --data <db> check-login` | Runs the real credential path (no HTTP). Administrator password-only login is refused by mandatory MFA after password verification |
 
 Useful flags for bootstrap:
 
