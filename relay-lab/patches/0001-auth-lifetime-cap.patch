@@ -1,0 +1,428 @@
+diff --git a/src/apps/relay/ns_ioalib_engine_impl.c b/src/apps/relay/ns_ioalib_engine_impl.c
+index 6790bfc..acccc77 100644
+--- a/src/apps/relay/ns_ioalib_engine_impl.c
++++ b/src/apps/relay/ns_ioalib_engine_impl.c
+@@ -951,7 +951,8 @@ ioa_timer_handle set_ioa_timer(ioa_engine_handle e, int secs, int ms, ioa_timer_
+                                int persist, const char *txt) {
+   ioa_timer_handle ret = NULL;
+ 
+-  if (e && cb && secs > 0) {
++  /* secs==0 with ms>0 is valid: authorization-bound timers can be sub-second. */
++  if (e && cb && (secs > 0 || ms > 0)) {
+ 
+     timer_event *te = (timer_event *)turn_malloc(sizeof(timer_event));
+ 
+@@ -962,7 +963,7 @@ ioa_timer_handle set_ioa_timer(ioa_engine_handle e, int secs, int ms, ioa_timer_
+     struct event *ev = event_new(e->event_base, -1, flags, timer_event_handler, te);
+     struct timeval tv;
+ 
+-    tv.tv_sec = secs;
++    tv.tv_sec = (secs > 0) ? secs : 0;
+ 
+     if (te) {
+       te->ctx = ctx;
+@@ -972,7 +973,7 @@ ioa_timer_handle set_ioa_timer(ioa_engine_handle e, int secs, int ms, ioa_timer_
+       te->txt = turn_strdup(txt);
+     }
+ 
+-    if (!ms) {
++    if (!ms && secs > 0) {
+       tv.tv_usec = 0;
+       int found = 0;
+       int t;
+diff --git a/src/apps/relay/userdb.c b/src/apps/relay/userdb.c
+index 47a3ee2..3d86c13 100644
+--- a/src/apps/relay/userdb.c
++++ b/src/apps/relay/userdb.c
+@@ -564,6 +564,30 @@ int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *u
+       return ret;
+     }
+ 
++    /* Bound the session to the REST credential timestamp. Without this,
++       max_session_time stayed 0 and an authenticated session could Refresh
++       indefinitely after the credential expired.
++       Checked narrowing: a far-future timestamp must not wrap into a negative
++       int (then treated as unlimited), and ts==ctime must not become 0
++       (also treated as unlimited). labs REST is always bounded. */
++    if (ts && max_session_time) {
++      turn_time_t remaining = 0;
++      if (ts > ctime) {
++        remaining = ts - ctime;
++      }
++      if (remaining == 0) {
++        /* Credential expires this very second: deny, do not grant unlimited. */
++        *key_lookup = TURN_KEY_LOOKUP_EXPIRED;
++        clean_secrets_list(&sl);
++        return ret;
++      }
++      if (remaining > (turn_time_t)0x7FFFFFFF) {
++        *max_session_time = 0x7FFFFFFF;
++      } else {
++        *max_session_time = (int)remaining;
++      }
++    }
++
+     {
+       uint8_t hmac[MAXSHASIZE];
+       unsigned int hmac_len;
+diff --git a/src/ns_turn_defs.h b/src/ns_turn_defs.h
+index a4ade5e..80f3dca 100644
+--- a/src/ns_turn_defs.h
++++ b/src/ns_turn_defs.h
+@@ -211,6 +211,43 @@ typedef uint32_t turn_time_t;
+ 
+ #define turn_time_before(t1, t2) ((((int32_t)(t1)) - ((int32_t)(t2))) < 0)
+ 
++/* Monotonic milliseconds for authorization deadlines. Wall-clock time
++ * (turn_time/time(NULL)) can roll back; a frozen deadline measured with
++ * this clock cannot be re-granted by Refresh or by a clock correction.
++ *
++ * TURN_MONOTONIC_MS_FAIL is returned when CLOCK_MONOTONIC is unavailable
++ * or clock_gettime fails. There is NO wall-clock fallback: callers must
++ * fail closed and deny new/renewed authority. Never conflate this failure
++ * with deadline 0 (no-bound / unlimited). */
++#define TURN_MONOTONIC_MS_FAIL ((int64_t)INT64_MIN)
++
++/* Frozen authorization deadline sentinel meaning "clock fault or invalid
++ * deadline; deny new and renewed authority". Distinct from 0 (no deadline).
++ * Negative deadlines other than 0 must also fail closed in callers. */
++#define TURN_AUTH_DEADLINE_FAIL ((int64_t)INT64_MIN)
++
++static inline int64_t turn_monotonic_ms(void) {
++#if defined(TURN_TEST_CLOCK_FAULT)
++  /* Test-only build seam (compile-time). Simulates monotonic clock failure
++   * in the real binary; not a runtime hook and not exported. */
++  return TURN_MONOTONIC_MS_FAIL;
++#elif defined(CLOCK_MONOTONIC)
++  struct timespec ts;
++  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
++    /* Checked conversion: reject values that would overflow int64 ms. */
++    if (ts.tv_sec < 0 || ts.tv_sec > (INT64_MAX / 1000)) {
++      return TURN_MONOTONIC_MS_FAIL;
++    }
++    return ((int64_t)ts.tv_sec) * 1000 + (int64_t)(ts.tv_nsec / 1000000);
++  }
++  return TURN_MONOTONIC_MS_FAIL;
++#else
++  /* Supported platforms (Linux/macOS) provide CLOCK_MONOTONIC. Absence is
++   * a fault, never a wall-clock fallback. */
++  return TURN_MONOTONIC_MS_FAIL;
++#endif
++}
++
+ #if !defined(UNUSED_ARG)
+ #define UNUSED_ARG(A)                                                                                                  \
+   do {                                                                                                                 \
+diff --git a/src/server/ns_turn_server.c b/src/server/ns_turn_server.c
+index 5be237a..aed5614 100644
+--- a/src/server/ns_turn_server.c
++++ b/src/server/ns_turn_server.c
+@@ -160,6 +160,84 @@ static ts_ur_super_session *mobile_complete_transition(turn_turnserver *server,
+ static void mobile_abort_transition(turn_turnserver *server, ts_ur_super_session *orig_ss);
+ static void client_to_be_allocated_timeout_handler(ioa_engine_handle e, void *arg);
+ 
++/* Remaining authorization seconds for this authenticated session.
++   0 means "no deadline" (auth_deadline_mono_ms unset). Returns -1 when the
++   frozen deadline has passed OR when less than one full second remains.
++
++   Fail-closed below 1s: remain_ms in (0,1000) must NOT return 0, because
++   callers treat 0 as "no deadline" and fall back to max_session_time_auth
++   (the initial duration), which re-grants a full lifetime in the last
++   fraction of the authorization window. */
++static void client_ss_allocation_timeout_handler(ioa_engine_handle e, void *arg);
++
++static int auth_remaining_secs(const ts_ur_super_session *ss) {
++  if (!ss) {
++    return -1;
++  }
++  if (ss->auth_deadline_mono_ms == 0) {
++    return 0;
++  }
++  /* FAIL sentinel, negative, or overflowed deadline: fail closed. */
++  if (ss->auth_deadline_mono_ms < 0) {
++    return -1;
++  }
++  const int64_t now_ms = turn_monotonic_ms();
++  if (now_ms == TURN_MONOTONIC_MS_FAIL) {
++    /* Clock fault: deny new/renewed authority. Never treat as unlimited. */
++    return -1;
++  }
++  const int64_t remain_ms = ss->auth_deadline_mono_ms - now_ms;
++  if (remain_ms < 1000) {
++    return -1;
++  }
++  int64_t secs = remain_ms / 1000;
++  if (secs > 0x7FFFFFFF) {
++    secs = 0x7FFFFFFF;
++  }
++  return (int)secs;
++}
++
++/* Milliseconds until the frozen authorization deadline, or -1 if the
++   deadline is absent/expired/less than 1ms away. Used to arm timers that
++   destroy the relay AT the bound independently of Refresh. */
++static int64_t auth_remaining_ms(const ts_ur_super_session *ss) {
++  if (!ss) {
++    return -1;
++  }
++  if (ss->auth_deadline_mono_ms == 0) {
++    return -1;
++  }
++  if (ss->auth_deadline_mono_ms < 0) {
++    return -1;
++  }
++  const int64_t now_ms = turn_monotonic_ms();
++  if (now_ms == TURN_MONOTONIC_MS_FAIL) {
++    return -1;
++  }
++  const int64_t remain_ms = ss->auth_deadline_mono_ms - now_ms;
++  if (remain_ms <= 0) {
++    return -1;
++  }
++  return remain_ms;
++}
++
++/* Mark relay families invalid at the authorization bound. The allocation
++   lifetime timer (armed with millisecond precision to the monotonic
++   deadline) is the process that actually closes the sockets; this helper
++   only fails closed the family state so no further forwarding occurs.
++   It must not re-enter the timeout handler from inside a request. */
++static void destroy_allocation_at_auth_bound(turn_turnserver *server, ts_ur_super_session *ss) {
++  if (!server || !ss) {
++    return;
++  }
++  allocation *a = get_allocation_ss(ss);
++  if (!is_allocation_valid(a)) {
++    return;
++  }
++  set_allocation_family_invalid(a, AF_INET);
++  set_allocation_family_invalid(a, AF_INET6);
++}
++
+ static int check_stun_auth(turn_turnserver *server, ts_ur_super_session *ss, stun_tid *tid, int *resp_constructed,
+                            int *err_code, const uint8_t **reason, ioa_net_data *in_buffer,
+                            ioa_network_buffer_handle nbh, uint16_t method, int *message_integrity, int *postpone_reply,
+@@ -1402,7 +1480,19 @@ static int handle_turn_allocate(turn_turnserver *server, ts_ur_super_session *ss
+         }
+       }
+ 
+-      lifetime = stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), ss->max_session_time_auth);
++      {
++        const int auth_rem = auth_remaining_secs(ss);
++        if (auth_rem < 0) {
++          *err_code = 401;
++          *reason = (const uint8_t *)"Credentials have expired (authorization deadline)";
++          destroy_allocation_at_auth_bound(server, ss);
++          return 0;
++        }
++        /* auth_rem == 0: no frozen deadline (non-REST / unlimited).
++           auth_rem > 0: cap every grant to remaining authorization. */
++        const turn_time_t auth_cap = (auth_rem > 0) ? (turn_time_t)auth_rem : ss->max_session_time_auth;
++        lifetime = stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), auth_cap);
++      }
+       uint64_t out_reservation_token = 0;
+ 
+       if (inc_quota(ss, username) < 0) {
+@@ -1650,6 +1740,7 @@ static void copy_auth_parameters(ts_ur_super_session *orig_ss, ts_ur_super_sessi
+     ss->origin_set = orig_ss->origin_set;
+     memcpy(ss->pwd, orig_ss->pwd, sizeof(ss->pwd));
+     ss->max_session_time_auth = orig_ss->max_session_time_auth;
++  ss->auth_deadline_mono_ms = orig_ss->auth_deadline_mono_ms;
+     if (acquire_quota) {
+       inc_quota(ss, ss->username);
+     }
+@@ -2005,11 +2096,20 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
+               if (to_delete) {
+                 lifetime = 0;
+               } else {
+-                lifetime = stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime),
+-                                                         ss->max_session_time_auth);
++                const int auth_rem = auth_remaining_secs(ss);
++                if (auth_rem < 0) {
++                  *err_code = 401;
++                  *reason = (const uint8_t *)"Credentials have expired (authorization deadline)";
++                  destroy_allocation_at_auth_bound(server, ss);
++                } else {
++                  const turn_time_t auth_cap = (auth_rem > 0) ? (turn_time_t)auth_rem : ss->max_session_time_auth;
++                  lifetime = stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), auth_cap);
++                }
+               }
+ 
+-              if (af4c && refresh_relay_connection(server, orig_ss, lifetime, 0, 0, 0, err_code, AF_INET) < 0) {
++              if (*err_code) {
++                /* Authorization deadline already expired: do not extend. */
++              } else if (af4c && refresh_relay_connection(server, orig_ss, lifetime, 0, 0, 0, err_code, AF_INET) < 0) {
+ 
+                 if (!(*err_code)) {
+                   *err_code = 437;
+@@ -2098,7 +2198,15 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
+       if (to_delete) {
+         lifetime = 0;
+       } else {
+-        lifetime = stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), ss->max_session_time_auth);
++        const int auth_rem = auth_remaining_secs(ss);
++        if (auth_rem < 0) {
++          *err_code = 401;
++          *reason = (const uint8_t *)"Credentials have expired (authorization deadline)";
++          destroy_allocation_at_auth_bound(server, ss);
++        } else {
++          const turn_time_t auth_cap = (auth_rem > 0) ? (turn_time_t)auth_rem : ss->max_session_time_auth;
++          lifetime = stun_adjust_allocate_lifetime(lifetime, *(server->max_allocate_lifetime), auth_cap);
++        }
+       }
+ 
+       if (!af4 && !af6) {
+@@ -2106,7 +2214,9 @@ static int handle_turn_refresh(turn_turnserver *server, ts_ur_super_session *ss,
+         af6 = af6c;
+       }
+ 
+-      if (af4 && refresh_relay_connection(server, ss, lifetime, 0, 0, 0, err_code, AF_INET) < 0) {
++      if (*err_code) {
++        /* Authorization deadline already expired: do not extend the allocation. */
++      } else if (af4 && refresh_relay_connection(server, ss, lifetime, 0, 0, 0, err_code, AF_INET) < 0) {
+ 
+         if (!(*err_code)) {
+           *err_code = 437;
+@@ -3577,7 +3687,29 @@ static void resume_processing_after_username_check(int success, turn_key_lookup_
+         memcpy(ss->hmackey, hmackey, sizeof(hmackey_t));
+         ss->hmackey_set = 1;
+         ss->oauth = oauth;
+-        ss->max_session_time_auth = (turn_time_t)max_session_time;
++        /* Freeze the authorization deadline once per authenticated session.
++           Refresh reuses cached credentials and must never re-grant this.
++           Clock fault / overflow fail closed: never deadline 0 (unlimited). */
++        {
++          const int64_t now_ms = turn_monotonic_ms();
++          if (now_ms == TURN_MONOTONIC_MS_FAIL) {
++            ss->auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++            ss->max_session_time_auth = 0;
++          } else if (max_session_time > 0) {
++            const int64_t dur_ms = ((int64_t)max_session_time) * 1000;
++            if ((dur_ms / 1000) != (int64_t)max_session_time || (now_ms > (INT64_MAX - dur_ms))) {
++              ss->auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++              ss->max_session_time_auth = 0;
++            } else {
++              ss->auth_deadline_mono_ms = now_ms + dur_ms;
++              ss->max_session_time_auth = (turn_time_t)max_session_time;
++            }
++          } else {
++            /* Non-REST unlimited kept separate; only true 0 stays no-bound. */
++            ss->auth_deadline_mono_ms = 0;
++            ss->max_session_time_auth = (turn_time_t)max_session_time;
++          }
++        }
+         memcpy(ss->pwd, pwd, sizeof(password_t));
+         if (realm && realm[0] && strcmp((char *)realm, ss->realm_options.name)) {
+           dec_quota(ss);
+@@ -4989,9 +5121,49 @@ static int create_relay_connection(turn_turnserver *server, ts_ur_super_session
+       lifetime = (uint32_t) * (server->max_allocate_lifetime);
+     }
+ 
+-    ioa_timer_handle ev = set_ioa_timer(server->e, lifetime, 0, client_ss_allocation_timeout_handler, newelem, 0,
+-                                        "client_ss_allocation_timeout_handler");
+-    set_allocation_lifetime_ev(a, server->ctime + lifetime, ev, get_ioa_socket_address_family(newelem->s));
++    /* Destroy the relay AT the authorization bound: cap the lifetime timer
++       to the remaining monotonic authorization, with millisecond precision. */
++    {
++      int timer_secs = (int)lifetime;
++      int timer_ms = 0;
++      const int64_t auth_ms = auth_remaining_ms(ss);
++      if (ss->auth_deadline_mono_ms != 0) {
++        if (auth_ms < 0) {
++          *err_code = 401;
++          *reason = (const uint8_t *)"Credentials have expired (authorization deadline)";
++          IOA_CLOSE_SOCKET(newelem->s);
++          return -1;
++        }
++        int64_t want_ms = ((int64_t)lifetime) * 1000;
++        if (want_ms > auth_ms) {
++          want_ms = auth_ms;
++        }
++        timer_secs = (int)(want_ms / 1000);
++        timer_ms = (int)(want_ms % 1000);
++        if (timer_secs <= 0 && timer_ms <= 0) {
++          *err_code = 401;
++          *reason = (const uint8_t *)"Credentials have expired (authorization deadline)";
++          IOA_CLOSE_SOCKET(newelem->s);
++          return -1;
++        }
++        if (lifetime > (uint32_t)(want_ms / 1000) && want_ms % 1000) {
++          /* Report only whole seconds that fit before the bound. */
++          lifetime = (uint32_t)(want_ms / 1000);
++          if (lifetime < 1) {
++            *err_code = 401;
++            *reason = (const uint8_t *)"Credentials have expired (authorization deadline)";
++            IOA_CLOSE_SOCKET(newelem->s);
++            return -1;
++          }
++        } else if (want_ms / 1000 < (int64_t)lifetime) {
++          lifetime = (uint32_t)(want_ms / 1000);
++        }
++      }
++      ioa_timer_handle ev = set_ioa_timer(server->e, timer_secs, timer_ms, client_ss_allocation_timeout_handler, newelem,
++                                          0, "client_ss_allocation_timeout_handler");
++      set_allocation_lifetime_ev(a, server->ctime + ((timer_ms > 0) ? (timer_secs + 1) : timer_secs), ev,
++                                 get_ioa_socket_address_family(newelem->s));
++    }
+ 
+     if (!multiplex_peer_udp) {
+       set_ioa_socket_session(newelem->s, ss);
+@@ -5018,11 +5190,37 @@ static int refresh_relay_connection(turn_turnserver *server, ts_ur_super_session
+       lifetime = 1;
+     }
+ 
+-    ioa_timer_handle ev =
+-        set_ioa_timer(server->e, lifetime, 0, client_ss_allocation_timeout_handler, get_relay_session(a, family), 0,
+-                      "refresh_client_ss_allocation_timeout_handler");
++    int timer_secs = (int)lifetime;
++    int timer_ms = 0;
++    if (ss->auth_deadline_mono_ms != 0) {
++      const int64_t auth_ms = auth_remaining_ms(ss);
++      if (auth_ms < 0) {
++        destroy_allocation_at_auth_bound(server, ss);
++        return -1;
++      }
++      int64_t want_ms = ((int64_t)lifetime) * 1000;
++      if (want_ms > auth_ms) {
++        want_ms = auth_ms;
++      }
++      timer_secs = (int)(want_ms / 1000);
++      timer_ms = (int)(want_ms % 1000);
++      if (timer_secs <= 0 && timer_ms <= 0) {
++        destroy_allocation_at_auth_bound(server, ss);
++        return -1;
++      }
++      if (want_ms / 1000 < (int64_t)lifetime) {
++        lifetime = (uint32_t)(want_ms / 1000);
++        if (lifetime < 1) {
++          destroy_allocation_at_auth_bound(server, ss);
++          return -1;
++        }
++      }
++    }
++
++    ioa_timer_handle ev = set_ioa_timer(server->e, timer_secs, timer_ms, client_ss_allocation_timeout_handler,
++                                        get_relay_session(a, family), 0, "refresh_client_ss_allocation_timeout_handler");
+ 
+-    set_allocation_lifetime_ev(a, server->ctime + lifetime, ev, family);
++    set_allocation_lifetime_ev(a, server->ctime + ((timer_ms > 0) ? (timer_secs + 1) : timer_secs), ev, family);
+ 
+     return 0;
+ 
+diff --git a/src/server/ns_turn_session.h b/src/server/ns_turn_session.h
+index e4f3272..f59a694 100644
+--- a/src/server/ns_turn_session.h
++++ b/src/server/ns_turn_session.h
+@@ -118,6 +118,12 @@ struct _ts_ur_super_session {
+   int quota_used;
+   int oauth;
+   turn_time_t max_session_time_auth;
++  /* Absolute authorization deadline on the monotonic clock (ms).
++     0 = none (non-REST unlimited).
++     TURN_AUTH_DEADLINE_FAIL = clock fault / invalid; deny new/renewed.
++     Positive = absolute deadline. Frozen at credential lookup; Refresh
++     must never extend it. */
++  int64_t auth_deadline_mono_ms;
+   /* Realm */
+   realm_options_t realm_options;
+   int origin_set;
