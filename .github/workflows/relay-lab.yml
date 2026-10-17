@@ -1,0 +1,105 @@
+name: relay-lab
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "relay-lab/**"
+      - ".github/workflows/relay-lab.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native-linux-relay-lab:
+    name: coturn relay expiry lab (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record runner and tool versions
+        run: |
+          set -euo pipefail
+          {
+            echo "uname: $(uname -a)"
+            echo "cc: $(cc --version | head -1)"
+            echo "make: $(make --version | head -1)"
+            echo "git: $(git --version)"
+            echo "python3: $(python3 --version)"
+            echo "openssl: $(openssl version || true)"
+            echo "pkg-config: $(pkg-config --version || true)"
+            lsb_release -a || true
+          } | tee relay-lab-runner-versions.txt
+
+      - name: Install build dependencies (disposable runner)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git \
+            libssl-dev pkg-config python3
+          {
+            echo "libssl-dev: $(dpkg-query -W -f='${Version}\n' libssl-dev || true)"
+            echo "build-essential: $(dpkg-query -W -f='${Version}\n' build-essential || true)"
+          } | tee -a relay-lab-runner-versions.txt
+
+      - name: Fetch pinned coturn + libevent
+        env:
+          LAB_ROOT: ${{ runner.temp }}/relay-lab
+        run: |
+          set -euo pipefail
+          chmod +x relay-lab/scripts/*.sh
+          ./relay-lab/scripts/fetch-coturn.sh
+
+      - name: Launcher and oracle-causal fixtures (early, test-only)
+        env:
+          LAB_ROOT: ${{ runner.temp }}/relay-lab-fixtures
+        run: |
+          set -euo pipefail
+          ./relay-lab/scripts/test-run-lab-launcher.sh
+          python3 -m py_compile relay-lab/harness/*.py
+          python3 relay-lab/harness/test_oracle_causality.py
+
+      - name: Build stock + patched + clockfault (single ordered pass)
+        env:
+          LAB_ROOT: ${{ runner.temp }}/relay-lab
+          OPENSSL_PREFIX: /usr
+        run: |
+          set -euo pipefail
+          # One ordered stock+0001+0002 build. build-lab.sh calls build-stock.sh.
+          ./relay-lab/scripts/build-lab.sh
+
+      - name: Run lab scenarios (stock red + patched + clockfault)
+        env:
+          LAB_ROOT: ${{ runner.temp }}/relay-lab
+        run: |
+          set -euo pipefail
+          export STOCK_BIN="${LAB_ROOT}/coturn-stock-20261017/bin/turnserver-stock"
+          ./relay-lab/scripts/run-lab.sh
+
+      - name: Owned delete-realloc regression seam
+        env:
+          LAB_ROOT: ${{ runner.temp }}/relay-lab
+        run: |
+          set -euo pipefail
+          export STOCK_BIN="${LAB_ROOT}/coturn-stock-20261017/bin/turnserver-stock"
+          export PATCHED_BIN="${LAB_ROOT}/bin/turnserver-patched"
+          export CLOCKFAULT_BIN="${LAB_ROOT}/bin/turnserver-clockfault"
+          python3 relay-lab/harness/test_delete_realloc_regression.py
+
+      - name: Upload metadata-only results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-lab-results
+          path: |
+            ${{ runner.temp }}/relay-lab/run/*.json
+            ${{ runner.temp }}/relay-lab/run/*.exit
+            relay-lab-runner-versions.txt
+          if-no-files-found: warn
+          retention-days: 14

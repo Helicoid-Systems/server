@@ -1,0 +1,17 @@
+# Lab package hygiene: no bulk / generated / secret material in git.
+__pycache__/
+*.py[cod]
+*.log
+*.out
+*.dSYM/
+run/
+build/
+prefix/
+bin/
+deps-src/
+coturn-src/
+coturn-stock*/
+*.pem
+*.key
+*.crt
+turnserver.conf

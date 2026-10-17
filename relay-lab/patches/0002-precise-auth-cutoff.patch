@@ -1,0 +1,435 @@
+diff --git a/src/apps/relay/netengine.c b/src/apps/relay/netengine.c
+--- a/src/apps/relay/netengine.c
++++ b/src/apps/relay/netengine.c
+@@ -533,8 +533,8 @@
+ 
+ void send_auth_message_to_auth_server(struct auth_message *am) {
+   if (can_auth_message_inline(am)) {
+-    if (get_user_key(am->in_oauth, &(am->out_oauth), &(am->max_session_time), am->username, am->realm, am->key,
+-                     am->in_buffer.nbh, &(am->key_lookup)) < 0) {
++    if (get_user_key(am->in_oauth, &(am->out_oauth), &(am->max_session_time), &(am->auth_deadline_mono_ms), am->username,
++                     am->realm, am->key, am->in_buffer.nbh, &(am->key_lookup)) < 0) {
+       am->success = 0;
+     } else {
+       am->success = 1;
+@@ -567,8 +567,8 @@
+       continue;
+     }
+ 
+-    if (get_user_key(am->in_oauth, &(am->out_oauth), &(am->max_session_time), am->username, am->realm, am->key,
+-                     am->in_buffer.nbh, &(am->key_lookup)) < 0) {
++    if (get_user_key(am->in_oauth, &(am->out_oauth), &(am->max_session_time), &(am->auth_deadline_mono_ms), am->username,
++                     am->realm, am->key, am->in_buffer.nbh, &(am->key_lookup)) < 0) {
+       am->success = 0;
+     } else {
+       am->success = 1;
+@@ -841,7 +841,8 @@
+ }
+ 
+ static void handle_relay_auth_message(struct relay_server *rs, struct auth_message *am) {
+-  am->resume_func(am->success, am->key_lookup, am->out_oauth, am->max_session_time, am->key, am->pwd, &(rs->server),
++  am->resume_func(am->success, am->key_lookup, am->out_oauth, am->max_session_time, am->auth_deadline_mono_ms, am->key,
++                  am->pwd, &(rs->server),
+                   am->ctxkey, &(am->in_buffer), am->realm);
+   if (am->in_buffer.nbh) {
+     ioa_network_buffer_delete(rs->ioa_eng, am->in_buffer.nbh);
+diff --git a/src/apps/relay/userdb.c b/src/apps/relay/userdb.c
+--- a/src/apps/relay/userdb.c
++++ b/src/apps/relay/userdb.c
+@@ -399,14 +399,17 @@
+ /*
+  * Password retrieval
+  */
+-int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *usname, uint8_t *realm, hmackey_t key,
+-                 ioa_network_buffer_handle nbh, turn_key_lookup_result *key_lookup) {
++int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, int64_t *auth_deadline_mono_ms, uint8_t *usname,
++                 uint8_t *realm, hmackey_t key, ioa_network_buffer_handle nbh, turn_key_lookup_result *key_lookup) {
+   int ret = -1;
+ 
+   *key_lookup = TURN_KEY_LOOKUP_NOT_FOUND;
+ 
+   if (max_session_time) {
+     *max_session_time = 0;
++  }
++  if (auth_deadline_mono_ms) {
++    *auth_deadline_mono_ms = 0;
+   }
+ 
+   if (in_oauth && out_oauth && usname && usname[0]) {
+@@ -564,27 +567,97 @@
+       return ret;
+     }
+ 
+-    /* Bound the session to the REST credential timestamp. Without this,
+-       max_session_time stayed 0 and an authenticated session could Refresh
+-       indefinitely after the credential expired.
+-       Checked narrowing: a far-future timestamp must not wrap into a negative
+-       int (then treated as unlimited), and ts==ctime must not become 0
+-       (also treated as unlimited). labs REST is always bounded. */
++    /* Bound the session to the REST credential timestamp. The timestamp is
++       an integer wall second; remaining time to that instant must use a
++       sub-second wall observation or it is up to 1s too long (and the mapped
++       monotonic deadline then extends past the wall bound). Capture the
++       monotonic deadline HERE, before any auth-queue delay, so resume after
++       async key lookup cannot lengthen it. Trust is applied only after real
++       key verification. Checked narrowing: a far-future timestamp must not
++       wrap into a negative int (then treated as unlimited). */
+     if (ts && max_session_time) {
+-      turn_time_t remaining = 0;
+-      if (ts > ctime) {
+-        remaining = ts - ctime;
+-      }
+-      if (remaining == 0) {
+-        /* Credential expires this very second: deny, do not grant unlimited. */
++      /* Sample monotonic BEFORE walltime so a scheduling gap cannot extend
++         the admission deadline past the wall bound. Wall ms is ceiled and
++         mono ms is floored (conservative remaining). */
++      const int64_t mono_now = turn_monotonic_ms();
++      if (mono_now == TURN_MONOTONIC_MS_FAIL) {
++        if (auth_deadline_mono_ms) {
++          *auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++        }
+         *key_lookup = TURN_KEY_LOOKUP_EXPIRED;
+         clean_secrets_list(&sl);
+         return ret;
+       }
+-      if (remaining > (turn_time_t)0x7FFFFFFF) {
++      struct timespec wall_ts;
++      if (clock_gettime(CLOCK_REALTIME, &wall_ts) != 0) {
++        /* Wall clock fault: deny, never fall back to integer time(NULL). */
++        if (auth_deadline_mono_ms) {
++          *auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++        }
++        *key_lookup = TURN_KEY_LOOKUP_EXPIRED;
++        clean_secrets_list(&sl);
++        return ret;
++      }
++      if (wall_ts.tv_sec < 0 || wall_ts.tv_nsec < 0 || wall_ts.tv_nsec >= 1000000000L ||
++          wall_ts.tv_sec > (INT64_MAX / 1000)) {
++        if (auth_deadline_mono_ms) {
++          *auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++        }
++        *key_lookup = TURN_KEY_LOOKUP_EXPIRED;
++        clean_secrets_list(&sl);
++        return ret;
++      }
++      if (ts > (turn_time_t)0x7FFFFFFF) {
++        /* Checked narrowing for ts*1000. */
++        if (auth_deadline_mono_ms) {
++          *auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++        }
++        *key_lookup = TURN_KEY_LOOKUP_EXPIRED;
++        clean_secrets_list(&sl);
++        return ret;
++      }
++      const int64_t wall_sec_ms = ((int64_t)wall_ts.tv_sec) * 1000;
++      int64_t wall_frac_ms = (int64_t)(wall_ts.tv_nsec / 1000000);
++      if ((wall_ts.tv_nsec % 1000000) != 0) {
++        wall_frac_ms += 1; /* ceil ms: later wall => smaller remaining */
++      }
++      if (wall_frac_ms > (INT64_MAX - wall_sec_ms)) {
++        if (auth_deadline_mono_ms) {
++          *auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++        }
++        *key_lookup = TURN_KEY_LOOKUP_EXPIRED;
++        clean_secrets_list(&sl);
++        return ret;
++      }
++      const int64_t wall_now_ms = wall_sec_ms + wall_frac_ms;
++      const int64_t deadline_wall_ms = ((int64_t)ts) * 1000;
++      const int64_t remaining_ms = deadline_wall_ms - wall_now_ms;
++      if (remaining_ms < 1000) {
++        /* Expired, or less than 1s remains: deny (fail-closed, matching
++           auth_remaining_secs). Never grant unlimited on 0. */
++        if (auth_deadline_mono_ms) {
++          *auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++        }
++        *key_lookup = TURN_KEY_LOOKUP_EXPIRED;
++        clean_secrets_list(&sl);
++        return ret;
++      }
++      if (remaining_ms > (INT64_MAX - mono_now)) {
++        if (auth_deadline_mono_ms) {
++          *auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++        }
++        *key_lookup = TURN_KEY_LOOKUP_EXPIRED;
++        clean_secrets_list(&sl);
++        return ret;
++      }
++      if (auth_deadline_mono_ms) {
++        *auth_deadline_mono_ms = mono_now + remaining_ms;
++      }
++      const int64_t remaining_s = remaining_ms / 1000;
++      if (remaining_s > (int64_t)0x7FFFFFFF) {
+         *max_session_time = 0x7FFFFFFF;
+       } else {
+-        *max_session_time = (int)remaining;
++        *max_session_time = (int)remaining_s;
+       }
+     }
+ 
+@@ -689,6 +762,7 @@
+   am->ct = ct;
+   am->in_oauth = in_oauth;
+   am->out_oauth = *out_oauth;
++  am->auth_deadline_mono_ms = 0;
+   STRCPY(am->username, usname);
+   STRCPY(am->realm, realm);
+   am->resume_func = resume;
+diff --git a/src/apps/relay/userdb.h b/src/apps/relay/userdb.h
+--- a/src/apps/relay/userdb.h
++++ b/src/apps/relay/userdb.h
+@@ -85,6 +85,10 @@
+   int in_oauth;
+   int out_oauth;
+   int max_session_time;
++  /* Monotonic authorization deadline captured at credential observation
++   * (get_user_key time), before any auth-queue delay. Consumed only after
++   * real key verification. 0 = none, TURN_AUTH_DEADLINE_FAIL = deny. */
++  int64_t auth_deadline_mono_ms;
+   uint8_t username[STUN_MAX_USERNAME_SIZE + 1];
+   uint8_t realm[STUN_MAX_REALM_SIZE + 1];
+   hmackey_t key;
+@@ -183,8 +187,8 @@
+ /////////// USER DB CHECK //////////////////
+ 
+ /* On failure, *key_lookup tells the caller why the lookup failed. */
+-int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *uname, uint8_t *realm, hmackey_t key,
+-                 ioa_network_buffer_handle nbh, turn_key_lookup_result *key_lookup);
++int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, int64_t *auth_deadline_mono_ms, uint8_t *uname,
++                 uint8_t *realm, hmackey_t key, ioa_network_buffer_handle nbh, turn_key_lookup_result *key_lookup);
+ uint8_t *start_user_check(turnserver_id id, turn_credential_type ct, int in_oauth, int *out_oauth, uint8_t *usname,
+                           uint8_t *realm, get_username_resume_cb resume, ioa_net_data *in_buffer, uint64_t ctxkey,
+                           int *postpone_reply);
+diff --git a/src/server/ns_turn_server.c b/src/server/ns_turn_server.c
+--- a/src/server/ns_turn_server.c
++++ b/src/server/ns_turn_server.c
+@@ -190,7 +190,16 @@
+   if (remain_ms < 1000) {
+     return -1;
+   }
++  /* Ceil so a fractional remainder is not floored into an early cut
++     (5.9s remains -> 6). Timers still bind to min(grant, auth_ms). */
+   int64_t secs = remain_ms / 1000;
++  if ((remain_ms % 1000) != 0) {
++    if (secs >= 0x7FFFFFFF) {
++      secs = 0x7FFFFFFF;
++    } else {
++      secs += 1;
++    }
++  }
+   if (secs > 0x7FFFFFFF) {
+     secs = 0x7FFFFFFF;
+   }
+@@ -3671,9 +3680,9 @@
+ }
+ 
+ static void resume_processing_after_username_check(int success, turn_key_lookup_result key_lookup, int oauth,
+-                                                   int max_session_time, hmackey_t hmackey, password_t pwd,
+-                                                   turn_turnserver *server, uint64_t ctxkey, ioa_net_data *in_buffer,
+-                                                   uint8_t *realm) {
++                                                   int max_session_time, int64_t auth_deadline_mono_ms, hmackey_t hmackey,
++                                                   password_t pwd, turn_turnserver *server, uint64_t ctxkey,
++                                                   ioa_net_data *in_buffer, uint8_t *realm) {
+ 
+   if (server && in_buffer && in_buffer->nbh) {
+ 
+@@ -3687,28 +3696,21 @@
+         memcpy(ss->hmackey, hmackey, sizeof(hmackey_t));
+         ss->hmackey_set = 1;
+         ss->oauth = oauth;
+-        /* Freeze the authorization deadline once per authenticated session.
+-           Refresh reuses cached credentials and must never re-grant this.
+-           Clock fault / overflow fail closed: never deadline 0 (unlimited). */
+-        {
+-          const int64_t now_ms = turn_monotonic_ms();
+-          if (now_ms == TURN_MONOTONIC_MS_FAIL) {
+-            ss->auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
+-            ss->max_session_time_auth = 0;
+-          } else if (max_session_time > 0) {
+-            const int64_t dur_ms = ((int64_t)max_session_time) * 1000;
+-            if ((dur_ms / 1000) != (int64_t)max_session_time || (now_ms > (INT64_MAX - dur_ms))) {
+-              ss->auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
+-              ss->max_session_time_auth = 0;
+-            } else {
+-              ss->auth_deadline_mono_ms = now_ms + dur_ms;
+-              ss->max_session_time_auth = (turn_time_t)max_session_time;
+-            }
+-          } else {
+-            /* Non-REST unlimited kept separate; only true 0 stays no-bound. */
+-            ss->auth_deadline_mono_ms = 0;
+-            ss->max_session_time_auth = (turn_time_t)max_session_time;
+-          }
++        /* Adopt the monotonic deadline captured at credential observation
++           (before any auth-queue delay). Trust/authentication only here,
++           after real key verification. Refresh reuses cached credentials
++           and must never re-grant this. Clock fault / overflow fail closed:
++           never deadline 0 (unlimited). */
++        if (auth_deadline_mono_ms == TURN_AUTH_DEADLINE_FAIL || auth_deadline_mono_ms < 0) {
++          ss->auth_deadline_mono_ms = TURN_AUTH_DEADLINE_FAIL;
++          ss->max_session_time_auth = 0;
++        } else if (auth_deadline_mono_ms > 0) {
++          ss->auth_deadline_mono_ms = auth_deadline_mono_ms;
++          ss->max_session_time_auth = (turn_time_t)max_session_time;
++        } else {
++          /* Non-REST unlimited kept separate; only true 0 stays no-bound. */
++          ss->auth_deadline_mono_ms = 0;
++          ss->max_session_time_auth = (turn_time_t)max_session_time;
+         }
+         memcpy(ss->pwd, pwd, sizeof(password_t));
+         if (realm && realm[0] && strcmp((char *)realm, ss->realm_options.name)) {
+@@ -5121,8 +5123,10 @@
+       lifetime = (uint32_t) * (server->max_allocate_lifetime);
+     }
+ 
+-    /* Destroy the relay AT the authorization bound: cap the lifetime timer
+-       to the remaining monotonic authorization, with millisecond precision. */
++    /* Destroy at min(granted lifetime, auth deadline). Never substitute the
++       auth remainder for a shorter server/client grant (that let a 5s cap
++       forward past its advertised lifetime). Auth-fraction grants use ceil
++       seconds so a 5.9s remainder is not floored into an early 5s cut. */
+     {
+       int timer_secs = (int)lifetime;
+       int timer_ms = 0;
+@@ -5135,7 +5139,7 @@
+           return -1;
+         }
+         int64_t want_ms = ((int64_t)lifetime) * 1000;
+-        if (want_ms > auth_ms) {
++        if (auth_ms < want_ms) {
+           want_ms = auth_ms;
+         }
+         timer_secs = (int)(want_ms / 1000);
+@@ -5146,17 +5150,16 @@
+           IOA_CLOSE_SOCKET(newelem->s);
+           return -1;
+         }
+-        if (lifetime > (uint32_t)(want_ms / 1000) && want_ms % 1000) {
+-          /* Report only whole seconds that fit before the bound. */
+-          lifetime = (uint32_t)(want_ms / 1000);
+-          if (lifetime < 1) {
+-            *err_code = 401;
+-            *reason = (const uint8_t *)"Credentials have expired (authorization deadline)";
+-            IOA_CLOSE_SOCKET(newelem->s);
+-            return -1;
+-          }
+-        } else if (want_ms / 1000 < (int64_t)lifetime) {
+-          lifetime = (uint32_t)(want_ms / 1000);
++        /* Report only whole seconds that fit before the bound. */
++        const uint32_t fit = (uint32_t)(want_ms / 1000);
++        if (fit < 1) {
++          *err_code = 401;
++          *reason = (const uint8_t *)"Credentials have expired (authorization deadline)";
++          IOA_CLOSE_SOCKET(newelem->s);
++          return -1;
++        }
++        if (fit < lifetime) {
++          lifetime = fit;
+         }
+       }
+       ioa_timer_handle ev = set_ioa_timer(server->e, timer_secs, timer_ms, client_ss_allocation_timeout_handler, newelem,
+@@ -5182,13 +5185,52 @@
+   UNUSED_ARG(out_reservation_token);
+   UNUSED_ARG(err_code);
+ 
++  if (!server || !ss) {
++    return -1;
++  }
++
+   allocation *a = get_allocation_ss(ss);
+ 
+-  if (server && ss && is_allocation_valid(a)) {
+-
+-    if (lifetime < 1) {
+-      lifetime = 1;
+-    }
++  /* RFC 5766 7.2: a Refresh with lifetime=0 deletes the allocation now.
++     Do not bump 0->1: that left the relay socket forwarding after an
++     authenticated delete. Close both families (idempotent across the
++     per-family call sites) and invalidate so no further Send/forwarding
++     occurs. The caller still sends the success response on the client
++     socket; do not re-enter shutdown from inside this request. */
++  if (lifetime < 1) {
++    set_allocation_family_invalid(a, AF_INET);
++    set_allocation_family_invalid(a, AF_INET6);
++    /* Drop permission/channel authorization state so a replacement allocation
++       on this session cannot inherit stale CreatePermission/ChannelBind
++       rights. Session/owner/quota stay intact; no shutdown re-entry here. */
++    {
++      turn_permission_hashtable *pmap = allocation_get_turn_permission_hashtable(a);
++      if (pmap) {
++        for (size_t b = 0; b < TURN_PERMISSION_HASHTABLE_SIZE; ++b) {
++          turn_permission_array *parray = &(pmap->table[b]);
++          for (size_t i = 0; i < TURN_PERMISSION_ARRAY_SIZE; ++i) {
++            turn_permission_slot *slot = &(parray->main_slots[i]);
++            if (slot->info.allocated) {
++              turn_permission_clean(&(slot->info));
++            }
++          }
++          if (parray->extra_slots) {
++            for (size_t i = 0; i < parray->extra_sz; ++i) {
++              turn_permission_slot *slot = parray->extra_slots[i];
++              if (slot && slot->info.allocated) {
++                turn_permission_clean(&(slot->info));
++              }
++            }
++          }
++        }
++      }
++      ch_map_clean(&(a->chns));
++    }
++    set_allocation_valid(a, false);
++    return 0;
++  }
++
++  if (is_allocation_valid(a)) {
+ 
+     int timer_secs = (int)lifetime;
+     int timer_ms = 0;
+@@ -5198,8 +5240,10 @@
+         destroy_allocation_at_auth_bound(server, ss);
+         return -1;
+       }
++      /* min(granted lifetime ms, precise auth deadline). Do not extend a
++         shorter server/client grant to the auth remainder. */
+       int64_t want_ms = ((int64_t)lifetime) * 1000;
+-      if (want_ms > auth_ms) {
++      if (auth_ms < want_ms) {
+         want_ms = auth_ms;
+       }
+       timer_secs = (int)(want_ms / 1000);
+@@ -5208,12 +5252,13 @@
+         destroy_allocation_at_auth_bound(server, ss);
+         return -1;
+       }
+-      if (want_ms / 1000 < (int64_t)lifetime) {
+-        lifetime = (uint32_t)(want_ms / 1000);
+-        if (lifetime < 1) {
+-          destroy_allocation_at_auth_bound(server, ss);
+-          return -1;
+-        }
++      const uint32_t fit = (uint32_t)(want_ms / 1000);
++      if (fit < 1) {
++        destroy_allocation_at_auth_bound(server, ss);
++        return -1;
++      }
++      if (fit < lifetime) {
++        lifetime = fit;
+       }
+     }
+ 
+diff --git a/src/server/ns_turn_server.h b/src/server/ns_turn_server.h
+--- a/src/server/ns_turn_server.h
++++ b/src/server/ns_turn_server.h
+@@ -101,8 +101,9 @@
+ typedef struct _turn_turnserver turn_turnserver;
+ 
+ typedef void (*get_username_resume_cb)(int success, turn_key_lookup_result key_lookup, int oauth, int max_session_time,
+-                                       hmackey_t hmackey, password_t pwd, turn_turnserver *server, uint64_t ctxkey,
+-                                       ioa_net_data *in_buffer, uint8_t *realm);
++                                       int64_t auth_deadline_mono_ms, hmackey_t hmackey, password_t pwd,
++                                       turn_turnserver *server, uint64_t ctxkey, ioa_net_data *in_buffer,
++                                       uint8_t *realm);
+ typedef uint8_t *(*get_user_key_cb)(turnserver_id id, turn_credential_type ct, int in_oauth, int *out_oauth,
+                                     uint8_t *uname, uint8_t *realm, get_username_resume_cb resume,
+                                     ioa_net_data *in_buffer, uint64_t ctxkey, int *postpone_reply);
