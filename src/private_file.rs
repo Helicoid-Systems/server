@@ -259,7 +259,7 @@ pub fn read_existing_private_file(
 
     #[cfg(unix)]
     {
-        unix_read_existing_private(&abs, max_bytes)
+        unix_read_existing_private(&abs, max_bytes, DirUse::RecoveryParent)
     }
     #[cfg(windows)]
     {
@@ -270,6 +270,38 @@ pub fn read_existing_private_file(
         let _ = (abs, max_bytes);
         Err(AppError::not_implemented(
             "reading an existing private file is not implemented on this platform",
+        ))
+    }
+}
+
+/// Read a systemd-provided credential through a held descriptor. The parent
+/// directory belongs to systemd, so its ownership differs from product
+/// credential stores; the credential file itself still has to be private and
+/// owned by this service's effective user.
+pub fn read_service_credential_file(
+    path: &Path,
+    max_bytes: usize,
+) -> AppResult<zeroize::Zeroizing<Vec<u8>>> {
+    if !cfg!(unix) {
+        return Err(AppError::not_implemented(
+            "systemd service credentials are available only on Unix",
+        ));
+    }
+    if max_bytes == 0 || max_bytes > MAX_PRIVATE_PAYLOAD_BYTES {
+        return Err(AppError::bad_request(
+            "service credential read bound is invalid",
+        ));
+    }
+    let abs = resolve_output_path(path)?;
+    #[cfg(unix)]
+    {
+        unix_read_existing_private(&abs, max_bytes, DirUse::CredentialParent)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = abs;
+        Err(AppError::not_implemented(
+            "systemd service credentials are available only on Unix",
         ))
     }
 }
@@ -522,6 +554,7 @@ fn unix_create_private_store_file(abs: &Path) -> AppResult<()> {
 fn unix_read_existing_private(
     abs: &Path,
     max_bytes: usize,
+    parent_policy: DirUse,
 ) -> AppResult<zeroize::Zeroizing<Vec<u8>>> {
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -533,7 +566,7 @@ fn unix_read_existing_private(
         .ok_or_else(|| AppError::bad_request("private file must have a file name"))?;
     let file_c = std::ffi::CString::new(file_name.as_bytes())
         .map_err(|_| AppError::bad_request("private file name contains NUL"))?;
-    let dir_fd = open_dir_nofollow(parent, DirUse::RecoveryParent)?;
+    let dir_fd = open_dir_nofollow(parent, parent_policy)?;
 
     // O_NONBLOCK keeps a FIFO (or other blocking special) from hanging the
     // open; the fd-based type check below then refuses it without reading.
@@ -648,6 +681,9 @@ pub(crate) enum DirUse {
     /// Credential-store parent: same as [`DirUse::RecoveryParent`], and the
     /// directory itself must be owner-only (0700-class).
     StoreParent,
+    /// Read-only runtime parent created and owned by systemd for service
+    /// credentials; the file is still checked against the service user.
+    CredentialParent,
 }
 
 #[cfg(unix)]
@@ -1248,10 +1284,15 @@ fn validate_dir_fd(fd: i32, use_kind: DirUse, euid: u32, name: &Path) -> AppResu
             handle_extended_acl(fd, false)?;
             Ok(())
         }
-        DirUse::RecoveryParent | DirUse::StoreParent => {
-            if !owned_by_us && !(owned_by_root && euid == 0) {
+        DirUse::RecoveryParent | DirUse::StoreParent | DirUse::CredentialParent => {
+            let owner_is_allowed = if use_kind == DirUse::CredentialParent {
+                trusted_owner
+            } else {
+                owned_by_us || (owned_by_root && euid == 0)
+            };
+            if !owner_is_allowed {
                 return Err(AppError::bad_request(format!(
-                    "recovery parent '{}' is not owned by the process principal; refusing write",
+                    "credential parent '{}' is not owned by root or the process principal",
                     name.display()
                 )));
             }

@@ -72,14 +72,15 @@ Unauthenticated liveness + authority readiness.
   "status": "ok",
   "accepting_authorized_operations": true,
   "schema_version": 1,
-  "storage_schema_version": 2,
+  "storage_schema_version": 18,
   "bootstrap_completed": true,
+  "recovery_quarantined": false,
   "features": {
     "local_accounts": true,
     "manager_enrollment": true,
     "scoped_inventory": true,
     "mfa": true,
-    "file_jobs": false,
+    "file_jobs": true,
     "security_recovery": false,
     "remote_control": false,
     "screen_observation": false
@@ -92,7 +93,7 @@ Unauthenticated liveness + authority readiness.
 | Field | Meaning | Value |
 | --- | --- | --- |
 | `schema_version` | **v1 HTTP wire contract version** | frozen at **1** — existing native clients assert `== 1`; do not change |
-| `storage_schema_version` | database storage schema version | tracks `db::SCHEMA_VERSION` (currently **2**) |
+| `storage_schema_version` | database storage schema version | tracks `db::SCHEMA_VERSION` (currently **18**) |
 
 Wire compatibility is explicit: v1 clients keep validating `schema_version == 1`.
 Storage upgrades are independent and never alter the wire contract version.
@@ -103,12 +104,19 @@ Health semantics (fail closed):
 | --- | --- | --- | --- |
 | Trust healthy **and** bootstrap completed | `ok` | `true` | `true` |
 | Bootstrap not completed (trust healthy) | `degraded` | `false` | `false` |
+| Restored deployment awaiting fresh local bootstrap | `degraded` | `false` | stored bootstrap value (false until bootstrap) |
 | Security State Unavailable (memory or durable) | `degraded` | `false` | real value if readable, else `false` |
 | Deployment row missing / trust record unreadable / invalid | `degraded` | `false` | `false` unless a prior readable value is retained |
 
 - `accepting_authorized_operations` is **never** `true` before bootstrap completes.
+- `recovery_quarantined` stays true after restore through fresh bootstrap and
+  MFA. Only an explicit, reviewed local recovery release clears the deployment
+  gate; restored accounts and endpoints remain individually quarantined.
+- Restore recovery refuses v1 bootstrap. It requires v2 bootstrap with a fresh Manager key and proof; restored accounts and Manager identities stay quarantined/revoked, and endpoints require fresh enrollment.
 - POST `/v1/bootstrap` remains allowed while trust state is healthy and bootstrap
-  is incomplete (`status` `degraded` is expected until first bootstrap).
+  is incomplete for initial setup (`status` `degraded` is expected). Restore
+  quarantine explicitly rejects v1 bootstrap and requires the v2 fresh-key/MFA
+  flow described above.
 - A missing deployment row **latches** Security State Unavailable (subsequent
   login/token creation return `503`); it does not merely return degraded while
   authority could still be issued.
@@ -250,6 +258,39 @@ Requires `manage_enrollment`. Pending managers cannot list or approve themselves
 
 ---
 
+## `GET /v1/accounts`
+
+Requires `manage_accounts`.
+
+**200**
+
+```json
+{
+  "accounts": [
+    {
+      "id": "8f2c…",
+      "username": "admin",
+      "state": "active",
+      "capabilities": {
+        "operate": true,
+        "manage_enrollment": true,
+        "manage_access": true,
+        "manage_accounts": true,
+        "manage_security": true
+      },
+      "revision": 1
+    }
+  ],
+  "max_page_size": 100
+}
+```
+
+The endpoint returns at most 100 accounts. Capability flags are the server's
+authorization source of truth; clients must not infer elevated authority from a
+displayed label.
+
+---
+
 ## `POST /v1/managers`
 
 Requires `manage_enrollment`. Registers a **pending** development manager
@@ -310,7 +351,8 @@ enrollment. Hard cap `max_page_size` = 100.
       "friendly_name": "Lab Mac",
       "platform": "macos",
       "enrollment_state": "pending",
-      "enrollment_epoch": 1
+      "enrollment_epoch": 1,
+      "groups": [{"id":"group-1","name":"West campus"}]
     }
   ],
   "scope_is_explicit": true,
@@ -320,6 +362,10 @@ enrollment. Hard cap `max_page_size` = 100.
 
 `platform`: `macos` | `windows` | `linux`.  
 `enrollment_state`: `pending` | `enrolled` | `quarantined` | `revoked`.
+`groups` contains flat organization labels for that computer only. The
+endpoint already applies the caller's per-computer access scope before adding
+these labels; group membership never grants inventory, observation, or
+operation access. Older servers may omit `groups`.
 
 An account with an empty explicit scope receives `"computers": []` (not a
 hidden full inventory).
@@ -363,6 +409,7 @@ Requires `manage_access`.
   "access_assignments": [
     {
       "id": "bb22…",
+      "account_id": "8f2c…",
       "capability": "operate",
       "computer_scope_all": false,
       "computer_ids": ["aa11…"],

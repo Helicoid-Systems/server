@@ -813,3 +813,110 @@ are **Not Verified** pending the new run. This is signed metadata structure
 verification only; actual binary architecture per declared package target,
 installed services, updates, security floors, rollback, recovery, platform
 signing and production release remain gated. No VM changes or public routes.
+
+
+## Passphrase-encrypted SQLite snapshots — 2026-10-22
+
+Added Unix `hs-server backup create|verify` commands. Creation uses SQLite
+`VACUUM INTO` for a consistent database snapshot, encrypts bounded 1 MiB
+records with AES-256-GCM under an Argon2id-derived per-archive key, reads the
+passphrase from stdin with terminal echo disabled, and publishes an owner-only
+archive without replacing an existing path. Verification authenticates every
+record and the terminal marker, decrypts only into a private temporary
+directory, and checks SQLite integrity, foreign keys, and the current schema.
+The package-signing authority is not reused as the archive key.
+
+This is a database-only primitive. It does not include TLS keys or host
+configuration and does not implement restore, backup schedules, deployment
+identity rotation, host cutover, or TUI lifecycle operations. A behavioral
+backup round trip and actual server-store operation were not run in this pass.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | **Passed** |
+| `cargo check --locked --all-targets` | **Passed** |
+| `cargo clippy --locked --all-targets -- -D warnings` | **Passed** |
+| `cargo build --locked` and backup subcommand help | **Passed** |
+| Go TUI `gofmt` and `go build ./...` | **Passed** |
+| Archive round-trip, tamper, wrong-passphrase, and restore behavior | **Not run** |
+| Scheduled backups and clean-host/two-host recovery | **Not implemented** |
+
+## Database-only restore — 2026-10-22 follow-up
+
+Added `hs-server backup restore --input ... --output ... --passphrase-stdin`.
+It decrypts into an owner-private temporary database, verifies authenticated
+records, SQLite integrity, foreign keys, and the exact current schema, then
+fences authority from the archived copy before atomically publishing to a new
+owner-private path. Restored manager and endpoint sessions are revoked;
+pending manager/endpoint/MFA challenges, bootstrap tokens, and unused endpoint
+invitations are invalidated; active interaction claims fail and their
+per-computer revisions advance. Existing destinations and incorrect
+passphrases fail before publishing.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | **Passed** |
+| Focused restore test: `restore_fences_prior_authority_and_never_overwrites_destination` | **Passed** (wrong passphrase, no output on failure, revocation/fencing, no overwrite) |
+| `cargo check --locked --all-targets` | **Passed** |
+| `cargo clippy --locked --all-targets -- -D warnings` | **Passed** |
+| `cargo run --locked --quiet -- backup restore --help` | **Passed** |
+| Go TUI `gofmt`, `go test ./...`, and `go build ./...` | **Passed** |
+
+This restores one SQLite database file only. It does not package TLS or
+signing keys, switch the service to the restored path, schedule backups, or
+fence a still-running source host. The TUI now launches one-shot create,
+verify, and restore commands in a protected terminal; scheduled backups and
+service switching remain unavailable. Clean-host and two-host cutover
+acceptance remain **Not Verified**.
+
+## Deployment grant-signing key custody — 2026-10-22 follow-up
+
+Schema v16 stores a deployment-local Ed25519 secret in the server database,
+which is created in the verified private-store path and is never returned over
+HTTP. The new `GET /v2/deployment/authority` endpoint exposes only the matching
+public verification key. Explicit v15-to-v16 migration provisions the key only
+when the store's private-file boundary is verified; an unverified Windows
+legacy store retains a null key and the endpoint refuses to publish one.
+Restore rotates this key in the same transaction that fences the archived
+authority, before the restored database is published. This is key custody and
+restore fencing only: no signed interaction grant is issued, no endpoint
+verifies it, and the native channel is not admitted.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check`, `cargo check --locked --all-targets`, and Clippy with `-D warnings` | **Passed** |
+| `cargo test --locked` with socket-binding cases skipped and one test thread | **Passed** for the remaining server tests; nine loopback/TLS cases were skipped because socket bind returns `EPERM` in this sandbox |
+| Migration, missing/unverified key, private-store reopen, restore rotation, and HTTP public-key tests | **Passed** |
+| `authority-lab` formatting, 167 runtime tests, four compile-fail doctests, and Clippy | **Passed**; candidate remains unfrozen and unintegrated |
+| WebRTC generated-header and wrapper-contract checks; standalone channel-binding C++ test | **Passed** |
+| Pinned WebRTC GN build | **Not completed**: the scratch checkout lacks `build/dotfile_settings.gni` and a valid pinned `depot_tools` Git checkout; no native media build is claimed |
+
+## Security audit metadata and TUI — 2026-10-22 follow-up
+
+Added schema-v20 metadata-only audit events with a configurable 1–3650 day
+retention window, 30-day default, a 100,000-event storage bound, and a bounded
+target list. Successful security-sensitive server mutations append their
+allowlisted event in the same SQLite transaction; capacity or persistence
+failure rolls the mutation back. Events are paginated and filterable through
+fresh-MFA security-admin routes. The service prunes expired events during its
+60-second maintenance cycle and before new audit inserts. The Manager has an
+Audit workspace with refresh, older-page loading, and explicit retention
+controls. Group creation, rename, membership changes, and deletion now join the
+transactional event writers, as does the start of self-service MFA enrollment.
+The Go TUI adds `audit recent`, cursor-based `audit page`, and an interactive
+retention review/update. Each operation creates and revokes a short-lived
+MFA-backed session, and validates bounded metadata before printing. Support
+exports continue to exclude audit rows.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all` and `cargo check --locked --offline` | **Passed** |
+| Go TUI `gofmt` and `go build` | **Passed** |
+| Test suites | **Not run** in this follow-up |
+| Manager Qt build | **Not verified**; Qt 6.10 and Ninja are unavailable in the current build environment |
+| Denied-attempt coverage and audit acceptance across deployed platforms | **Not complete** |
+
+No database migration was run against an installation. Existing stores require
+the explicit, backup-protected schema migration before these routes are
+available. This change does not establish installed Manager behavior or
+deployment/platform acceptance.

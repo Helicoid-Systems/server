@@ -15,19 +15,23 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.10"
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs", "logging"] }
+rustls-webpki = { version = "0.103.15", default-features = false, features = ["std"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ed25519-dalek = { version = "2", features = ["serde"] }
+ed25519-dalek = { version = "2", features = ["serde", "zeroize"] }
 hex = "0.4"
+hs-core = { path = "../core" }
 totp-rs = { version = "=5.5.1", default-features = false, features = ["zeroize"] }
 libc = "0.2"
 sha2 = "0.10"
 subtle = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "io-util", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "io-util", "time", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tough = { version = "=0.24.0", features = ["http"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = { version = "1", features = ["derive"] }
 
@@ -43,6 +47,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_System_SystemServices",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+ring = "0.17.14"
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", features = ["serde"] }

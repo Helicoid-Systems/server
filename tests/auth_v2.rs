@@ -11,6 +11,7 @@ use hs_server::crypto::{
     totp_generate_at, totp_time_step, unix_now,
 };
 use hs_server::db;
+use hs_server::error::ErrorCode;
 use hs_server::models::*;
 use hs_server::service::Service;
 use hs_server::AppError;
@@ -156,6 +157,46 @@ fn bootstrap_enrolled(service: &Service) -> Enrolled {
 }
 
 // ----- bootstrap enrollment -----
+
+#[test]
+fn bootstrap_token_rotation_revokes_previous_token_and_stops_after_completion() {
+    let service = service();
+    let first = service.create_bootstrap_token().expect("first token");
+    let current = service.create_bootstrap_token().expect("rotated token");
+
+    let stale_attempt = service.bootstrap_v2(BootstrapV2Request {
+        bootstrap_token: first,
+        username: "admin".into(),
+        password: PASSWORD.into(),
+        manager_public_key: None,
+        manager_proof: None,
+        manager_friendly_name: None,
+    });
+    assert!(stale_attempt.is_err(), "rotated token must no longer work");
+
+    let bootstrap = service
+        .bootstrap_v2(BootstrapV2Request {
+            bootstrap_token: current,
+            username: "admin".into(),
+            password: PASSWORD.into(),
+            manager_public_key: None,
+            manager_proof: None,
+            manager_friendly_name: None,
+        })
+        .expect("current token remains usable");
+    assert_eq!(bootstrap.account_state, "pending_mfa");
+
+    let after_completion = service
+        .create_bootstrap_token()
+        .expect_err("completed bootstrap must not mint another token");
+    assert!(matches!(
+        after_completion,
+        AppError::Api {
+            code: ErrorCode::Conflict,
+            ..
+        }
+    ));
+}
 
 #[test]
 fn bootstrap_v2_creates_inactive_until_mfa_confirmed() {

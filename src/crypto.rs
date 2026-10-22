@@ -248,6 +248,135 @@ pub fn auth_challenge_proof_message(
     .into_bytes()
 }
 
+/// Domain-separated proof for enrolling a new manager device key from an
+/// already-authenticated enrollment administrator.
+pub fn manager_enrollment_proof_message(
+    deployment_id: &str,
+    manager_public_key_hex: &str,
+    friendly_name: &str,
+) -> Vec<u8> {
+    format!(
+        "hs-manager-enroll-v2|deployment:{deployment_id}|manager:{manager_public_key_hex}|friendly_name:{friendly_name}"
+    )
+    .into_bytes()
+}
+
+/// Domain-separated proof that an endpoint possesses the key it is enrolling.
+///
+/// The enrollment code hash, invitation ID, and server-owned deployment key
+/// prevent transferring a proof between invitations or deployments. The
+/// endpoint can compute the code hash locally; the server never sends it.
+pub fn endpoint_enrollment_proof_message(
+    deployment_id: &str,
+    invitation_id: &str,
+    enrollment_code_hash: &str,
+    endpoint_public_key_hex: &str,
+) -> Vec<u8> {
+    format!(
+        "hs-endpoint-enroll-v2|deployment:{deployment_id}|invitation:{invitation_id}|code_hash:{enrollment_code_hash}|endpoint:{endpoint_public_key_hex}"
+    )
+    .into_bytes()
+}
+
+/// Endpoint possession proof for requesting a session challenge. The bounded
+/// timestamp and unique nonce prevent an unauthenticated caller from filling
+/// the durable challenge store using only a computer ID.
+pub fn endpoint_session_begin_proof_message(
+    deployment_id: &str,
+    computer_id: &str,
+    issued_at_unix: i64,
+    client_nonce: &str,
+) -> Vec<u8> {
+    format!(
+        "hs-endpoint-session-begin-v1|deployment:{deployment_id}|computer:{computer_id}|issued_at:{issued_at_unix}|nonce:{client_nonce}"
+    )
+    .into_bytes()
+}
+
+/// D29 session-begin proof binding the endpoint to a stable OS account.
+pub fn endpoint_session_begin_proof_message_for_user(
+    deployment_id: &str,
+    computer_id: &str,
+    local_user_id: &str,
+    issued_at_unix: i64,
+    client_nonce: &str,
+) -> Vec<u8> {
+    format!(
+        "hs-endpoint-session-begin-v2|deployment:{deployment_id}|computer:{computer_id}|local_user:{local_user_id}|issued_at:{issued_at_unix}|nonce:{client_nonce}"
+    )
+    .into_bytes()
+}
+
+/// D29 v3 begin proof binding both a stable OS identity and its OS-provided
+/// display label. The label is hex encoded so it cannot alter message framing.
+pub fn endpoint_session_begin_proof_message_for_user_label(
+    deployment_id: &str,
+    computer_id: &str,
+    local_user_id: &str,
+    local_user_display_name: &str,
+    issued_at_unix: i64,
+    client_nonce: &str,
+) -> Vec<u8> {
+    let display_name_hex = hex::encode(local_user_display_name.as_bytes());
+    format!(
+        "hs-endpoint-session-begin-v3|deployment:{deployment_id}|computer:{computer_id}|local_user:{local_user_id}|local_user_display_name:{display_name_hex}|issued_at:{issued_at_unix}|nonce:{client_nonce}"
+    )
+    .into_bytes()
+}
+
+/// Domain-separated completion proof for the server-issued endpoint session
+/// challenge. The deployment, challenge token hash, computer, and approved
+/// enrollment epoch are all bound to the signature.
+pub fn endpoint_session_proof_message(
+    deployment_id: &str,
+    challenge_id: &str,
+    challenge_token_hash: &str,
+    computer_id: &str,
+    enrollment_epoch: i64,
+    endpoint_public_key_hex: &str,
+) -> Vec<u8> {
+    format!(
+        "hs-endpoint-session-v1|deployment:{deployment_id}|challenge:{challenge_id}|token_hash:{challenge_token_hash}|computer:{computer_id}|epoch:{enrollment_epoch}|endpoint:{endpoint_public_key_hex}"
+    )
+    .into_bytes()
+}
+
+/// D29 completion proof binding the server challenge to the same OS account.
+pub fn endpoint_session_proof_message_for_user(
+    deployment_id: &str,
+    challenge_id: &str,
+    challenge_token_hash: &str,
+    computer_id: &str,
+    enrollment_epoch: i64,
+    endpoint_public_key_hex: &str,
+    local_user_id: &str,
+) -> Vec<u8> {
+    format!(
+        "hs-endpoint-session-v2|deployment:{deployment_id}|challenge:{challenge_id}|token_hash:{challenge_token_hash}|computer:{computer_id}|epoch:{enrollment_epoch}|endpoint:{endpoint_public_key_hex}|local_user:{local_user_id}"
+    )
+    .into_bytes()
+}
+
+/// D29 v3 completion proof binding the same stable user identity and label to
+/// the one-use challenge and endpoint session.
+#[allow(clippy::too_many_arguments)] // The protocol proof binds each field explicitly.
+pub fn endpoint_session_proof_message_for_user_label(
+    deployment_id: &str,
+    challenge_id: &str,
+    challenge_token_hash: &str,
+    computer_id: &str,
+    enrollment_epoch: i64,
+    endpoint_public_key_hex: &str,
+    local_user_id: &str,
+    local_user_display_name: &str,
+) -> Vec<u8> {
+    let display_name_hex = hex::encode(local_user_display_name.as_bytes());
+    format!(
+        "hs-endpoint-session-v3|deployment:{deployment_id}|challenge:{challenge_id}|token_hash:{challenge_token_hash}|computer:{computer_id}|epoch:{enrollment_epoch}|endpoint:{endpoint_public_key_hex}|local_user:{local_user_id}|local_user_display_name:{display_name_hex}"
+    )
+    .into_bytes()
+}
+
 /// Domain-separated message for a v2 bootstrap manager-key proof.
 ///
 /// Binds the proof to this deployment and this bootstrap token hash.
@@ -420,9 +549,20 @@ mod tests {
         let a = auth_challenge_proof_message("dep_1", "c1", "session", "aa");
         let b = bootstrap_manager_proof_message("dep_1", "th", "aa");
         let c = auth_challenge_proof_message("dep_2", "c1", "session", "aa");
+        let endpoint = endpoint_enrollment_proof_message("dep_1", "invite-1", "hash", "aa");
+        let other_endpoint = endpoint_enrollment_proof_message("dep_2", "invite-1", "hash", "aa");
         assert_ne!(a, b);
         assert_ne!(a, c, "deployment id must be part of the signed message");
+        assert_ne!(
+            a, endpoint,
+            "endpoint enrollment has a separate signature domain"
+        );
+        assert_ne!(
+            endpoint, other_endpoint,
+            "endpoint proof is deployment-bound"
+        );
         assert!(a.starts_with(b"hs-auth-v2|deployment:"));
         assert!(b.starts_with(b"hs-bootstrap-v2|deployment:"));
+        assert!(endpoint.starts_with(b"hs-endpoint-enroll-v2|deployment:"));
     }
 }

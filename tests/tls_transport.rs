@@ -616,6 +616,27 @@ fn loopback_bind_is_accepted_by_guard_and_material_loads() {
         tls::validate_serve_tls_inputs("127.0.0.1:8920", &cert, &key).expect("loopback + material");
     assert!(transport.addr().ip().is_loopback());
     assert_eq!(transport.addr().port(), 8920);
+    assert!(!transport.serves_network_routes());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn network_tls_bind_requires_opt_in_and_selects_v2_routes() {
+    let (_dir, base) = private_tempdir();
+    let pki = test_pki(&["localhost"]);
+    let (cert, key) = write_tls_material(&base, &pki);
+
+    let refused = match tls::validate_serve_tls_inputs("192.168.1.10:8920", &cert, &key) {
+        Err(error) => error,
+        Ok(_) => panic!("nonloopback listener needs explicit opt-in"),
+    };
+    assert!(refused.to_string().contains("loopback"));
+
+    let transport =
+        tls::validate_serve_tls_inputs_with_network("192.168.1.10:8920", &cert, &key, true)
+            .expect("explicit network TLS listener");
+    assert_eq!(transport.addr().to_string(), "192.168.1.10:8920");
+    assert!(transport.serves_network_routes());
 }
 
 /// Portable constant check: default bind is literal loopback :8920 on every
