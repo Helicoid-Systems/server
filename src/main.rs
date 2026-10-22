@@ -326,6 +326,12 @@ enum InstallerAction {
         #[arg(long, default_value = "/opt/helicoid/.installer")]
         state_dir: String,
     },
+    /// Cancel the exact v2 install operation and remove only journal-owned resources.
+    CancelV2 {
+        /// Path to the installer state directory.
+        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        state_dir: String,
+    },
     /// Read v2 durable operation state without changing the host.
     StatusV2 {
         /// Path to the installer state directory.
@@ -1440,6 +1446,18 @@ fn run_installer(action: InstallerAction) -> AppResult<()> {
             refresh_systemd_readiness(&mut result);
             serde_json::to_value(result).map_err(|err| {
                 hs_server::AppError::internal(format!("serialize v2 operation result: {err}"))
+            })?
+        }
+        InstallerAction::CancelV2 { state_dir } => {
+            let input: lifecycle_v2::CancelInput =
+                serde_json::from_str(&stdin_buf).map_err(|err| {
+                    hs_server::AppError::bad_request(format!(
+                        "invalid v2 cancellation input: {err}"
+                    ))
+                })?;
+            let result = machine::cancel_v2(&adapter, &input, std::path::Path::new(&state_dir))?;
+            serde_json::to_value(result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize v2 cancellation result: {err}"))
             })?
         }
         InstallerAction::StatusV2 { state_dir } => {

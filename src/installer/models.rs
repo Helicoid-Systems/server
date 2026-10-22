@@ -444,6 +444,7 @@ pub enum ResourceStatus {
     Intent,
     Completed,
     Failed,
+    RolledBack,
 }
 
 // ---------------------------------------------------------------------------
