@@ -43,6 +43,7 @@ const BACKUP_TIMER_UNIT: &str = "hs-server-backup.timer";
 const BACKUP_CONTROL_SOCKET_UNIT: &str = "hs-server-backup-control.socket";
 const BACKUP_CONTROL_SERVICE_UNIT: &str = "hs-server-backup-control@.service";
 const BACKUP_CONTROL_SOCKET_PATH: &str = "/run/helicoid-backup-control/backup-control.sock";
+const CANCELLATION_REQUEST_FILE: &str = "cancel-request-v2.json";
 const COMPOSE_LOG_OUTPUT_LIMIT: usize = 256 * 1024;
 const COMPOSE_LOG_COMMAND_TIMEOUT_SECS: u64 = 5;
 pub const BACKUP_CREDENTIAL_PATH: &str = "/etc/helicoid/backup-passphrase.cred";
@@ -512,11 +513,6 @@ pub fn lifecycle_capabilities_v2() -> v2::LifecycleCapabilities {
             .to_string(),
     );
     reasons_unavailable.insert(
-        "cancellation".to_string(),
-        "the installer journals resumable phases but has no safe cancellation operation"
-            .to_string(),
-    );
-    reasons_unavailable.insert(
         "online_update".to_string(),
         "signed service updates, persistent downgrade protection, schema compatibility review, and health-gated binary rollback are not implemented".to_string(),
     );
@@ -555,12 +551,13 @@ pub fn lifecycle_capabilities_v2() -> v2::LifecycleCapabilities {
             LifecycleAction::Plan,
             LifecycleAction::Install,
             LifecycleAction::Resume,
+            LifecycleAction::Cancel,
             LifecycleAction::Inspect,
             LifecycleAction::Remove,
         ],
         custom_storage_directories: true,
         durable_operation_journal: true,
-        cancellation: false,
+        cancellation: on_linux,
         online_update: false,
         backup_and_restore: false,
         public_edge_integration: false,
@@ -2033,6 +2030,17 @@ pub fn remove_v2(
         None
     };
 
+    if let Some(record) = existing_record.as_ref() {
+        if record.action == v2::LifecycleAction::Install
+            && cancellation_requested_for(adapter, state_dir, &record.operation_id)?
+        {
+            return Err(AppError::conflict(
+                "an install cancellation is pending; finish its rollback before starting removal",
+                None,
+            ));
+        }
+    }
+
     if existing_record.is_none()
         && (input.configuration.storage.data_directory != DATA_SUBDIR
             || input.configuration.storage.backup_directory != BACKUP_DIR)
@@ -2303,6 +2311,7 @@ fn validate_v2_removal_state_dir(adapter: &dyn CommandAdapter, state_dir: &Path)
         "operation-v2.json",
         "installed.json",
         "removal-v2.json",
+        CANCELLATION_REQUEST_FILE,
     ] {
         let path = state_dir.join(name);
         let path_text = path
@@ -2340,6 +2349,373 @@ fn owned_service_resources_remain(adapter: &dyn CommandAdapter) -> AppResult<boo
         || user_exists
         || path_present(adapter, &binary_path)
         || path_present(adapter, &unit_path))
+}
+
+fn cancellation_request_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(CANCELLATION_REQUEST_FILE)
+}
+
+fn read_cancellation_request(
+    adapter: &dyn CommandAdapter,
+    state_dir: &Path,
+) -> AppResult<Option<v2::CancellationRequest>> {
+    let path = cancellation_request_path(state_dir);
+    let metadata = match adapter.symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if is_missing_path_error(&error) => return Ok(None),
+        Err(error) => {
+            return Err(AppError::internal(format!(
+                "inspect installer cancellation request: {error}"
+            )))
+        }
+    };
+    if metadata.is_symlink || metadata.is_dir || metadata.len == 0 || metadata.len > 4096 {
+        return Err(AppError::forbidden(
+            "installer cancellation request has an invalid file shape",
+        ));
+    }
+    let bytes = adapter.read_file(&path).map_err(|error| {
+        AppError::internal(format!("read installer cancellation request: {error}"))
+    })?;
+    let request: v2::CancellationRequest = serde_json::from_slice(&bytes).map_err(|error| {
+        AppError::internal(format!("corrupt installer cancellation request: {error}"))
+    })?;
+    if request.contract_version != v2::CONTRACT_VERSION
+        || uuid::Uuid::parse_str(&request.operation_id).is_err()
+        || uuid::Uuid::parse_str(&request.cleanup_operation_id).is_err()
+    {
+        return Err(AppError::unprocessable(
+            "installer cancellation request has an invalid identity or contract version",
+        ));
+    }
+    Ok(Some(request))
+}
+
+fn cancellation_requested_for(
+    adapter: &dyn CommandAdapter,
+    state_dir: &Path,
+    operation_id: &str,
+) -> AppResult<bool> {
+    Ok(read_cancellation_request(adapter, state_dir)?
+        .is_some_and(|request| request.operation_id == operation_id))
+}
+
+fn create_cancellation_request(
+    adapter: &dyn CommandAdapter,
+    state_dir: &Path,
+    operation_id: &str,
+) -> AppResult<v2::CancellationRequest> {
+    if let Some(request) = read_cancellation_request(adapter, state_dir)? {
+        if request.operation_id == operation_id {
+            return Ok(request);
+        }
+        return Err(AppError::conflict(
+            "another installer cancellation request is still recorded",
+            None,
+        ));
+    }
+
+    let request = v2::CancellationRequest {
+        contract_version: v2::CONTRACT_VERSION,
+        operation_id: operation_id.to_string(),
+        cleanup_operation_id: uuid::Uuid::new_v4().to_string(),
+        requested_at: adapter.now_iso8601(),
+    };
+    let bytes = serde_json::to_vec_pretty(&request)
+        .map_err(|error| AppError::internal(format!("serialize cancellation request: {error}")))?;
+    match adapter.write_new_private_file(&cancellation_request_path(state_dir), &bytes) {
+        Ok(()) => Ok(request),
+        Err(write_error) => {
+            if let Some(existing) = read_cancellation_request(adapter, state_dir)? {
+                if existing.operation_id == operation_id {
+                    return Ok(existing);
+                }
+                return Err(AppError::conflict(
+                    "another installer cancellation request won the write race",
+                    None,
+                ));
+            }
+            Err(AppError::internal(format!(
+                "persist installer cancellation request: {write_error}"
+            )))
+        }
+    }
+}
+
+fn remove_cancellation_request(
+    adapter: &dyn CommandAdapter,
+    state_dir: &Path,
+    operation_id: &str,
+) -> AppResult<()> {
+    let Some(request) = read_cancellation_request(adapter, state_dir)? else {
+        return Ok(());
+    };
+    if request.operation_id != operation_id {
+        return Ok(());
+    }
+    adapter
+        .remove_file(&cancellation_request_path(state_dir))
+        .map_err(|error| AppError::internal(format!("remove cancellation request: {error}")))
+}
+
+fn complete_cancellation_locked(
+    adapter: &dyn CommandAdapter,
+    state_dir: &Path,
+    record: &mut v2::OperationRecord,
+    request: &v2::CancellationRequest,
+) -> AppResult<()> {
+    if record.action != v2::LifecycleAction::Install || record.operation_id != request.operation_id
+    {
+        return Err(AppError::conflict(
+            "cancellation request does not identify the current install operation",
+            None,
+        ));
+    }
+
+    let journal_path = state_dir.join("journal.json");
+    if !path_present(adapter, &journal_path) {
+        record.outcome = Some(v2::OperationOutcome {
+            state: v2::OperationState::Cancelled,
+            result: v2::OperationResult {
+                code: "cancelled_before_host_changes".to_string(),
+                summary: "Installation was cancelled before an ownership journal was created; no host resources were recorded as created.".to_string(),
+                errors: vec![],
+                warnings: vec![],
+            },
+        });
+        persist_operation_record(adapter, state_dir, record)?;
+        remove_cancellation_request(adapter, state_dir, &record.operation_id)?;
+        return Ok(());
+    }
+
+    let journal_bytes = adapter.read_file(&journal_path).map_err(|error| {
+        AppError::internal(format!(
+            "read installer ownership journal for cancellation: {error}"
+        ))
+    })?;
+    let mut journal: Journal = serde_json::from_slice(&journal_bytes).map_err(|error| {
+        AppError::internal(format!(
+            "corrupt installer journal during cancellation: {error}"
+        ))
+    })?;
+    if journal.plan_digest != record.reviewed_plan_digest {
+        return Err(AppError::conflict(
+            "cancellation journal no longer matches the reviewed install plan",
+            None,
+        ));
+    }
+
+    let mut errors = Vec::new();
+    if record.configuration.deployment_kind == v2::DeploymentKind::LinuxCompose
+        && journal.phases.get("units").is_some_and(|phase| {
+            matches!(
+                phase.status,
+                PhaseStatus::InProgress | PhaseStatus::Completed | PhaseStatus::Failed
+            )
+        })
+    {
+        let cleanup_digest_input = serde_json::to_vec((
+            v2::CONTRACT_VERSION,
+            "cancel-install",
+            &record.configuration,
+            &record.reviewed_plan_digest,
+            &request.cleanup_operation_id,
+        ))
+        .map_err(|error| {
+            AppError::internal(format!("serialize Compose cancellation review: {error}"))
+        })?;
+        let cleanup_record = v2::OperationRecord {
+            contract_version: v2::CONTRACT_VERSION,
+            operation_id: request.cleanup_operation_id.clone(),
+            action: v2::LifecycleAction::Remove,
+            resource_operation_id: Some(record.operation_id.clone()),
+            reviewed_plan_digest: manifest::sha256_hex(&cleanup_digest_input),
+            configuration: record.configuration.clone(),
+            created_at: request.requested_at.clone(),
+            outcome: None,
+        };
+        errors.extend(remove_compose_resources(
+            adapter,
+            state_dir,
+            &cleanup_record,
+        )?);
+    }
+
+    let removal = remove_with_storage(
+        adapter,
+        &RemoveInput {
+            contract_version: CONTRACT_VERSION,
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            delete_data: false,
+            confirm: true,
+        },
+        &record.configuration.storage.data_directory,
+        &record.configuration.storage.backup_directory,
+    )?;
+    errors.extend(removal.errors);
+
+    journal.updated_at = adapter.now_iso8601();
+    if errors.is_empty() {
+        journal.current_phase = "cancelled".to_string();
+        for phase in journal.phases.values_mut() {
+            if phase.status != PhaseStatus::Pending {
+                phase.status = PhaseStatus::RolledBack;
+            }
+        }
+        for resource in &mut journal.resources {
+            if resource.status == ResourceStatus::Completed {
+                resource.status = ResourceStatus::RolledBack;
+            }
+        }
+        journal.resources_created = ResourcesCreated::default();
+        record.outcome = Some(v2::OperationOutcome {
+            state: v2::OperationState::Cancelled,
+            result: v2::OperationResult {
+                code: "cancelled".to_string(),
+                summary: format!(
+                    "Installation was cancelled and its owned service resources were removed. Data and backups remain at {} and {}.",
+                    record.configuration.storage.data_directory,
+                    record.configuration.storage.backup_directory
+                ),
+                errors: vec![],
+                warnings: vec![],
+            },
+        });
+    } else {
+        journal.current_phase = "cancellation_cleanup_required".to_string();
+        record.outcome = Some(v2::OperationOutcome {
+            state: v2::OperationState::AttentionRequired,
+            result: v2::OperationResult {
+                code: "cancellation_rollback_incomplete".to_string(),
+                summary: "Cancellation was requested, but some owned resources could not be removed. Data and backups remain preserved; retry cancellation after resolving the listed errors.".to_string(),
+                errors,
+                warnings: vec![],
+            },
+        });
+    }
+    save_journal(adapter, &journal_path, &journal)?;
+    persist_operation_record(adapter, state_dir, record)?;
+
+    if record
+        .outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.state == v2::OperationState::Cancelled)
+    {
+        let removal_journal = state_dir.join("removal-v2.json");
+        if path_present(adapter, &removal_journal) {
+            adapter.remove_file(&removal_journal).map_err(|error| {
+                AppError::internal(format!(
+                    "remove completed Compose cancellation journal: {error}"
+                ))
+            })?;
+        }
+        remove_cancellation_request(adapter, state_dir, &record.operation_id)?;
+    }
+    Ok(())
+}
+
+/// Cancel the current v2 install operation. A running installer receives a
+/// private durable request and stops at its next phase boundary; interrupted
+/// operations are rolled back synchronously under the lifecycle lock.
+pub fn cancel_v2(
+    adapter: &dyn CommandAdapter,
+    input: &v2::CancelInput,
+    state_dir: &Path,
+) -> AppResult<v2::OperationStatus> {
+    if input.contract_version != v2::CONTRACT_VERSION {
+        return Err(AppError::bad_request(format!(
+            "unsupported lifecycle contract_version: {} (expected {})",
+            input.contract_version,
+            v2::CONTRACT_VERSION
+        )));
+    }
+    validate_v2_configuration(&input.configuration)?;
+    if !input.confirm {
+        return Err(AppError::bad_request("cancel requires confirm: true"));
+    }
+    if !adapter
+        .query_is_root()
+        .map_err(|error| AppError::internal(format!("check host privileges: {error}")))?
+    {
+        return Err(AppError::forbidden(
+            "cancelling an installation requires a root terminal",
+        ));
+    }
+    validate_v2_removal_state_dir(adapter, state_dir)?;
+
+    let record_path = operation_record_path(state_dir);
+    if !path_present(adapter, &record_path) {
+        return Err(AppError::conflict(
+            "no durable install operation is available to cancel",
+            None,
+        ));
+    }
+    let record_bytes = adapter
+        .read_file(&record_path)
+        .map_err(|error| AppError::internal(format!("read installer operation record: {error}")))?;
+    let mut record: v2::OperationRecord =
+        serde_json::from_slice(&record_bytes).map_err(|error| {
+            AppError::internal(format!("corrupt installer operation record: {error}"))
+        })?;
+    if record.contract_version != v2::CONTRACT_VERSION
+        || record.configuration != input.configuration
+        || uuid::Uuid::parse_str(&record.operation_id).is_err()
+    {
+        return Err(AppError::conflict(
+            "operation record does not match the requested deployment configuration",
+            None,
+        ));
+    }
+    if record.operation_id != input.operation_id {
+        return Err(AppError::conflict(
+            "operation_id does not match the current installer operation",
+            None,
+        ));
+    }
+    if record.action != v2::LifecycleAction::Install {
+        return Err(AppError::conflict(
+            "only an install operation can be cancelled through this workflow",
+            None,
+        ));
+    }
+    if record.outcome.as_ref().is_some_and(|outcome| {
+        outcome.state == v2::OperationState::Completed
+            || outcome.state == v2::OperationState::Cancelled
+    }) {
+        return Err(AppError::conflict(
+            "the installer operation is already in a terminal state",
+            None,
+        ));
+    }
+
+    match adapter.acquire_lifecycle_operation_lock(state_dir) {
+        Err(LifecycleLockError::Busy) => {
+            create_cancellation_request(adapter, state_dir, &record.operation_id)?;
+            operation_status_v2(
+                adapter,
+                &v2::StatusInput {
+                    contract_version: v2::CONTRACT_VERSION,
+                    configuration: input.configuration.clone(),
+                },
+                state_dir,
+            )
+        }
+        Err(LifecycleLockError::Unavailable(error)) => Err(AppError::internal(format!(
+            "cannot acquire installer lifecycle lock for cancellation: {error}"
+        ))),
+        Ok(_operation_lock) => {
+            let request = create_cancellation_request(adapter, state_dir, &record.operation_id)?;
+            complete_cancellation_locked(adapter, state_dir, &mut record, &request)?;
+            operation_status_v2(
+                adapter,
+                &v2::StatusInput {
+                    contract_version: v2::CONTRACT_VERSION,
+                    configuration: input.configuration.clone(),
+                },
+                state_dir,
+            )
+        }
+    }
 }
 
 fn run_v2_operation(
@@ -2465,12 +2841,49 @@ fn run_v2_operation(
         }
     }
 
-    let record = load_or_create_operation_record(
+    let mut record = load_or_create_operation_record(
         adapter,
         state_dir,
         &input.configuration,
         &input.reviewed_plan_digest,
     )?;
+    if record.outcome.as_ref().is_some_and(|outcome| {
+        outcome.state == v2::OperationState::Cancelled
+            || outcome.result.code == "cancellation_rollback_incomplete"
+    }) {
+        return Err(AppError::conflict(
+            "this install operation has a cancellation request; finish cancellation before resuming",
+            None,
+        ));
+    }
+    if record
+        .outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.state == v2::OperationState::Completed)
+    {
+        return operation_status_v2(
+            adapter,
+            &v2::StatusInput {
+                contract_version: v2::CONTRACT_VERSION,
+                configuration: record.configuration.clone(),
+            },
+            state_dir,
+        );
+    }
+    if cancellation_requested_for(adapter, state_dir, &record.operation_id)? {
+        let request = read_cancellation_request(adapter, state_dir)?.ok_or_else(|| {
+            AppError::internal("installer cancellation request disappeared during resume")
+        })?;
+        complete_cancellation_locked(adapter, state_dir, &mut record, &request)?;
+        return operation_status_v2(
+            adapter,
+            &v2::StatusInput {
+                contract_version: v2::CONTRACT_VERSION,
+                configuration: record.configuration.clone(),
+            },
+            state_dir,
+        );
+    }
     let legacy_input = super::models::ApplyInput {
         contract_version: CONTRACT_VERSION,
         plan: input.plan.clone(),
@@ -2479,13 +2892,30 @@ fn run_v2_operation(
         package_dir: Some(input.package_dir.clone()),
         verify_key: Some(input.verify_key.clone()),
     };
-    let _ = apply_internal(
+    let apply_result = apply_internal(
         adapter,
         &legacy_input,
         state_dir,
         Some(&input.configuration),
         Some(&record.operation_id),
     )?;
+    if cancellation_requested_for(adapter, state_dir, &record.operation_id)? {
+        let request = read_cancellation_request(adapter, state_dir)?.ok_or_else(|| {
+            AppError::internal("installer cancellation request disappeared after apply")
+        })?;
+        complete_cancellation_locked(adapter, state_dir, &mut record, &request)?;
+    } else if apply_result.ok {
+        record.outcome = Some(v2::OperationOutcome {
+            state: v2::OperationState::Completed,
+            result: v2::OperationResult {
+                code: "installed".to_string(),
+                summary: "The reviewed Linux server package was installed from its verified manifest and canonical resource plan.".to_string(),
+                errors: vec![],
+                warnings: apply_result.warnings,
+            },
+        });
+        persist_operation_record(adapter, state_dir, &record)?;
+    }
     operation_status_v2(
         adapter,
         &v2::StatusInput {
@@ -2550,23 +2980,66 @@ pub fn operation_status_v2(
             if record.action == v2::LifecycleAction::Remove {
                 return remove_operation_status(adapter, input, record, false);
             }
+            let cancellation_pending =
+                cancellation_requested_for(adapter, state_dir, &record.operation_id)?;
+            if record
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.state == OperationState::Cancelled)
+            {
+                let outcome = record.outcome.ok_or_else(|| {
+                    AppError::internal("cancelled installer operation has no result")
+                })?;
+                return Ok(v2::OperationStatus {
+                    contract_version: v2::CONTRACT_VERSION,
+                    configuration: input.configuration.clone(),
+                    operation_id: Some(record.operation_id),
+                    action: Some(record.action),
+                    state: OperationState::Cancelled,
+                    reviewed_plan_digest: Some(record.reviewed_plan_digest),
+                    current_phase: None,
+                    phases: BTreeMap::new(),
+                    cancellation_available: false,
+                    resume_available: false,
+                    service_installed: false,
+                    bootstrap_ready: false,
+                    server_ready_for_enrollment: false,
+                    result: outcome.result,
+                });
+            }
             return Ok(v2::OperationStatus {
                 contract_version: v2::CONTRACT_VERSION,
                 configuration: input.configuration.clone(),
-                operation_id: Some(record.operation_id),
+                operation_id: Some(record.operation_id.clone()),
                 action: Some(record.action),
-                state: OperationState::AttentionRequired,
-                reviewed_plan_digest: Some(record.reviewed_plan_digest),
+                state: if cancellation_pending {
+                    OperationState::InProgress
+                } else {
+                    OperationState::AttentionRequired
+                },
+                reviewed_plan_digest: Some(record.reviewed_plan_digest.clone()),
                 current_phase: None,
                 phases: BTreeMap::new(),
-                cancellation_available: false,
+                cancellation_available: record.action == v2::LifecycleAction::Install
+                    && !record.outcome.as_ref().is_some_and(|outcome| {
+                        outcome.state == OperationState::Completed
+                            || outcome.state == OperationState::Cancelled
+                    }),
                 resume_available: false,
                 service_installed: false,
                 bootstrap_ready: false,
                 server_ready_for_enrollment: false,
                 result: OperationResult {
-                    code: "journal_missing".to_string(),
-                    summary: "An operation identity exists, but no phase journal is available; its result cannot be confirmed.".to_string(),
+                    code: if cancellation_pending {
+                        "cancellation_requested".to_string()
+                    } else {
+                        "journal_missing".to_string()
+                    },
+                    summary: if cancellation_pending {
+                        "Cancellation is queued; the installer will stop at the next phase boundary and remove its owned resources.".to_string()
+                    } else {
+                        "An operation identity exists, but no phase journal is available; its result cannot be confirmed.".to_string()
+                    },
                     errors: vec![],
                     warnings: vec![],
                 },
@@ -2646,7 +3119,19 @@ pub fn operation_status_v2(
         .phases
         .get("units")
         .is_some_and(|entry| entry.status == PhaseStatus::Completed);
-    let state = if completed {
+    let outcome = record.as_ref().and_then(|record| record.outcome.as_ref());
+    let cancellation_pending = if let Some(record) = record.as_ref() {
+        record.action == v2::LifecycleAction::Install
+            && cancellation_requested_for(adapter, state_dir, &record.operation_id)?
+    } else {
+        false
+    };
+    let cancelled = outcome.is_some_and(|outcome| outcome.state == OperationState::Cancelled);
+    let state = if cancelled {
+        OperationState::Cancelled
+    } else if cancellation_pending {
+        OperationState::InProgress
+    } else if completed {
         OperationState::Completed
     } else if failed {
         OperationState::AttentionRequired
@@ -2658,7 +3143,14 @@ pub fn operation_status_v2(
         .values()
         .filter_map(|entry| entry.error.clone())
         .collect::<Vec<_>>();
-    let (code, summary) = if completed {
+    let (code, summary) = if cancelled {
+        ("cancelled", "The installer operation was cancelled.")
+    } else if cancellation_pending {
+        (
+            "cancellation_requested",
+            "Cancellation is queued; the installer will stop at the next phase boundary and remove its owned resources.",
+        )
+    } else if completed {
         ("completed", "The service package was installed.")
     } else if failed {
         (
@@ -2688,18 +3180,55 @@ pub fn operation_status_v2(
             .map(|item| item.reviewed_plan_digest.clone()),
         current_phase: Some(journal.current_phase),
         phases,
-        cancellation_available: false,
-        resume_available: !completed && record.is_some(),
-        service_installed: installed,
+        cancellation_available: record.as_ref().is_some_and(|record| {
+            record.action == v2::LifecycleAction::Install
+                && !completed
+                && !cancelled
+                && !record.outcome.as_ref().is_some_and(|outcome| {
+                    outcome.state == OperationState::Completed
+                        || outcome.state == OperationState::Cancelled
+                })
+        }),
+        resume_available: !completed
+            && !cancelled
+            && !cancellation_pending
+            && record.as_ref().is_some_and(|record| {
+                record.action == v2::LifecycleAction::Install
+                    && !record.outcome.as_ref().is_some_and(|outcome| {
+                        outcome.state == OperationState::Cancelled
+                            || outcome.result.code == "cancellation_rollback_incomplete"
+                    })
+            }),
+        service_installed: installed && !cancelled,
         // The current unit starts loopback development HTTP and does not prove
         // authenticated bootstrap, so it cannot claim readiness for enrollment.
         bootstrap_ready: false,
         server_ready_for_enrollment: false,
-        result: OperationResult {
-            code: code.to_string(),
-            summary: summary.to_string(),
-            errors,
-            warnings: vec![],
+        result: if cancelled {
+            outcome
+                .map(|outcome| outcome.result.clone())
+                .unwrap_or_else(|| OperationResult {
+                    code: code.to_string(),
+                    summary: summary.to_string(),
+                    errors,
+                    warnings: vec![],
+                })
+        } else if cancellation_pending {
+            OperationResult {
+                code: code.to_string(),
+                summary: summary.to_string(),
+                errors,
+                warnings: vec![],
+            }
+        } else {
+            OperationResult {
+                code: code.to_string(),
+                summary: summary.to_string(),
+                errors,
+                warnings: outcome
+                    .map(|outcome| outcome.result.warnings.clone())
+                    .unwrap_or_default(),
+            }
         },
     })
 }
@@ -2739,25 +3268,67 @@ fn compose_operation_status(
             if record.action == v2::LifecycleAction::Remove {
                 return remove_operation_status(adapter, input, record.clone(), false);
             }
+            let cancellation_pending =
+                cancellation_requested_for(adapter, state_dir, &record.operation_id)?;
+            if record
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.state == OperationState::Cancelled)
+            {
+                let outcome = record.outcome.ok_or_else(|| {
+                    AppError::internal("cancelled Compose operation has no result")
+                })?;
+                return Ok(v2::OperationStatus {
+                    contract_version: v2::CONTRACT_VERSION,
+                    configuration: input.configuration.clone(),
+                    operation_id: Some(record.operation_id),
+                    action: Some(record.action),
+                    state: OperationState::Cancelled,
+                    reviewed_plan_digest: Some(record.reviewed_plan_digest),
+                    current_phase: None,
+                    phases: BTreeMap::new(),
+                    cancellation_available: false,
+                    resume_available: false,
+                    service_installed: false,
+                    bootstrap_ready: false,
+                    server_ready_for_enrollment: false,
+                    result: outcome.result,
+                });
+            }
             return Ok(v2::OperationStatus {
                 contract_version: v2::CONTRACT_VERSION,
                 configuration: input.configuration.clone(),
                 operation_id: Some(record.operation_id.clone()),
                 action: Some(record.action),
-                state: OperationState::AttentionRequired,
+                state: if cancellation_pending {
+                    OperationState::InProgress
+                } else {
+                    OperationState::AttentionRequired
+                },
                 reviewed_plan_digest: Some(record.reviewed_plan_digest.clone()),
                 current_phase: None,
                 phases: BTreeMap::new(),
-                cancellation_available: false,
+                cancellation_available: record.action == v2::LifecycleAction::Install
+                    && !record.outcome.as_ref().is_some_and(|outcome| {
+                        outcome.state == OperationState::Completed
+                            || outcome.state == OperationState::Cancelled
+                    }),
                 resume_available: false,
                 service_installed: false,
                 bootstrap_ready: false,
                 server_ready_for_enrollment: false,
                 result: OperationResult {
-                    code: "journal_missing".to_string(),
-                    summary:
+                    code: if cancellation_pending {
+                        "cancellation_requested".to_string()
+                    } else {
+                        "journal_missing".to_string()
+                    },
+                    summary: if cancellation_pending {
+                        "Cancellation is queued; the installer will stop at the next phase boundary and remove its owned resources.".to_string()
+                    } else {
                         "A Compose operation record exists, but its ownership journal is missing."
-                            .to_string(),
+                            .to_string()
+                    },
                     errors: vec![],
                     warnings: vec![],
                 },
@@ -2912,7 +3483,19 @@ fn compose_operation_status(
     if let Some(error) = runtime_error.as_ref() {
         errors.push(error.clone());
     }
-    let state = if phase_completed && service_running {
+    let outcome = record.as_ref().and_then(|record| record.outcome.as_ref());
+    let cancellation_pending = if let Some(record) = record.as_ref() {
+        record.action == v2::LifecycleAction::Install
+            && cancellation_requested_for(adapter, state_dir, &record.operation_id)?
+    } else {
+        false
+    };
+    let cancelled = outcome.is_some_and(|outcome| outcome.state == OperationState::Cancelled);
+    let state = if cancelled {
+        OperationState::Cancelled
+    } else if cancellation_pending {
+        OperationState::InProgress
+    } else if phase_completed && service_running {
         OperationState::Completed
     } else if phase_failed || (phase_completed && !service_running) {
         OperationState::AttentionRequired
@@ -2922,6 +3505,14 @@ fn compose_operation_status(
     let (bootstrap_ready, server_ready_for_enrollment) =
         compose_readiness_flags(&health_state, readiness_probe.as_ref());
     let (code, summary) = match state {
+        OperationState::Cancelled => (
+            "cancelled",
+            "The Compose install operation was cancelled.",
+        ),
+        OperationState::InProgress if cancellation_pending => (
+            "cancellation_requested",
+            "Cancellation is queued; the installer will stop at the next phase boundary and remove its owned resources.",
+        ),
         OperationState::Completed if server_ready_for_enrollment => (
             "installed_and_healthy",
             "The journaled Compose server container is running and its healthcheck confirms bootstrap and enrollment readiness.",
@@ -2959,28 +3550,55 @@ fn compose_operation_status(
             .map(|record| record.reviewed_plan_digest.clone()),
         current_phase: Some(journal.current_phase),
         phases,
-        cancellation_available: false,
+        cancellation_available: record.as_ref().is_some_and(|record| {
+            record.action == v2::LifecycleAction::Install
+                && !phase_completed
+                && !cancelled
+                && !record.outcome.as_ref().is_some_and(|outcome| {
+                    outcome.state == OperationState::Completed
+                        || outcome.state == OperationState::Cancelled
+                })
+        }),
         resume_available: record.as_ref().is_some_and(|record| {
             record.action == v2::LifecycleAction::Install
                 && (!phase_completed || phase_failed || interrupted || !service_running)
+                && !cancelled
+                && !cancellation_pending
+                && !record.outcome.as_ref().is_some_and(|outcome| {
+                    outcome.state == OperationState::Cancelled
+                        || outcome.result.code == "cancellation_rollback_incomplete"
+                })
         }),
-        service_installed,
+        service_installed: service_installed && !cancelled,
         // Compose health succeeds only after bootstrap, so it confirms
         // enrollment readiness but cannot mean initial bootstrap is pending.
         bootstrap_ready,
         server_ready_for_enrollment,
-        result: OperationResult {
-            code: code.to_string(),
-            summary: summary.to_string(),
-            errors,
-            warnings: if readiness_warning {
-                vec![
-                    "The verified Compose container did not return a valid local readiness probe."
-                        .to_string(),
-                ]
-            } else {
-                vec![]
-            },
+        result: if cancelled {
+            outcome
+                .map(|outcome| outcome.result.clone())
+                .unwrap_or_else(|| OperationResult {
+                    code: code.to_string(),
+                    summary: summary.to_string(),
+                    errors,
+                    warnings: vec![],
+                })
+        } else {
+            OperationResult {
+                code: code.to_string(),
+                summary: summary.to_string(),
+                errors,
+                warnings: if readiness_warning {
+                    vec![
+                        "The verified Compose container did not return a valid local readiness probe."
+                            .to_string(),
+                    ]
+                } else {
+                    outcome
+                        .map(|outcome| outcome.result.warnings.clone())
+                        .unwrap_or_default()
+                },
+            }
         },
     })
 }
@@ -4223,6 +4841,14 @@ fn apply_internal(
     // Execute phases in order.
     let phases = Phase::execution_sequence();
     for &phase in phases {
+        if let Some(operation_id) = operation_id {
+            if cancellation_requested_for(adapter, state_dir, operation_id)? {
+                journal.current_phase = "cancellation_requested".to_string();
+                journal.updated_at = adapter.now_iso8601();
+                save_journal(adapter, &journal_path, &journal)?;
+                return Ok(build_apply_result(&journal, false, &journal_path));
+            }
+        }
         let phase_key = phase.as_str().to_string();
         let entry = journal
             .phases
@@ -4286,6 +4912,15 @@ fn apply_internal(
 
                 return Ok(build_apply_result(&journal, false, &journal_path));
             }
+        }
+    }
+
+    if let Some(operation_id) = operation_id {
+        if cancellation_requested_for(adapter, state_dir, operation_id)? {
+            journal.current_phase = "cancellation_requested".to_string();
+            journal.updated_at = adapter.now_iso8601();
+            save_journal(adapter, &journal_path, &journal)?;
+            return Ok(build_apply_result(&journal, false, &journal_path));
         }
     }
 

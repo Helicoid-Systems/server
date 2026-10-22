@@ -64,6 +64,7 @@ pub enum LifecycleAction {
     Plan,
     Install,
     Resume,
+    Cancel,
     Inspect,
     Update,
     Backup,
@@ -172,6 +173,7 @@ pub enum OperationState {
     InProgress,
     AttentionRequired,
     Completed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +208,24 @@ pub struct OperationStatus {
     pub bootstrap_ready: bool,
     pub server_ready_for_enrollment: bool,
     pub result: OperationResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelInput {
+    pub contract_version: u32,
+    pub configuration: DeploymentConfiguration,
+    pub operation_id: String,
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancellationRequest {
+    pub contract_version: u32,
+    pub operation_id: String,
+    pub cleanup_operation_id: String,
+    pub requested_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
