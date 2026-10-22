@@ -604,6 +604,23 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "i", "g", "x", "p", "f":
 			if m.active == "cutover" && msg.String() == "x" {
 				return m.startCutoverCommand("cancel")
+			} else if m.active == "installation" && msg.String() == "x" &&
+				m.status != nil && m.status.CancellationAvailable && !m.installRunning {
+				executable, err := os.Executable()
+				if err != nil {
+					m.installError = "Could not locate the running management application."
+					return m, nil
+				}
+				m.installRunning = true
+				m.installError = ""
+				command := exec.Command(executable, "installer", "cancel")
+				if os.Geteuid() != 0 {
+					command = exec.Command("/usr/bin/sudo", executable, "installer", "cancel")
+				}
+				generation := m.generation
+				return m, tea.ExecProcess(command, func(err error) tea.Msg {
+					return installerFinishedMessage{generation: generation, err: err}
+				})
 			} else if m.active == "backup" && msg.String() == "i" {
 				return m.startRecoveryCommand("status")
 			} else if m.active == "installation" && msg.String() == "i" && !m.installRunning {
@@ -967,7 +984,7 @@ func (m model) View() tea.View {
 		content = lipgloss.NewStyle().Width(max(34, m.width-m.width/3-4)).PaddingLeft(2).Render(content)
 	}
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, content)
-	help := mutedStyle.Render("↑/↓ navigate   enter open   i install/access/invitations   R resume/restore   b bootstrap   l list backups/accounts/logs/cutover   A audit page   T audit retention   n new account/group/request   e export support/roles/rename group   s state/submissions/schedule backup   w download received file   g grant/groups   x revoke access/delete content/cancel cutover   p MFA policy/publish request   f recover MFA/list file jobs   m managers/membership   a approve/cutover review   v quota/revoke access/verify backup   c computers/cancel file job/create backup   u enrollment inventory   j issue invite   k revoke invite   d remove/delete/close/drain cutover/network diagnostics   P prune backups   D disable backup schedule   r refresh/list requests   esc back   q quit")
+	help := mutedStyle.Render("↑/↓ navigate   enter open   i install/access/invitations   R resume/restore   b bootstrap   l list backups/accounts/logs/cutover   A audit page   T audit retention   n new account/group/request   e export support/roles/rename group   s state/submissions/schedule backup   w download received file   g grant/groups   x cancel install/revoke access/delete content/cancel cutover   p MFA policy/publish request   f recover MFA/list file jobs   m managers/membership   a approve/cutover review   v quota/revoke access/verify backup   c computers/cancel file job/create backup   u enrollment inventory   j issue invite   k revoke invite   d remove/delete/close/drain cutover/network diagnostics   P prune backups   D disable backup schedule   r refresh/list requests   esc back   q quit")
 	view := tea.NewView(titleStyle.Render("HELICOID SERVER") + "\n\n" + body + "\n\n" + help)
 	view.AltScreen = true
 	return view
@@ -1665,6 +1682,9 @@ func (m model) installationDetail() string {
 			lines = append(lines, "", "Press R to select the retained request and resume, or keep the same signed package directory available and run:",
 				"helicoid-server installer resume --request <reviewed-request.json> --confirm")
 		}
+	}
+	if m.status.CancellationAvailable && !m.installRunning {
+		lines = append(lines, "", "Press x to cancel this install operation. The installer will remove only journal-owned service resources and preserve data and backups.")
 	}
 	if m.status.Result.Summary != "" {
 		lines = append(lines, "", m.status.Result.Summary)

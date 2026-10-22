@@ -48,7 +48,7 @@ type reviewedInstallRequest struct {
 
 func runInstallerCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: helicoid-server installer install|plan|apply|resume|remove|database-path")
+		return errors.New("usage: helicoid-server installer install|plan|apply|resume|cancel|remove|database-path")
 	}
 	switch args[0] {
 	case "install":
@@ -59,13 +59,70 @@ func runInstallerCommand(args []string) error {
 		return runInstallerApply(args[1:])
 	case "resume":
 		return runInstallerResume(args[1:])
+	case "cancel":
+		return runInstallerCancel(args[1:])
 	case "remove":
 		return runInstallerRemove(args[1:])
 	case "database-path":
 		return runInstallerDatabasePath(args[1:])
 	default:
-		return fmt.Errorf("unknown installer command %q; use install, plan, apply, resume, remove, or database-path", args[0])
+		return fmt.Errorf("unknown installer command %q; use install, plan, apply, resume, cancel, remove, or database-path", args[0])
 	}
+}
+
+func runInstallerCancel(args []string) error {
+	if len(args) != 0 {
+		return errors.New("usage: helicoid-server installer cancel")
+	}
+	if os.Geteuid() != 0 {
+		return errors.New("cancelling installation changes the local host; run this workflow from a root terminal")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), backendTimeout)
+	defer cancel()
+	configuration, err := loadStoredConfiguration(ctx)
+	if err != nil {
+		return err
+	}
+	var status operationStatus
+	if err := callBackend(ctx, "status-v2", statusInput{
+		ContractVersion: 2,
+		Configuration:   configuration,
+	}, &status); err != nil {
+		return err
+	}
+	if status.OperationID == nil || !status.CancellationAvailable {
+		return errors.New("the current installer operation is not cancellable")
+	}
+	phrase := "cancel installer operation " + *status.OperationID
+	answer, err := readPromptLine("Type " + phrase + " to remove the journal-owned service resources; data and backups will be preserved: ")
+	if err != nil {
+		return fmt.Errorf("read cancellation confirmation: %w", err)
+	}
+	if answer != phrase {
+		return errors.New("cancellation was not confirmed; no host changes were made")
+	}
+	input := struct {
+		ContractVersion uint32                  `json:"contract_version"`
+		Configuration   deploymentConfiguration `json:"configuration"`
+		OperationID     string                  `json:"operation_id"`
+		Confirm         bool                    `json:"confirm"`
+	}{
+		ContractVersion: 2,
+		Configuration:   configuration,
+		OperationID:     *status.OperationID,
+		Confirm:         true,
+	}
+	var result operationStatus
+	if err := callBackendArgs(ctx, []string{"cancel-v2", "--state-dir", "/opt/helicoid/.installer"}, input, &result); err != nil {
+		return err
+	}
+	if err := writeJSON(os.Stdout, result); err != nil {
+		return err
+	}
+	if result.State != "cancelled" && result.Result.Code != "cancellation_requested" {
+		return fmt.Errorf("installer cancellation needs attention: %s", result.Result.Summary)
+	}
+	return nil
 }
 
 func runInstallerInstall(args []string) (result error) {
