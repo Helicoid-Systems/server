@@ -15,6 +15,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate Linux shell installer and configuration parser
+        run: |
+          bash -n scripts/install-linux.sh
+          bash scripts/install-linux.sh --help
+          python3 tests/test_read_linux_install_config.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

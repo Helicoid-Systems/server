@@ -22,12 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{AppError, AppResult};
 use crate::private_file::{self, StorePathPresence};
 
 /// Schema version installed by this build. Refuses to open a newer schema.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// Capability of the opened store for NEW persisted v2 MFA credentials.
 ///
@@ -116,7 +117,7 @@ pub fn open(path: &Path) -> AppResult<Db> {
     // Newly created/used sidecars must also be private (or at least regular).
     verify_sqlite_sidecars(&abs, require_private)?;
 
-    ensure_schema(&conn)?;
+    ensure_schema_with_signer(&conn, capability != StoreCapability::PersistentUnverified)?;
     Ok(Db {
         conn: Mutex::new(conn),
         capability,
@@ -217,7 +218,7 @@ fn refuse_preexisting_mfa_rows(conn: &Connection) -> AppResult<()> {
 pub fn open_in_memory() -> AppResult<Db> {
     let conn = Connection::open_in_memory()?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    install_schema(&conn)?;
+    install_schema(&conn, true)?;
     Ok(Db {
         conn: Mutex::new(conn),
         capability: StoreCapability::NonPersistent,
@@ -313,7 +314,7 @@ fn schema_version(conn: &Connection) -> AppResult<Option<i64>> {
 
 /// Install schema only on a truly empty database; refuse unrelated content
 /// and refuse version mismatches instead of auto-migrating.
-fn ensure_schema(conn: &Connection) -> AppResult<()> {
+fn ensure_schema_with_signer(conn: &Connection, signer_enabled: bool) -> AppResult<()> {
     match schema_version(conn)? {
         Some(v) if v == SCHEMA_VERSION => Ok(()),
         Some(v) if v < SCHEMA_VERSION => Err(AppError::unprocessable(format!(
@@ -330,27 +331,38 @@ fn ensure_schema(conn: &Connection) -> AppResult<()> {
                     "database is not empty and has no hs-server schema; refusing to initialize over unrelated data",
                 ));
             }
-            install_schema(conn)
+            install_schema(conn, signer_enabled)
         }
     }
 }
 
-fn install_schema(conn: &Connection) -> AppResult<()> {
+fn install_schema(conn: &Connection, signer_enabled: bool) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(SCHEMA_SQL)?;
+    tx.execute_batch(INTERACTION_SCHEMA_SQL)?;
+    tx.execute_batch(ADMISSION_SCHEMA_SQL)?;
     tx.execute(
         "INSERT INTO schema_meta (id, schema_version) VALUES (1, ?1)",
         params![SCHEMA_VERSION],
     )?;
+    let grant_signing_secret = signer_enabled.then(new_grant_signing_secret);
     tx.execute(
         "INSERT INTO deployment (
-            id, bootstrap_completed, security_state_ok, created_at, deployment_key
-         ) VALUES (1, 0, 1, ?1, ?2)",
-        params![now_unix(), new_deployment_key()],
+            id, bootstrap_completed, security_state_ok, created_at, deployment_key,
+            grant_signing_secret
+         ) VALUES (1, 0, 1, ?1, ?2, ?3)",
+        params![
+            now_unix(),
+            new_deployment_key(),
+            grant_signing_secret
+                .as_ref()
+                .map(|secret| secret.as_slice())
+        ],
     )?;
     tx.execute(
-        "INSERT INTO security_policy (id, operator_mfa_policy, updated_at)
-         VALUES (1, 'optional', ?1)",
+        "INSERT INTO security_policy (
+            id, operator_mfa_policy, audit_retention_days, updated_at
+         ) VALUES (1, 'optional', 30, ?1)",
         params![now_unix()],
     )?;
     tx.commit()?;
@@ -368,6 +380,43 @@ pub fn now_unix() -> i64 {
 /// proof messages so a challenge cannot be replayed across deployments.
 pub fn new_deployment_key() -> String {
     format!("dep_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Generate the deployment-local Ed25519 signing secret used for endpoint
+/// authorization grants. The caller stores it only in the private database.
+pub fn new_grant_signing_secret() -> Zeroizing<[u8; 32]> {
+    use rand::Rng;
+
+    let mut secret = Zeroizing::new([0u8; 32]);
+    rand::rng().fill_bytes(&mut *secret);
+    secret
+}
+
+/// Load the deployment-local grant signing secret. Missing or malformed
+/// authority material fails closed; it is never silently regenerated on open.
+pub fn grant_signing_secret(conn: &Connection) -> AppResult<Zeroizing<[u8; 32]>> {
+    let stored_secret: Option<Option<Vec<u8>>> = conn
+        .query_row(
+            "SELECT grant_signing_secret FROM deployment WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(Some(mut stored_secret)) = stored_secret else {
+        return Err(AppError::internal(
+            "deployment grant signing secret is missing; refusing authorization",
+        ));
+    };
+    if stored_secret.len() != 32 {
+        stored_secret.zeroize();
+        return Err(AppError::internal(
+            "deployment grant signing secret is malformed; refusing authorization",
+        ));
+    }
+    let mut secret = [0_u8; 32];
+    secret.copy_from_slice(&stored_secret);
+    stored_secret.zeroize();
+    Ok(Zeroizing::new(secret))
 }
 
 /// Max retained auth challenges (pending + recently consumed). Older rows are
@@ -496,7 +545,7 @@ pub fn migrate(path: &Path, backup_dir: &Path) -> AppResult<MigrationReport> {
     let backup_path = backup_database(&conn, backup_dir, from)?;
     // Backup output must retain privacy.
     private_file::verify_private_store_file(&backup_path)?;
-    apply_migrations(&conn, from)?;
+    apply_migrations(&conn, from, private_file::private_file_supported())?;
     verify_sqlite_sidecars(&abs, require_private)?;
 
     Ok(MigrationReport {
@@ -532,7 +581,7 @@ fn backup_database(conn: &Connection, backup_dir: &Path, from: i64) -> AppResult
     Ok(backup_path)
 }
 
-fn apply_migrations(conn: &Connection, from: i64) -> AppResult<()> {
+fn apply_migrations(conn: &Connection, from: i64, signer_enabled: bool) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
     if from < 2 {
         migrate_v1_to_v2(&tx)?;
@@ -546,11 +595,327 @@ fn apply_migrations(conn: &Connection, from: i64) -> AppResult<()> {
     if from < 3 {
         migrate_v2_to_v3(&tx)?;
     }
+    if from < 4 {
+        migrate_v3_to_v4(&tx)?;
+    }
+    if from < 5 {
+        migrate_v4_to_v5(&tx)?;
+    }
+    if from < 6 {
+        migrate_v5_to_v6(&tx)?;
+    }
+    if from < 7 {
+        migrate_v6_to_v7(&tx)?;
+    }
+    if from < 8 {
+        migrate_v7_to_v8(&tx)?;
+    }
+    if from < 9 {
+        migrate_v8_to_v9(&tx)?;
+    }
+    if from < 10 {
+        migrate_v9_to_v10(&tx)?;
+    }
+    if from < 11 {
+        migrate_v10_to_v11(&tx)?;
+    }
+    if from < 12 {
+        migrate_v11_to_v12(&tx)?;
+    }
+    if from < 13 {
+        migrate_v12_to_v13(&tx)?;
+    }
+    if from < 14 {
+        migrate_v13_to_v14(&tx)?;
+    }
+    if from < 15 {
+        migrate_v14_to_v15(&tx)?;
+    }
+    if from < 16 {
+        migrate_v15_to_v16(&tx, signer_enabled)?;
+    }
+    if from < 17 {
+        migrate_v16_to_v17(&tx)?;
+    }
+    if from < 18 {
+        migrate_v17_to_v18(&tx)?;
+    }
+    if from < 19 {
+        migrate_v18_to_v19(&tx)?;
+    }
+    if from < 20 {
+        migrate_v19_to_v20(&tx)?;
+    }
     tx.execute(
         "UPDATE schema_meta SET schema_version = ?1 WHERE id = 1",
         params![SCHEMA_VERSION],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+/// v19 → v20: install bounded metadata-only audit storage and configurable
+/// retention. Existing deployments begin with the documented 30-day default.
+fn migrate_v19_to_v20(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE security_policy ADD COLUMN audit_retention_days INTEGER NOT NULL DEFAULT 30
+            CHECK (audit_retention_days BETWEEN 1 AND 3650);
+
+        CREATE TABLE audit_events (
+            id TEXT PRIMARY KEY,
+            actor_account_id TEXT NOT NULL,
+            actor_manager_id TEXT,
+            action TEXT NOT NULL CHECK (length(action) BETWEEN 1 AND 64),
+            target_ids_json TEXT NOT NULL CHECK (length(target_ids_json) BETWEEN 2 AND 16384),
+            occurred_at INTEGER NOT NULL,
+            result TEXT NOT NULL CHECK (result IN ('succeeded', 'denied', 'failed')),
+            reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 64)
+        );
+        CREATE INDEX audit_events_time_idx
+            ON audit_events (occurred_at DESC, id DESC);
+        CREATE INDEX audit_events_actor_time_idx
+            ON audit_events (actor_account_id, occurred_at DESC, id DESC);
+        CREATE INDEX audit_events_action_time_idx
+            ON audit_events (action, occurred_at DESC, id DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v18 → v19: persist authority lifecycle and independently reviewed
+/// host-cutover evidence. Existing installations begin Active; restoring an
+/// encrypted database explicitly moves the replacement to Awaiting Cutover.
+fn migrate_v18_to_v19(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE deployment ADD COLUMN authority_state TEXT NOT NULL DEFAULT 'active'
+            CHECK (authority_state IN ('active', 'draining', 'awaiting_cutover', 'retired', 'needs_review'));
+        ALTER TABLE deployment ADD COLUMN authority_generation INTEGER NOT NULL DEFAULT 1
+            CHECK (authority_generation >= 1);
+        ALTER TABLE deployment ADD COLUMN predecessor_deployment_key TEXT;
+
+        CREATE TABLE authority_cutovers (
+            id TEXT PRIMARY KEY,
+            predecessor_authority_id TEXT NOT NULL,
+            replacement_authority_id TEXT,
+            generation INTEGER NOT NULL CHECK (generation >= 1),
+            state TEXT NOT NULL CHECK (state IN ('draining', 'awaiting_review', 'approved', 'cancelled', 'needs_review')),
+            initiated_by_account_id TEXT,
+            approved_by_account_id TEXT,
+            fencing_method TEXT,
+            fencing_evidence_reference TEXT,
+            created_at INTEGER NOT NULL,
+            approved_at INTEGER,
+            CHECK (state != 'approved' OR
+                   (replacement_authority_id IS NOT NULL AND approved_by_account_id IS NOT NULL
+                    AND fencing_method IS NOT NULL AND fencing_evidence_reference IS NOT NULL
+                    AND approved_at IS NOT NULL))
+        );
+        CREATE INDEX authority_cutovers_predecessor_idx
+            ON authority_cutovers (predecessor_authority_id, created_at DESC, id DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v9 → v10: bound queued and in-progress file delivery lifetime.
+///
+/// Existing active uploads retain their upload deadline. Previously queued
+/// jobs receive a bounded lifetime from their last state update and are
+/// expired on the next file maintenance pass if that deadline has elapsed.
+fn migrate_v9_to_v10(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "ALTER TABLE file_jobs ADD COLUMN delivery_expires_at INTEGER NOT NULL DEFAULT 0;
+         UPDATE file_jobs
+         SET delivery_expires_at = CASE
+             WHEN state = 'uploading' THEN upload_expires_at
+             ELSE updated_at + 86400
+         END;
+         CREATE INDEX file_jobs_delivery_expiry_idx
+             ON file_jobs (state, delivery_expires_at);",
+    )?;
+    Ok(())
+}
+
+/// v10 → v11: add private, deployment-scoped file-request drafts and their
+/// explicit eligible-computer bindings. v12 adds submission metadata and bytes.
+fn migrate_v10_to_v11(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE file_requests (
+            id TEXT PRIMARY KEY,
+            owner_account_id TEXT NOT NULL REFERENCES accounts(id),
+            title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
+            instructions TEXT NOT NULL CHECK (length(instructions) <= 2000),
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            state TEXT NOT NULL CHECK (state IN ('draft', 'open', 'closed')),
+            allowed_extensions_json TEXT NOT NULL,
+            max_file_count INTEGER NOT NULL CHECK (max_file_count BETWEEN 1 AND 50),
+            max_total_size_bytes INTEGER NOT NULL CHECK (max_total_size_bytes BETWEEN 1 AND 134217728),
+            closes_at INTEGER NOT NULL,
+            replacement_allowed INTEGER NOT NULL CHECK (replacement_allowed IN (0, 1)),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            published_at INTEGER,
+            closed_at INTEGER
+        );
+        CREATE INDEX file_requests_owner_created_idx
+            ON file_requests (owner_account_id, created_at DESC, id);
+        CREATE INDEX file_requests_state_deadline_idx
+            ON file_requests (state, closes_at);
+        CREATE TABLE file_request_computers (
+            request_id TEXT NOT NULL REFERENCES file_requests(id) ON DELETE CASCADE,
+            computer_id TEXT NOT NULL REFERENCES computers(id),
+            PRIMARY KEY (request_id, computer_id)
+        );
+        CREATE INDEX file_request_computers_computer_idx
+            ON file_request_computers (computer_id, request_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v11 → v12: add OS-user-bound request submissions and private file chunks.
+fn migrate_v11_to_v12(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE file_request_submissions (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL REFERENCES file_requests(id),
+            request_revision INTEGER NOT NULL CHECK (request_revision > 0),
+            computer_id TEXT NOT NULL REFERENCES computers(id),
+            local_user_id TEXT NOT NULL,
+            local_user_display_name TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('uploading', 'received', 'failed', 'expired', 'superseded')),
+            replaces_submission_id TEXT REFERENCES file_request_submissions(id),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            upload_expires_at INTEGER NOT NULL,
+            received_at INTEGER
+        );
+        CREATE INDEX file_request_submissions_request_idx
+            ON file_request_submissions (request_id, created_at DESC, id);
+        CREATE INDEX file_request_submissions_identity_idx
+            ON file_request_submissions (computer_id, local_user_id, request_id, state);
+        CREATE INDEX file_request_submissions_expiry_idx
+            ON file_request_submissions (state, upload_expires_at);
+        CREATE TABLE file_request_submission_files (
+            id TEXT PRIMARY KEY,
+            submission_id TEXT NOT NULL REFERENCES file_request_submissions(id) ON DELETE CASCADE,
+            file_name TEXT NOT NULL CHECK (length(file_name) BETWEEN 1 AND 255),
+            file_size_bytes INTEGER NOT NULL CHECK (file_size_bytes BETWEEN 0 AND 134217728),
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+            chunk_size_bytes INTEGER NOT NULL CHECK (chunk_size_bytes = 262144),
+            chunk_count INTEGER NOT NULL CHECK (chunk_count BETWEEN 0 AND 512),
+            state TEXT NOT NULL CHECK (state IN ('uploading', 'received')),
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX file_request_submission_files_submission_idx
+            ON file_request_submission_files (submission_id, id);
+        CREATE TABLE file_request_submission_chunks (
+            file_id TEXT NOT NULL REFERENCES file_request_submission_files(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL CHECK (chunk_index BETWEEN 0 AND 511),
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+            data BLOB NOT NULL CHECK (length(data) <= 262144),
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (file_id, chunk_index)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v12 → v13: record whether received submission content is still retained.
+/// Metadata remains available after an operator explicitly removes the bytes.
+fn migrate_v12_to_v13(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "ALTER TABLE file_request_submission_files
+             ADD COLUMN content_available INTEGER NOT NULL DEFAULT 1
+             CHECK (content_available IN (0, 1));
+         UPDATE file_request_submission_files SET content_available = 0
+         WHERE submission_id IN (
+             SELECT id FROM file_request_submissions
+             WHERE state IN ('failed', 'expired', 'superseded')
+         );",
+    )?;
+    Ok(())
+}
+
+/// v13 → v14: preserve who explicitly removed retained request content and
+/// when. Existing logical deletions receive a best-effort timestamp only.
+fn migrate_v13_to_v14(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "ALTER TABLE file_request_submissions
+             ADD COLUMN content_deleted_at INTEGER;
+         ALTER TABLE file_request_submissions
+             ADD COLUMN content_deleted_by_account_id TEXT;
+         UPDATE file_request_submissions
+         SET content_deleted_at = updated_at
+         WHERE state = 'received'
+           AND EXISTS (
+               SELECT 1 FROM file_request_submission_files f
+               WHERE f.submission_id = file_request_submissions.id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM file_request_submission_files f
+               WHERE f.submission_id = file_request_submissions.id
+                 AND f.content_available = 1
+           );",
+    )?;
+    Ok(())
+}
+
+/// v14 → v15: persist per-computer interaction revisions and idempotent claims.
+/// Existing computers start at revision zero with no active interaction claims.
+fn migrate_v14_to_v15(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(INTERACTION_SCHEMA_SQL)?;
+    Ok(())
+}
+
+/// v15 → v16: add a deployment-local grant signing secret. Existing stores
+/// receive fresh authority during the explicit, backed-up migration.
+fn migrate_v15_to_v16(conn: &Connection, signer_enabled: bool) -> AppResult<()> {
+    conn.execute_batch("ALTER TABLE deployment ADD COLUMN grant_signing_secret BLOB;")?;
+    if signer_enabled {
+        let secret = new_grant_signing_secret();
+        let changed = conn.execute(
+            "UPDATE deployment SET grant_signing_secret = ?1 WHERE id = 1",
+            params![secret.as_slice()],
+        )?;
+        if changed != 1 {
+            return Err(AppError::unprocessable(
+                "deployment row is missing; refusing to initialize grant signing authority",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// v7 → v8: bind endpoint sessions and durable file targets to a local OS user.
+/// Existing sessions/jobs remain unbound and cannot authorize delivery.
+fn migrate_v7_to_v8(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE endpoint_auth_challenges ADD COLUMN local_user_id TEXT;
+        ALTER TABLE endpoint_sessions ADD COLUMN local_user_id TEXT;
+        ALTER TABLE file_job_targets ADD COLUMN recipient_local_user_id TEXT;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v8 → v9: preserve the signed local account label for explicit recipient
+/// confirmation. Existing sessions and targets remain unlabelled, so they
+/// cannot be selected as the named recipient for a new D29 job.
+fn migrate_v8_to_v9(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE endpoint_auth_challenges ADD COLUMN local_user_display_name TEXT;
+        ALTER TABLE endpoint_sessions ADD COLUMN local_user_display_name TEXT;
+        ALTER TABLE file_job_targets ADD COLUMN recipient_local_user_display_name TEXT;
+        "#,
+    )?;
     Ok(())
 }
 
@@ -580,6 +945,175 @@ fn migrate_v2_to_v3(conn: &Connection) -> AppResult<()> {
         [],
     )?;
     conn.execute("ALTER TABLE sessions ADD COLUMN mfa_assured_at INTEGER", [])?;
+    Ok(())
+}
+
+/// v3 → v4: add flat computer groups and independent membership rows.
+/// Group membership is organization metadata and does not create access grants.
+fn migrate_v3_to_v4(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE computer_groups (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX computer_groups_name_unique
+            ON computer_groups (name COLLATE NOCASE);
+
+        CREATE TABLE computer_group_members (
+            group_id TEXT NOT NULL REFERENCES computer_groups(id) ON DELETE CASCADE,
+            computer_id TEXT NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+            PRIMARY KEY (group_id, computer_id)
+        );
+        CREATE INDEX computer_group_members_computer_idx
+            ON computer_group_members (computer_id, group_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v4 → v5: one-time endpoint enrollment invitations.
+///
+/// Invitation codes are high-entropy and only their SHA-256 hashes are stored.
+/// A redeemed invitation is permanently bound to the pending computer created
+/// by its endpoint proof.
+fn migrate_v4_to_v5(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE computer_enrollment_invitations (
+            id TEXT PRIMARY KEY,
+            code_hash TEXT NOT NULL UNIQUE,
+            friendly_name TEXT NOT NULL,
+            platform TEXT NOT NULL CHECK (platform IN ('macos', 'windows', 'linux')),
+            created_by_account_id TEXT NOT NULL REFERENCES accounts(id),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            redeemed_at INTEGER,
+            computer_id TEXT REFERENCES computers(id),
+            revoked_at INTEGER,
+            CHECK ((redeemed_at IS NULL AND computer_id IS NULL)
+                OR (redeemed_at IS NOT NULL AND computer_id IS NOT NULL))
+        );
+        CREATE INDEX computer_enrollment_invitations_active_idx
+            ON computer_enrollment_invitations (expires_at, created_at)
+            WHERE redeemed_at IS NULL AND revoked_at IS NULL;
+        CREATE UNIQUE INDEX computer_enrollment_invitations_computer_unique
+            ON computer_enrollment_invitations (computer_id)
+            WHERE computer_id IS NOT NULL;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v5 → v6: admitted endpoint challenges and short-lived sessions.
+///
+/// Endpoint credentials are stored only as token hashes. Each session is
+/// fenced by the endpoint's enrollment epoch and is revalidated against the
+/// current approved incarnation on use.
+fn migrate_v5_to_v6(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE endpoint_auth_challenges (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            computer_id TEXT NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+            client_nonce TEXT NOT NULL,
+            issued_at INTEGER NOT NULL,
+            public_key TEXT NOT NULL,
+            enrollment_epoch INTEGER NOT NULL CHECK (enrollment_epoch > 0),
+            deployment_key TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            consumed_at INTEGER
+        );
+        CREATE UNIQUE INDEX endpoint_auth_challenges_nonce_unique
+            ON endpoint_auth_challenges (computer_id, client_nonce);
+        CREATE INDEX endpoint_auth_challenges_active_idx
+            ON endpoint_auth_challenges (expires_at, created_at)
+            WHERE consumed_at IS NULL;
+        CREATE INDEX endpoint_auth_challenges_created_idx
+            ON endpoint_auth_challenges (created_at);
+        CREATE INDEX endpoint_auth_challenges_computer_created_idx
+            ON endpoint_auth_challenges (computer_id, created_at);
+
+        CREATE TABLE endpoint_sessions (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            computer_id TEXT NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+            enrollment_epoch INTEGER NOT NULL CHECK (enrollment_epoch > 0),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+        CREATE INDEX endpoint_sessions_computer_idx
+            ON endpoint_sessions (computer_id, expires_at);
+        CREATE INDEX endpoint_sessions_expires_idx
+            ON endpoint_sessions (expires_at);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v6 → v7: durable manager-to-endpoint file delivery jobs.
+///
+/// Files are stored as bounded chunks in the private SQLite store until every
+/// target reports a terminal result. Each target has an independent state.
+fn migrate_v6_to_v7(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE file_jobs (
+            id TEXT PRIMARY KEY,
+            owner_account_id TEXT NOT NULL REFERENCES accounts(id),
+            direction TEXT NOT NULL CHECK (direction = 'push'),
+            file_name TEXT NOT NULL,
+            file_size_bytes INTEGER NOT NULL CHECK (file_size_bytes BETWEEN 0 AND 134217728),
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+            chunk_size_bytes INTEGER NOT NULL CHECK (chunk_size_bytes = 262144),
+            chunk_count INTEGER NOT NULL CHECK (chunk_count BETWEEN 0 AND 512),
+            state TEXT NOT NULL CHECK (state IN (
+                'uploading', 'queued', 'in_progress', 'completed', 'partial',
+                'failed', 'cancelled', 'expired'
+            )),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            upload_expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX file_jobs_owner_created_idx
+            ON file_jobs (owner_account_id, created_at DESC, id);
+        CREATE INDEX file_jobs_owner_state_idx
+            ON file_jobs (owner_account_id, state);
+        CREATE INDEX file_jobs_state_expiry_idx
+            ON file_jobs (state, upload_expires_at);
+
+        CREATE TABLE file_job_targets (
+            job_id TEXT NOT NULL REFERENCES file_jobs(id) ON DELETE CASCADE,
+            computer_id TEXT NOT NULL REFERENCES computers(id),
+            state TEXT NOT NULL CHECK (state IN (
+                'awaiting_upload', 'queued', 'in_progress', 'completed', 'failed', 'cancelled'
+            )),
+            result_detail TEXT,
+            received_size_bytes INTEGER,
+            received_sha256 TEXT,
+            started_at INTEGER,
+            finished_at INTEGER,
+            PRIMARY KEY (job_id, computer_id)
+        );
+        CREATE INDEX file_job_targets_computer_state_idx
+            ON file_job_targets (computer_id, state, job_id);
+
+        CREATE TABLE file_job_chunks (
+            job_id TEXT NOT NULL REFERENCES file_jobs(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL CHECK (chunk_index BETWEEN 0 AND 511),
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+            data BLOB NOT NULL CHECK (length(data) <= 262144),
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (job_id, chunk_index)
+        );
+        "#,
+    )?;
     Ok(())
 }
 
@@ -711,8 +1245,36 @@ CREATE TABLE deployment (
     security_state_ok INTEGER NOT NULL DEFAULT 1,
     security_state_note TEXT,
     created_at INTEGER NOT NULL,
-    deployment_key TEXT NOT NULL DEFAULT ''
+    deployment_key TEXT NOT NULL DEFAULT '',
+    recovery_quarantined INTEGER NOT NULL DEFAULT 0 CHECK (recovery_quarantined IN (0, 1)),
+    authority_state TEXT NOT NULL DEFAULT 'active'
+        CHECK (authority_state IN ('active', 'draining', 'awaiting_cutover', 'retired', 'needs_review')),
+    authority_generation INTEGER NOT NULL DEFAULT 1 CHECK (authority_generation >= 1),
+    predecessor_deployment_key TEXT,
+    grant_signing_secret BLOB CHECK (
+        grant_signing_secret IS NULL OR length(grant_signing_secret) = 32
+    )
 );
+
+CREATE TABLE authority_cutovers (
+    id TEXT PRIMARY KEY,
+    predecessor_authority_id TEXT NOT NULL,
+    replacement_authority_id TEXT,
+    generation INTEGER NOT NULL CHECK (generation >= 1),
+    state TEXT NOT NULL CHECK (state IN ('draining', 'awaiting_review', 'approved', 'cancelled', 'needs_review')),
+    initiated_by_account_id TEXT,
+    approved_by_account_id TEXT,
+    fencing_method TEXT,
+    fencing_evidence_reference TEXT,
+    created_at INTEGER NOT NULL,
+    approved_at INTEGER,
+    CHECK (state != 'approved' OR
+           (replacement_authority_id IS NOT NULL AND approved_by_account_id IS NOT NULL
+            AND fencing_method IS NOT NULL AND fencing_evidence_reference IS NOT NULL
+            AND approved_at IS NOT NULL))
+);
+CREATE INDEX authority_cutovers_predecessor_idx
+    ON authority_cutovers (predecessor_authority_id, created_at DESC, id DESC);
 
 CREATE TABLE bootstrap_tokens (
     token_hash TEXT PRIMARY KEY,
@@ -730,12 +1292,14 @@ CREATE TABLE accounts (
     can_manage_access INTEGER NOT NULL DEFAULT 0,
     can_manage_accounts INTEGER NOT NULL DEFAULT 0,
     can_manage_security INTEGER NOT NULL DEFAULT 0,
+    recovery_quarantined INTEGER NOT NULL DEFAULT 0 CHECK (recovery_quarantined IN (0, 1)),
     revision INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
 
-CREATE UNIQUE INDEX accounts_username_unique ON accounts (username COLLATE NOCASE);
+CREATE UNIQUE INDEX accounts_username_unique
+    ON accounts (username COLLATE NOCASE) WHERE recovery_quarantined = 0;
 
 CREATE TABLE managers (
     id TEXT PRIMARY KEY,
@@ -782,6 +1346,91 @@ CREATE TABLE computers (
 
 CREATE UNIQUE INDEX computers_public_identity_unique ON computers (public_identity);
 
+CREATE TABLE computer_groups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX computer_groups_name_unique
+    ON computer_groups (name COLLATE NOCASE);
+
+CREATE TABLE computer_group_members (
+    group_id TEXT NOT NULL REFERENCES computer_groups(id) ON DELETE CASCADE,
+    computer_id TEXT NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, computer_id)
+);
+
+CREATE INDEX computer_group_members_computer_idx
+    ON computer_group_members (computer_id, group_id);
+
+CREATE TABLE computer_enrollment_invitations (
+    id TEXT PRIMARY KEY,
+    code_hash TEXT NOT NULL UNIQUE,
+    friendly_name TEXT NOT NULL,
+    platform TEXT NOT NULL CHECK (platform IN ('macos', 'windows', 'linux')),
+    created_by_account_id TEXT NOT NULL REFERENCES accounts(id),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    redeemed_at INTEGER,
+    computer_id TEXT REFERENCES computers(id),
+    revoked_at INTEGER,
+    CHECK ((redeemed_at IS NULL AND computer_id IS NULL)
+        OR (redeemed_at IS NOT NULL AND computer_id IS NOT NULL))
+);
+
+CREATE INDEX computer_enrollment_invitations_active_idx
+    ON computer_enrollment_invitations (expires_at, created_at)
+    WHERE redeemed_at IS NULL AND revoked_at IS NULL;
+CREATE UNIQUE INDEX computer_enrollment_invitations_computer_unique
+    ON computer_enrollment_invitations (computer_id)
+    WHERE computer_id IS NOT NULL;
+
+CREATE TABLE endpoint_auth_challenges (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    computer_id TEXT NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    client_nonce TEXT NOT NULL,
+    issued_at INTEGER NOT NULL,
+    public_key TEXT NOT NULL,
+    enrollment_epoch INTEGER NOT NULL CHECK (enrollment_epoch > 0),
+    deployment_key TEXT NOT NULL,
+    local_user_id TEXT,
+    local_user_display_name TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    consumed_at INTEGER
+);
+
+CREATE UNIQUE INDEX endpoint_auth_challenges_nonce_unique
+    ON endpoint_auth_challenges (computer_id, client_nonce);
+CREATE INDEX endpoint_auth_challenges_active_idx
+    ON endpoint_auth_challenges (expires_at, created_at)
+    WHERE consumed_at IS NULL;
+CREATE INDEX endpoint_auth_challenges_created_idx
+    ON endpoint_auth_challenges (created_at);
+CREATE INDEX endpoint_auth_challenges_computer_created_idx
+    ON endpoint_auth_challenges (computer_id, created_at);
+
+CREATE TABLE endpoint_sessions (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    computer_id TEXT NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    enrollment_epoch INTEGER NOT NULL CHECK (enrollment_epoch > 0),
+    local_user_id TEXT,
+    local_user_display_name TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER
+);
+
+CREATE INDEX endpoint_sessions_computer_idx
+    ON endpoint_sessions (computer_id, expires_at);
+CREATE INDEX endpoint_sessions_expires_idx
+    ON endpoint_sessions (expires_at);
+
 CREATE TABLE access_assignments (
     id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(id),
@@ -798,6 +1447,143 @@ CREATE TABLE access_computer_scope (
     assignment_id TEXT NOT NULL REFERENCES access_assignments(id) ON DELETE CASCADE,
     computer_id TEXT NOT NULL REFERENCES computers(id),
     PRIMARY KEY (assignment_id, computer_id)
+);
+
+CREATE TABLE file_jobs (
+    id TEXT PRIMARY KEY,
+    owner_account_id TEXT NOT NULL REFERENCES accounts(id),
+    direction TEXT NOT NULL CHECK (direction = 'push'),
+    file_name TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL CHECK (file_size_bytes BETWEEN 0 AND 134217728),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    chunk_size_bytes INTEGER NOT NULL CHECK (chunk_size_bytes = 262144),
+    chunk_count INTEGER NOT NULL CHECK (chunk_count BETWEEN 0 AND 512),
+    state TEXT NOT NULL CHECK (state IN (
+        'uploading', 'queued', 'in_progress', 'completed', 'partial',
+        'failed', 'cancelled', 'expired'
+    )),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    upload_expires_at INTEGER NOT NULL,
+    delivery_expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX file_jobs_owner_created_idx
+    ON file_jobs (owner_account_id, created_at DESC, id);
+CREATE INDEX file_jobs_owner_state_idx
+    ON file_jobs (owner_account_id, state);
+CREATE INDEX file_jobs_state_expiry_idx
+    ON file_jobs (state, upload_expires_at);
+CREATE INDEX file_jobs_delivery_expiry_idx
+    ON file_jobs (state, delivery_expires_at);
+
+CREATE TABLE file_job_targets (
+    job_id TEXT NOT NULL REFERENCES file_jobs(id) ON DELETE CASCADE,
+    computer_id TEXT NOT NULL REFERENCES computers(id),
+    recipient_local_user_id TEXT,
+    recipient_local_user_display_name TEXT,
+    state TEXT NOT NULL CHECK (state IN (
+        'awaiting_upload', 'queued', 'in_progress', 'completed', 'failed', 'cancelled'
+    )),
+    result_detail TEXT,
+    received_size_bytes INTEGER,
+    received_sha256 TEXT,
+    started_at INTEGER,
+    finished_at INTEGER,
+    PRIMARY KEY (job_id, computer_id)
+);
+
+CREATE INDEX file_job_targets_computer_state_idx
+    ON file_job_targets (computer_id, state, job_id);
+
+CREATE TABLE file_job_chunks (
+    job_id TEXT NOT NULL REFERENCES file_jobs(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL CHECK (chunk_index BETWEEN 0 AND 511),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    data BLOB NOT NULL CHECK (length(data) <= 262144),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (job_id, chunk_index)
+);
+
+CREATE TABLE file_requests (
+    id TEXT PRIMARY KEY,
+    owner_account_id TEXT NOT NULL REFERENCES accounts(id),
+    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
+    instructions TEXT NOT NULL CHECK (length(instructions) <= 2000),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    state TEXT NOT NULL CHECK (state IN ('draft', 'open', 'closed')),
+    allowed_extensions_json TEXT NOT NULL,
+    max_file_count INTEGER NOT NULL CHECK (max_file_count BETWEEN 1 AND 50),
+    max_total_size_bytes INTEGER NOT NULL CHECK (max_total_size_bytes BETWEEN 1 AND 134217728),
+    closes_at INTEGER NOT NULL,
+    replacement_allowed INTEGER NOT NULL CHECK (replacement_allowed IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    published_at INTEGER,
+    closed_at INTEGER
+);
+
+CREATE INDEX file_requests_owner_created_idx
+    ON file_requests (owner_account_id, created_at DESC, id);
+CREATE INDEX file_requests_state_deadline_idx
+    ON file_requests (state, closes_at);
+
+CREATE TABLE file_request_computers (
+    request_id TEXT NOT NULL REFERENCES file_requests(id) ON DELETE CASCADE,
+    computer_id TEXT NOT NULL REFERENCES computers(id),
+    PRIMARY KEY (request_id, computer_id)
+);
+
+CREATE INDEX file_request_computers_computer_idx
+    ON file_request_computers (computer_id, request_id);
+
+CREATE TABLE file_request_submissions (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL REFERENCES file_requests(id),
+    request_revision INTEGER NOT NULL CHECK (request_revision > 0),
+    computer_id TEXT NOT NULL REFERENCES computers(id),
+    local_user_id TEXT NOT NULL,
+    local_user_display_name TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('uploading', 'received', 'failed', 'expired', 'superseded')),
+    replaces_submission_id TEXT REFERENCES file_request_submissions(id),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    upload_expires_at INTEGER NOT NULL,
+    received_at INTEGER,
+    content_deleted_at INTEGER,
+    content_deleted_by_account_id TEXT
+);
+
+CREATE INDEX file_request_submissions_request_idx
+    ON file_request_submissions (request_id, created_at DESC, id);
+CREATE INDEX file_request_submissions_identity_idx
+    ON file_request_submissions (computer_id, local_user_id, request_id, state);
+CREATE INDEX file_request_submissions_expiry_idx
+    ON file_request_submissions (state, upload_expires_at);
+
+CREATE TABLE file_request_submission_files (
+    id TEXT PRIMARY KEY,
+    submission_id TEXT NOT NULL REFERENCES file_request_submissions(id) ON DELETE CASCADE,
+    file_name TEXT NOT NULL CHECK (length(file_name) BETWEEN 1 AND 255),
+    file_size_bytes INTEGER NOT NULL CHECK (file_size_bytes BETWEEN 0 AND 134217728),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    chunk_size_bytes INTEGER NOT NULL CHECK (chunk_size_bytes = 262144),
+    chunk_count INTEGER NOT NULL CHECK (chunk_count BETWEEN 0 AND 512),
+    state TEXT NOT NULL CHECK (state IN ('uploading', 'received')),
+    content_available INTEGER NOT NULL DEFAULT 1 CHECK (content_available IN (0, 1)),
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX file_request_submission_files_submission_idx
+    ON file_request_submission_files (submission_id, id);
+
+CREATE TABLE file_request_submission_chunks (
+    file_id TEXT NOT NULL REFERENCES file_request_submission_files(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL CHECK (chunk_index BETWEEN 0 AND 511),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    data BLOB NOT NULL CHECK (length(data) <= 262144),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (file_id, chunk_index)
 );
 
 CREATE TABLE login_attempts (
@@ -873,9 +1659,111 @@ CREATE TABLE security_policy (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     operator_mfa_policy TEXT NOT NULL
         CHECK (operator_mfa_policy IN ('optional', 'required')),
+    audit_retention_days INTEGER NOT NULL DEFAULT 30
+        CHECK (audit_retention_days BETWEEN 1 AND 3650),
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE audit_events (
+    id TEXT PRIMARY KEY,
+    actor_account_id TEXT NOT NULL,
+    actor_manager_id TEXT,
+    action TEXT NOT NULL CHECK (length(action) BETWEEN 1 AND 64),
+    target_ids_json TEXT NOT NULL CHECK (length(target_ids_json) BETWEEN 2 AND 16384),
+    occurred_at INTEGER NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('succeeded', 'denied', 'failed')),
+    reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 64)
+);
+
+CREATE INDEX audit_events_time_idx
+    ON audit_events (occurred_at DESC, id DESC);
+CREATE INDEX audit_events_actor_time_idx
+    ON audit_events (actor_account_id, occurred_at DESC, id DESC);
+CREATE INDEX audit_events_action_time_idx
+    ON audit_events (action, occurred_at DESC, id DESC);
 "#;
+
+const INTERACTION_SCHEMA_SQL: &str = r#"
+CREATE TABLE computer_interaction_revisions (
+    computer_id TEXT PRIMARY KEY REFERENCES computers(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK (revision >= 0)
+);
+
+CREATE TABLE interaction_claims (
+    id TEXT PRIMARY KEY,
+    computer_id TEXT NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    owner_account_id TEXT NOT NULL REFERENCES accounts(id),
+    owner_manager_id TEXT NOT NULL REFERENCES managers(id),
+    kind TEXT NOT NULL CHECK (kind IN (
+        'observation', 'control', 'share_source', 'share_receiver', 'attention'
+    )),
+    operation_fingerprint BLOB NOT NULL CHECK (length(operation_fingerprint) = 32),
+    state TEXT NOT NULL CHECK (state IN (
+        'requested', 'connecting', 'live', 'controlling', 'stalled',
+        'ending', 'pending_release', 'ended', 'failed'
+    )),
+    affected_computer_ids_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX interaction_claims_computer_state_idx
+    ON interaction_claims (computer_id, state, created_at, id);
+CREATE INDEX interaction_claims_owner_idx
+    ON interaction_claims (owner_account_id, owner_manager_id, state);
+"#;
+
+const ADMISSION_SCHEMA_SQL: &str = r#"
+CREATE TABLE observation_admission_grants (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    deployment_key TEXT NOT NULL,
+    account_id TEXT NOT NULL REFERENCES accounts(id),
+    manager_id TEXT NOT NULL REFERENCES managers(id),
+    manager_session_id TEXT NOT NULL,
+    computer_id TEXT NOT NULL REFERENCES computers(id),
+    endpoint_session_id TEXT NOT NULL,
+    endpoint_public_key TEXT NOT NULL,
+    enrollment_epoch INTEGER NOT NULL CHECK (enrollment_epoch > 0),
+    manager_public_key TEXT NOT NULL,
+    issued_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL CHECK (expires_at > issued_at),
+    consumed_at INTEGER,
+    endpoint_nonce_hash TEXT,
+    CHECK ((consumed_at IS NULL) = (endpoint_nonce_hash IS NULL))
+);
+
+CREATE UNIQUE INDEX observation_admission_nonce_unique
+    ON observation_admission_grants (endpoint_nonce_hash)
+    WHERE endpoint_nonce_hash IS NOT NULL;
+CREATE INDEX observation_admission_manager_time_idx
+    ON observation_admission_grants (manager_id, issued_at);
+CREATE INDEX observation_admission_expiry_idx
+    ON observation_admission_grants (expires_at, consumed_at);
+"#;
+
+/// v16 → v17: add short-lived, one-use observation admission grants.
+fn migrate_v16_to_v17(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(ADMISSION_SCHEMA_SQL)?;
+    Ok(())
+}
+
+/// v17 → v18: persist restore quarantine for the deployment and identities.
+fn migrate_v17_to_v18(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "ALTER TABLE deployment
+             ADD COLUMN recovery_quarantined INTEGER NOT NULL DEFAULT 0
+             CHECK (recovery_quarantined IN (0, 1));
+         ALTER TABLE accounts
+             ADD COLUMN recovery_quarantined INTEGER NOT NULL DEFAULT 0
+             CHECK (recovery_quarantined IN (0, 1));
+         DROP INDEX accounts_username_unique;
+         CREATE UNIQUE INDEX accounts_username_unique
+             ON accounts (username COLLATE NOCASE)
+             WHERE recovery_quarantined = 0;",
+    )?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -905,6 +1793,115 @@ mod tests {
             path
         };
         (dir, base)
+    }
+
+    /// Make a current-schema fixture represent a pre-v18 database before its
+    /// schema version is rewound by an explicit migration test.
+    fn drop_v18_recovery_columns(conn: &Connection) {
+        conn.execute_batch(
+            "DROP TABLE authority_cutovers;
+             DROP INDEX accounts_username_unique;
+             ALTER TABLE deployment DROP COLUMN predecessor_deployment_key;
+             ALTER TABLE deployment DROP COLUMN authority_generation;
+             ALTER TABLE deployment DROP COLUMN authority_state;
+             ALTER TABLE deployment DROP COLUMN recovery_quarantined;
+             ALTER TABLE accounts DROP COLUMN recovery_quarantined;
+             CREATE UNIQUE INDEX accounts_username_unique
+                 ON accounts (username COLLATE NOCASE);",
+        )
+        .expect("downgrade recovery quarantine schema fixture");
+    }
+
+    #[test]
+    fn migration_v14_to_current_adds_interaction_tables_and_local_signer() {
+        let db = open_in_memory().expect("open current in-memory schema");
+        let conn = db.lock().expect("lock in-memory store");
+        drop_v18_recovery_columns(&conn);
+        conn.execute_batch(
+            "DROP TABLE observation_admission_grants;
+             DROP TABLE interaction_claims;
+             DROP TABLE computer_interaction_revisions;
+             ALTER TABLE deployment DROP COLUMN grant_signing_secret;
+             UPDATE schema_meta SET schema_version = 14 WHERE id = 1;",
+        )
+        .expect("prepare v14 schema snapshot");
+
+        apply_migrations(&conn, 14, private_file::private_file_supported())
+            .expect("apply v14 to current migration");
+
+        assert_eq!(
+            schema_version(&conn).expect("read schema version"),
+            Some(SCHEMA_VERSION)
+        );
+        assert!(table_exists(&conn, "computer_interaction_revisions").expect("revision table"));
+        assert!(table_exists(&conn, "interaction_claims").expect("claim table"));
+        let secret: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT grant_signing_secret FROM deployment WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migrated signer secret");
+        if private_file::private_file_supported() {
+            let secret = secret.expect("verified store gets migrated signer");
+            assert_eq!(secret.len(), 32);
+            assert_ne!(secret, [0u8; 32]);
+        } else {
+            assert!(secret.is_none(), "unverified store gets no signer secret");
+        }
+    }
+
+    #[test]
+    fn deployment_signing_secret_is_stable_and_missing_authority_fails_closed() {
+        let db = open_in_memory().expect("open store");
+        let conn = db.lock().expect("lock store");
+        let first = grant_signing_secret(&conn).expect("load signer");
+        let second = grant_signing_secret(&conn).expect("load signer again");
+        assert_eq!(first, second);
+        assert_ne!(&*first, &[0u8; 32]);
+
+        conn.execute("DELETE FROM deployment WHERE id = 1", [])
+            .expect("remove authority for fail-closed check");
+        assert!(grant_signing_secret(&conn)
+            .expect_err("missing signing secret must fail closed")
+            .to_string()
+            .contains("missing"));
+    }
+
+    #[test]
+    fn unverified_store_schema_does_not_create_signing_authority() {
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        ensure_schema_with_signer(&conn, false).expect("install schema without signer");
+        let stored: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT grant_signing_secret FROM deployment WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read nullable signer field");
+        assert!(stored.is_none());
+        assert!(grant_signing_secret(&conn)
+            .expect_err("missing signer must fail closed")
+            .to_string()
+            .contains("missing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_grant_signer_survives_private_store_reopen() {
+        let (_directory, base) = real_tempdir();
+        let path = base.join("authority.db");
+        let before_restart = {
+            let db = open(&path).expect("open private store");
+            let connection = db.lock().expect("lock private store");
+            grant_signing_secret(&connection).expect("read deployment signer")
+        };
+        let after_restart = {
+            let db = open(&path).expect("reopen private store");
+            let connection = db.lock().expect("lock reopened store");
+            grant_signing_secret(&connection).expect("read deployment signer after restart")
+        };
+        assert_eq!(before_restart, after_restart);
     }
 
     /// Seed helper: create a file at `path` then force 0600 so the private
@@ -953,10 +1950,15 @@ mod tests {
             assert!(table_exists(&conn, "recovery_codes").expect("exists"));
             assert!(table_exists(&conn, "auth_challenges").expect("exists"));
             assert!(table_exists(&conn, "totp_consumptions").expect("exists"));
+            assert!(table_exists(&conn, "computer_groups").expect("groups table"));
+            assert!(table_exists(&conn, "computer_group_members").expect("group members table"));
+            assert!(table_exists(&conn, "file_jobs").expect("file jobs"));
+            assert!(table_exists(&conn, "file_job_targets").expect("file job targets"));
+            assert!(table_exists(&conn, "file_job_chunks").expect("file job chunks"));
         }
         {
             let conn = db.lock().expect("lock");
-            ensure_schema(&conn).expect("ensure again is a no-op");
+            ensure_schema_with_signer(&conn, true).expect("ensure again is a no-op");
         }
     }
 
@@ -965,7 +1967,7 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open");
         conn.execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
             .expect("create unrelated");
-        let err = ensure_schema(&conn).expect_err("must refuse");
+        let err = ensure_schema_with_signer(&conn, true).expect_err("must refuse");
         match err {
             AppError::Api { code, message, .. } => {
                 assert_eq!(code, crate::error::ErrorCode::Unprocessable);
@@ -979,7 +1981,7 @@ mod tests {
     fn fresh_empty_db_initializes_without_querying_missing_table() {
         let conn = Connection::open_in_memory().expect("open");
         assert!(!table_exists(&conn, "schema_meta").expect("probe"));
-        ensure_schema(&conn).expect("install on empty");
+        ensure_schema_with_signer(&conn, true).expect("install on empty");
         assert!(table_exists(&conn, "schema_meta").expect("probe after"));
     }
 
@@ -1140,7 +2142,7 @@ mod tests {
         create_private_db_for_seed(path);
         {
             let conn = Connection::open(path).expect("open");
-            ensure_schema(&conn).expect("install");
+            ensure_schema_with_signer(&conn, true).expect("install");
         }
         assert_no_sqlite_sidecars(path);
     }
@@ -1176,12 +2178,179 @@ mod tests {
         assert!(table_exists(&conn, "account_mfa").expect("mfa table"));
         assert!(table_exists(&conn, "recovery_codes").expect("recovery table"));
         assert!(table_exists(&conn, "auth_challenges").expect("challenge table"));
+        assert!(table_exists(&conn, "computer_groups").expect("groups table"));
+        assert!(table_exists(&conn, "computer_group_members").expect("group members table"));
         let state: String = conn
             .query_row("SELECT state FROM accounts WHERE id = 'a1'", [], |r| {
                 r.get(0)
             })
             .expect("account state");
         assert_eq!(state, "active");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn migrate_v3_to_current_takes_backup_and_adds_workflow_tables() {
+        let (_dir, base) = real_tempdir();
+        let path = base.join("v3.db");
+        let backup_dir = base.join("backups");
+        seed_current_schema_file(&path);
+        {
+            let conn = Connection::open(&path).expect("open v4 fixture");
+            drop_v18_recovery_columns(&conn);
+            conn.execute_batch(
+                "ALTER TABLE deployment DROP COLUMN grant_signing_secret;
+                 DROP TABLE observation_admission_grants;
+                 DROP TABLE interaction_claims;
+                 DROP TABLE computer_interaction_revisions;
+                 DROP TABLE file_request_submission_chunks;
+                 DROP TABLE file_request_submission_files;
+                 DROP TABLE file_request_submissions;
+                 DROP TABLE file_request_computers;
+                 DROP TABLE file_requests;
+                 DROP TABLE file_job_chunks;
+                 DROP TABLE file_job_targets;
+                 DROP TABLE file_jobs;
+                 DROP TABLE endpoint_sessions;
+                 DROP TABLE endpoint_auth_challenges;
+                 DROP TABLE computer_enrollment_invitations;
+                 DROP TABLE computer_group_members;
+                 DROP TABLE computer_groups;
+                 UPDATE schema_meta SET schema_version = 3 WHERE id = 1;",
+            )
+            .expect("downgrade test fixture to v3 shape");
+        }
+        force_private_mode(&path);
+
+        let report = migrate(&path, &backup_dir).expect("explicit v3 migration");
+        assert_eq!(report.from_version, 3);
+        assert_eq!(report.to_version, SCHEMA_VERSION);
+        assert!(
+            report.backup_path.exists(),
+            "pre-migration backup must exist"
+        );
+        force_private_mode(&report.backup_path);
+
+        let db = open(&path).expect("reopen migrated store");
+        let conn = db.lock().expect("lock");
+        assert_eq!(
+            schema_version(&conn).expect("version"),
+            Some(SCHEMA_VERSION)
+        );
+        assert!(table_exists(&conn, "computer_groups").expect("groups table"));
+        assert!(table_exists(&conn, "computer_group_members").expect("group members table"));
+        assert!(table_exists(&conn, "computer_enrollment_invitations")
+            .expect("endpoint invitation table"));
+        assert!(table_exists(&conn, "endpoint_auth_challenges").expect("endpoint challenges"));
+        assert!(table_exists(&conn, "endpoint_sessions").expect("endpoint sessions"));
+        assert!(table_exists(&conn, "file_jobs").expect("file jobs"));
+        assert!(table_exists(&conn, "file_job_targets").expect("file job targets"));
+        assert!(table_exists(&conn, "file_job_chunks").expect("file job chunks"));
+        assert!(table_exists(&conn, "file_requests").expect("file requests"));
+        assert!(table_exists(&conn, "interaction_claims").expect("interaction claims"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn migrate_v5_to_current_adds_endpoint_and_file_workflows_with_backup() {
+        let (_dir, base) = real_tempdir();
+        let path = base.join("v5.db");
+        let backup_dir = base.join("backups");
+        seed_current_schema_file(&path);
+        {
+            let conn = Connection::open(&path).expect("open v5 fixture");
+            drop_v18_recovery_columns(&conn);
+            conn.execute_batch(
+                "ALTER TABLE deployment DROP COLUMN grant_signing_secret;
+                 DROP TABLE observation_admission_grants;
+                 DROP TABLE interaction_claims;
+                 DROP TABLE computer_interaction_revisions;
+                 DROP TABLE file_request_submission_chunks;
+                 DROP TABLE file_request_submission_files;
+                 DROP TABLE file_request_submissions;
+                 DROP TABLE file_request_computers;
+                 DROP TABLE file_requests;
+                 DROP TABLE file_job_chunks;
+                 DROP TABLE file_job_targets;
+                 DROP TABLE file_jobs;
+                 DROP TABLE endpoint_sessions;
+                 DROP TABLE endpoint_auth_challenges;
+                 UPDATE schema_meta SET schema_version = 5 WHERE id = 1;",
+            )
+            .expect("downgrade test fixture to v5 shape");
+        }
+        force_private_mode(&path);
+
+        let report = migrate(&path, &backup_dir).expect("explicit v5 migration");
+        assert_eq!(report.from_version, 5);
+        assert_eq!(report.to_version, SCHEMA_VERSION);
+        assert!(report.backup_path.exists());
+        force_private_mode(&report.backup_path);
+
+        let db = open(&path).expect("reopen migrated store");
+        let conn = db.lock().expect("lock");
+        assert_eq!(
+            schema_version(&conn).expect("version"),
+            Some(SCHEMA_VERSION)
+        );
+        assert!(table_exists(&conn, "endpoint_auth_challenges").expect("challenge table"));
+        assert!(table_exists(&conn, "endpoint_sessions").expect("session table"));
+        assert!(table_exists(&conn, "file_jobs").expect("file jobs"));
+        assert!(table_exists(&conn, "file_job_targets").expect("file job targets"));
+        assert!(table_exists(&conn, "file_job_chunks").expect("file job chunks"));
+        assert!(table_exists(&conn, "file_requests").expect("file requests"));
+        assert!(table_exists(&conn, "interaction_claims").expect("interaction claims"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn migrate_v6_to_current_adds_durable_file_workflows_with_backup() {
+        let (_dir, base) = real_tempdir();
+        let path = base.join("v6.db");
+        let backup_dir = base.join("backups");
+        seed_current_schema_file(&path);
+        {
+            let conn = Connection::open(&path).expect("open v6 fixture");
+            drop_v18_recovery_columns(&conn);
+            conn.execute_batch(
+                "ALTER TABLE deployment DROP COLUMN grant_signing_secret;
+                 DROP TABLE observation_admission_grants;
+                 DROP TABLE interaction_claims;
+                 DROP TABLE computer_interaction_revisions;
+                 DROP TABLE file_request_submission_chunks;
+                 DROP TABLE file_request_submission_files;
+                 DROP TABLE file_request_submissions;
+                 DROP TABLE file_request_computers;
+                 DROP TABLE file_requests;
+                 DROP TABLE file_job_chunks;
+                 DROP TABLE file_job_targets;
+                 DROP TABLE file_jobs;
+                 ALTER TABLE endpoint_auth_challenges DROP COLUMN local_user_display_name;
+                 ALTER TABLE endpoint_auth_challenges DROP COLUMN local_user_id;
+                 ALTER TABLE endpoint_sessions DROP COLUMN local_user_display_name;
+                 ALTER TABLE endpoint_sessions DROP COLUMN local_user_id;
+                 UPDATE schema_meta SET schema_version = 6 WHERE id = 1;",
+            )
+            .expect("downgrade test fixture to v6 shape");
+        }
+        force_private_mode(&path);
+
+        let report = migrate(&path, &backup_dir).expect("explicit v6 migration");
+        assert_eq!(report.from_version, 6);
+        assert_eq!(report.to_version, SCHEMA_VERSION);
+        assert!(report.backup_path.exists());
+        force_private_mode(&report.backup_path);
+
+        let db = open(&path).expect("reopen migrated store");
+        let conn = db.lock().expect("lock");
+        assert_eq!(
+            schema_version(&conn).expect("version"),
+            Some(SCHEMA_VERSION)
+        );
+        assert!(table_exists(&conn, "file_jobs").expect("file jobs"));
+        assert!(table_exists(&conn, "file_job_targets").expect("file job targets"));
+        assert!(table_exists(&conn, "file_job_chunks").expect("file job chunks"));
+        assert!(table_exists(&conn, "interaction_claims").expect("interaction claims"));
     }
 
     /// Unix: already-current store is refused without a second migration.
@@ -1333,7 +2502,7 @@ mod tests {
     /// Seed one persisted MFA row so legacy open must refuse.
     fn seed_one_mfa_row(path: &Path) {
         let conn = Connection::open(path).expect("seed open");
-        ensure_schema(&conn).expect("schema");
+        ensure_schema_with_signer(&conn, true).expect("schema");
         conn.execute(
             "INSERT INTO accounts (
                 id, username, password_hash, state, can_operate,
