@@ -2514,7 +2514,7 @@ fn complete_cancellation_locked(
             )
         })
     {
-        let cleanup_digest_input = serde_json::to_vec((
+        let cleanup_digest_input = serde_json::to_vec(&(
             v2::CONTRACT_VERSION,
             "cancel-install",
             &record.configuration,
@@ -3275,16 +3275,16 @@ fn compose_operation_status(
                 .as_ref()
                 .is_some_and(|outcome| outcome.state == OperationState::Cancelled)
             {
-                let outcome = record.outcome.ok_or_else(|| {
+                let outcome = record.outcome.as_ref().ok_or_else(|| {
                     AppError::internal("cancelled Compose operation has no result")
                 })?;
                 return Ok(v2::OperationStatus {
                     contract_version: v2::CONTRACT_VERSION,
                     configuration: input.configuration.clone(),
-                    operation_id: Some(record.operation_id),
+                    operation_id: Some(record.operation_id.clone()),
                     action: Some(record.action),
                     state: OperationState::Cancelled,
-                    reviewed_plan_digest: Some(record.reviewed_plan_digest),
+                    reviewed_plan_digest: Some(record.reviewed_plan_digest.clone()),
                     current_phase: None,
                     phases: BTreeMap::new(),
                     cancellation_available: false,
@@ -3292,7 +3292,7 @@ fn compose_operation_status(
                     service_installed: false,
                     bootstrap_ready: false,
                     server_ready_for_enrollment: false,
-                    result: outcome.result,
+                    result: outcome.result.clone(),
                 });
             }
             return Ok(v2::OperationStatus {
@@ -5727,7 +5727,7 @@ fn reconcile_owned_resource(
     match latest_status {
         Some(ResourceStatus::Completed) => return Ok(()),
         Some(ResourceStatus::Intent) => {}
-        Some(ResourceStatus::Failed) | None => {
+        Some(ResourceStatus::Failed | ResourceStatus::RolledBack) | None => {
             record_resource_intent(adapter, journal_path, journal, resource_type, identity)?;
         }
     }
