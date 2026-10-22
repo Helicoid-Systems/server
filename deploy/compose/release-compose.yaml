@@ -1,0 +1,67 @@
+services:
+  server:
+    platform: linux/amd64
+    image: ${HELICOID_IMAGE_REF:-__HELICOID_IMAGE_REF__}
+    pull_policy: never
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    stop_grace_period: 20s
+    restart: unless-stopped
+    labels:
+      com.helicoid.managed: "true"
+      com.helicoid.operation-id: "${HELICOID_OPERATION_ID:-manual}"
+    healthcheck:
+      test: ["CMD", "hs-server", "healthcheck", "--address", "127.0.0.1:8787"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    ports:
+      - target: 8920
+        published: "${HELICOID_AUTHORITY_PORT:-8920}"
+        host_ip: "${HELICOID_PUBLISH_ADDRESS:-127.0.0.1}"
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ${HELICOID_DATA_ROOT:-/var/lib/helicoid}
+        target: /var/lib/helicoid
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HELICOID_BACKUP_DIRECTORY:-/var/lib/helicoid/backups}
+        target: ${HELICOID_BACKUP_TARGET:-/var/lib/helicoid/backups}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./tls
+        target: /run/helicoid/tls
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/helicoid-backup-control
+        target: /run/helicoid/backup-control
+        read_only: true
+        bind:
+          create_host_path: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    command:
+      - --data
+      - ${HELICOID_DATABASE_PATH:-/var/lib/helicoid/data/server.db}
+      - serve-dual
+      - --local-bind
+      - 127.0.0.1:8787
+      - --network-bind
+      - 0.0.0.0:8920
+      - --tls-cert
+      - /run/helicoid/tls/fullchain.pem
+      - --tls-key
+      - /run/helicoid/tls/private-key.pem
+      - --allow-network

@@ -76,9 +76,10 @@ as a server package. Expected product is never derived from package values.
 
 `version` (release identity) is strict `major.minor.patch` decimal, using the
 same grammar as `min_installer_version`: exactly three components, digits only,
-no leading zeros, no overflow. Malformed values refuse — they are **never**
-coerced to zero. Canonical bounded numeric triples (for example `0.1.0`,
-`0.0.0`, `1.2.3`) accept. This is signed metadata structure only: it does
+no leading zeros, and every component fits an unsigned 32-bit integer.
+Malformed values refuse — they are **never** coerced to zero. Canonical
+bounded numeric triples (for example `0.1.0`, `0.0.0`, `1.2.3`) accept. This
+is signed metadata structure only: it does
 **not** invent release names, does not authorize a release channel, and is
 separate from the required compatibility floors below.
 
@@ -123,6 +124,16 @@ Declared artifacts also:
 These path guards run **before** any affected artifact is opened. Existing
 Linux fixture nested names (`artifacts/hs-server`, `artifacts/hs-server.service`,
 `artifacts/sub/dir/file`) remain valid.
+
+The Linux systemd installation plan requires these signed artifacts:
+
+- `artifacts/hs-server` — the server and lifecycle backend
+- `artifacts/helicoid-server` — the SSH management TUI
+- `artifacts/hs-server.service` — the legacy unit input whose reviewed v2
+  install unit is rendered from the selected storage configuration
+
+The TUI is installed at `/opt/helicoid/bin/helicoid-server` beside the server
+binary so it can resolve the matching backend without a host Go or Rust toolchain.
 
 Unknown-file detection walks `artifacts/` recursively: every leaf must be a
 declared path. Directories are descended only when they are a path prefix of a

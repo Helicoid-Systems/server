@@ -1,0 +1,55 @@
+name: helicoid
+
+services:
+  server:
+    platform: linux/amd64
+    image: helicoid-server:local
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+      additional_contexts:
+        hs-core: ../../../core
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    stop_grace_period: 20s
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "hs-server", "healthcheck", "--address", "127.0.0.1:8787"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    ports:
+      - "${HELICOID_PUBLISH_ADDRESS:-127.0.0.1}:${HELICOID_AUTHORITY_PORT:-8920}:8920"
+    volumes:
+      - helicoid-state:/var/lib/helicoid
+      - type: bind
+        source: ./tls
+        target: /run/helicoid/tls
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    command:
+      - --data
+      - /var/lib/helicoid/data/server.db
+      - serve-dual
+      - --local-bind
+      - 127.0.0.1:8787
+      - --network-bind
+      - 0.0.0.0:8920
+      - --tls-cert
+      - /run/helicoid/tls/fullchain.pem
+      - --tls-key
+      - /run/helicoid/tls/private-key.pem
+      - --allow-network
+
+volumes:
+  helicoid-state:

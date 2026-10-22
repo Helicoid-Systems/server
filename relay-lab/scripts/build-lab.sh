@@ -6,12 +6,16 @@
 #                         (compile-time seam; fault injection, not OS fault)
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=pins.sh
+source "${SCRIPT_DIR}/pins.sh"
+
 LAB_ROOT="${LAB_ROOT:-/tmp/hs-finish-20261013/relay-lab}"
 SRC_DIR="${LAB_ROOT}/coturn-src"
 DEPS_DIR="${LAB_ROOT}/deps-src"
 PREFIX="${LAB_ROOT}/prefix"
 BIN_DIR="${LAB_ROOT}/bin"
-REPO_RELAY="${REPO_RELAY:-$(cd "$(dirname "$0")/.." && pwd)}"
+REPO_RELAY="${REPO_RELAY:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 PATCH_DIR="${REPO_RELAY}/patches"
 # Ordered layered patches: 0001 then 0002. Each is checked before apply;
 # reverse-check marks an already-applied patch so re-runs are idempotent.
@@ -19,8 +23,6 @@ PATCH_FILES=(
   "${PATCH_DIR}/0001-auth-lifetime-cap.patch"
   "${PATCH_DIR}/0002-precise-auth-cutoff.patch"
 )
-LIBEVENT_SRC="${DEPS_DIR}/libevent-2.1.12-stable"
-OPENSSL_PREFIX="${OPENSSL_PREFIX:-/opt/homebrew/opt/openssl}"
 
 mkdir -p "${BIN_DIR}" "${PREFIX}"
 
@@ -59,29 +61,19 @@ for _pf in "${PATCH_FILES[@]}"; do
   apply_one_patch "${_pf}"
 done
 
-echo "== build libevent (isolated prefix) =="
-if [[ ! -f "${PREFIX}/lib/libevent_core.a" ]]; then
-  if [[ ! -d "${LIBEVENT_SRC}" ]]; then
-    tar -xzf "${DEPS_DIR}/libevent-2.1.12-stable.tar.gz" -C "${DEPS_DIR}"
-  fi
-  (
-    cd "${LIBEVENT_SRC}"
-    ./configure --prefix="${PREFIX}" --disable-shared --disable-openssl --disable-samples --disable-libevent-regress
-    make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-    make install
-  )
-fi
+echo "== build libevent (isolated prefix, OpenSSL enabled) =="
+ensure_libevent "${PREFIX}" "${DEPS_DIR}"
+export_relay_dep_env "${PREFIX}"
+verify_libevent_prefix "${PREFIX}"
 
 echo "== configure coturn =="
 cd "${SRC_DIR}"
 if [[ ! -f Makefile ]]; then
   ./configure \
     --prefix="${PREFIX}" \
-    --disable-shared \
-    --disable-rabbitmq --disable-mongodb --disable-hiredis \
-    --disable-pgsql --disable-mysql --disable-sqlite \
-    CFLAGS="-I${PREFIX}/include -I${OPENSSL_PREFIX}/include -O1" \
-    LDFLAGS="-L${PREFIX}/lib -L${OPENSSL_PREFIX}/lib"
+    "${COTURN_CONFIGURE_ARGS[@]}" \
+    CFLAGS="${CFLAGS}" \
+    LDFLAGS="${LDFLAGS}"
 fi
 
 echo "== build patched (ordinary CLOCK_MONOTONIC) =="

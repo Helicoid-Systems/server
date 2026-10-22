@@ -1,0 +1,5 @@
+.git
+target
+**/.env
+deploy/compose/tls/*.pem
+deploy/compose/tls/*.key

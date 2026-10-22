@@ -12,6 +12,7 @@ fn reviewed_package() -> (TestAdapter, InstallPlan, PreflightResult, SigningKey)
     let signer = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
     let entries = [
         ("artifacts/hs-server", b"test-binary".as_slice()),
+        ("artifacts/helicoid-server", b"test-tui".as_slice()),
         ("artifacts/hs-server.service", b"test-unit".as_slice()),
     ];
     let package_manifest = PackageManifest {
@@ -93,6 +94,33 @@ fn reviewed_digest_cannot_authorize_changed_destination() {
     assert!(
         result.is_err() || !result.unwrap().ok,
         "a product/version digest does not authorize modified install resources"
+    );
+    assert!(!adapter
+        .fs
+        .lock()
+        .unwrap()
+        .contains_key(Path::new("/etc/ssh/sshd_config")));
+}
+
+#[test]
+fn stale_plan_digest_does_not_authorize_changed_plan_contents() {
+    let (adapter, mut plan, preflight, signer) = reviewed_package();
+    plan.files[0].destination = "/etc/ssh/sshd_config".into();
+    let result = machine::apply(
+        &adapter,
+        &ApplyInput {
+            contract_version: 1,
+            plan,
+            preflight,
+            confirm: true,
+            package_dir: Some(PACKAGE_DIR.into()),
+            verify_key: Some(verify_key_hex(&signer)),
+        },
+        Path::new("/tmp/hs-review-state"),
+    );
+    assert!(
+        result.is_err(),
+        "modified contents with a stale digest must refuse"
     );
     assert!(!adapter
         .fs
@@ -499,12 +527,13 @@ fn tampered_journal_cannot_redirect_remove_to_foreign_paths() {
 #[test]
 fn restart_after_partial_apply_never_touches_foreign_resources() {
     let (adapter, plan, preflight, signer) = reviewed_package();
-    // Fail late so earlier product resources already exist.
+    // Fail late so earlier product resources already exist. The current
+    // loopback-only install plan creates no firewall rules.
     adapter
         .force_failures
         .lock()
         .unwrap()
-        .insert("firewall_allow".into(), "ufw unavailable".into());
+        .insert("enable_unit".into(), "systemd unit enable refused".into());
     let state_dir = Path::new("/tmp/hs-review-state");
     let input = ApplyInput {
         contract_version: 1,
