@@ -32,7 +32,7 @@ const ALLOWED_PREFIX: &str = "artifacts/";
 /// signing key is wrong; keep parse and copy work bounded either way.
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_ARTIFACTS: usize = 256;
-const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARTIFACT_PATH_BYTES: usize = 256;
 const MAX_ARTIFACT_SEGMENT_BYTES: usize = 64;
 const MAX_ARTIFACT_SEGMENTS: usize = 16;

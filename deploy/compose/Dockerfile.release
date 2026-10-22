@@ -1,0 +1,19 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 helicoid \
+    && useradd --uid 10001 --gid 10001 --home-dir /var/lib/helicoid \
+        --no-create-home --shell /usr/sbin/nologin helicoid \
+    && install -d --owner 10001 --group 10001 --mode 0700 \
+        /var/lib/helicoid /var/lib/helicoid/data /var/lib/helicoid/.config \
+        /run/helicoid/tls /run/helicoid/backup-control
+
+COPY hs-server /usr/local/bin/hs-server
+COPY helicoid-server /usr/local/bin/helicoid-server
+
+ENV HOME=/var/lib/helicoid
+EXPOSE 8920
+USER 10001:10001
+ENTRYPOINT ["hs-server"]

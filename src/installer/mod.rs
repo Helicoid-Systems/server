@@ -5,9 +5,11 @@
 //! Phase journal for atomic, idempotent, resumable operations.
 
 pub mod adapter;
+pub mod lifecycle_v2;
 pub mod machine;
 pub mod manifest;
 pub mod models;
+pub mod tuf_update;
 
 #[cfg(target_os = "linux")]
 pub use adapter::LinuxAdapter;

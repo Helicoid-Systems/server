@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signer, SigningKey};
 use hs_server::error::ErrorCode;
-use hs_server::installer::adapter::{CommandAdapter, TestAdapter};
+use hs_server::installer::adapter::{CommandAdapter, DockerComposeRuntime, TestAdapter};
+use hs_server::installer::lifecycle_v2;
 use hs_server::installer::machine;
 use hs_server::installer::manifest;
 use hs_server::installer::models::*;
@@ -39,6 +40,11 @@ fn create_test_manifest(product: &str, version: &str) -> PackageManifest {
                 path: "artifacts/hs-server".to_string(),
                 sha256: manifest::sha256_hex(b"fake-binary-content"),
                 size_bytes: b"fake-binary-content".len() as u64,
+            },
+            ArtifactEntry {
+                path: "artifacts/helicoid-server".to_string(),
+                sha256: manifest::sha256_hex(b"fake-tui-content"),
+                size_bytes: b"fake-tui-content".len() as u64,
             },
             ArtifactEntry {
                 path: "artifacts/hs-server.service".to_string(),
@@ -137,6 +143,10 @@ fn setup_package(
         b"fake-binary-content".to_vec(),
     );
     fs.insert(
+        package_dir.join("artifacts/helicoid-server"),
+        b"fake-tui-content".to_vec(),
+    );
+    fs.insert(
         package_dir.join("artifacts/hs-server.service"),
         b"[Unit]\nDescription=Helicoid Systems coordination server\n".to_vec(),
     );
@@ -161,6 +171,10 @@ fn setup_signed_package(adapter: &TestAdapter) -> (String, String) {
     fs.insert(
         package_dir.join("artifacts/hs-server"),
         b"fake-binary-content".to_vec(),
+    );
+    fs.insert(
+        package_dir.join("artifacts/helicoid-server"),
+        b"fake-tui-content".to_vec(),
     );
     fs.insert(
         package_dir.join("artifacts/hs-server.service"),
@@ -561,7 +575,7 @@ fn preflight_occupied_required_port_fails() {
         .port_listeners
         .lock()
         .unwrap()
-        .insert((8920, "tcp".into()), "nginx".into());
+        .insert((8787, "tcp".into()), "nginx".into());
     let input = PreflightInput {
         contract_version: CONTRACT_VERSION,
         target: PreflightTarget {
@@ -815,7 +829,7 @@ fn apply_rejects_occupied_port() {
         .port_listeners
         .lock()
         .unwrap()
-        .insert((8920, "tcp".into()), "nginx".into());
+        .insert((8787, "tcp".into()), "nginx".into());
     let plan = create_install_plan();
     let input = ApplyInput {
         contract_version: CONTRACT_VERSION,
@@ -864,8 +878,8 @@ fn full_apply_creates_resources_and_journal() {
     assert!(commands_contain(&adapter, "useradd"));
     assert!(adapter.existing_users.lock().unwrap().contains("hs-server"));
 
-    // Verify firewall rules were added.
-    assert!(commands_contain(&adapter, "ufw"));
+    // The loopback-only development plan must not change the host firewall.
+    assert!(!commands_contain(&adapter, "ufw"));
 
     // Verify journal was saved.
     let journal_path = state_dir.join("journal.json");
@@ -986,12 +1000,12 @@ fn cancel_tracked_resources_are_rollbackable() {
     let plan = create_install_plan();
     let state_dir = PathBuf::from("/opt/helicoid/.installer");
 
-    // Fail at firewall phase.
+    // Fail during unit setup before the service is enabled.
     adapter
         .force_failures
         .lock()
         .unwrap()
-        .insert("firewall_allow".into(), "ufw not available".into());
+        .insert("enable_unit".into(), "systemd unit enable refused".into());
 
     let input = ApplyInput {
         contract_version: CONTRACT_VERSION,
@@ -1004,15 +1018,18 @@ fn cancel_tracked_resources_are_rollbackable() {
 
     let result = machine::apply(&adapter, &input, &state_dir).unwrap();
     assert!(!result.ok);
-    assert_eq!(result.phase, "firewall");
+    assert_eq!(result.phase, "units");
 
-    // Verify resources up to firewall were tracked.
+    // Verify the failed unit action has a durable resource entry and the
+    // signed unit artifact remains inside the installer-owned path.
     let journal_path = state_dir.join("journal.json");
     let journal_bytes = adapter.read_file(&journal_path).unwrap();
     let journal: Journal = serde_json::from_slice(&journal_bytes).unwrap();
     assert!(!journal.resources_created.service_users.is_empty());
     assert!(!journal.resources_created.directories.is_empty());
-    assert!(!journal.resources_created.units.is_empty());
+    assert!(journal.resources.iter().any(|resource| {
+        resource.resource_type == "unit" && resource.status == ResourceStatus::Failed
+    }));
 
     // Remove should clean up tracked resources.
     adapter.force_failures.lock().unwrap().clear();
@@ -1030,7 +1047,7 @@ fn cancel_tracked_resources_are_rollbackable() {
     );
     assert!(remove_result.data_preserved);
     assert!(commands_contain(&adapter, "userdel"));
-    assert!(commands_contain(&adapter, "remove_unit"));
+    assert!(!adapter.path_exists(Path::new("/etc/systemd/system/hs-server.service")));
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,6 +1245,10 @@ fn remove_with_delete_data_removes_data() {
         verify_key: Some(verify_key),
     };
     machine::apply(&adapter, &apply_input, &state_dir).unwrap();
+    adapter.fs.lock().unwrap().insert(
+        PathBuf::from("/var/lib/helicoid/data/hs-server.db"),
+        b"preserved".to_vec(),
+    );
 
     let remove_input = RemoveInput {
         contract_version: CONTRACT_VERSION,
@@ -1239,6 +1260,618 @@ fn remove_with_delete_data_removes_data() {
     assert!(result.ok);
     assert!(!result.data_preserved);
     assert!(result.data_dir.is_none());
+}
+
+#[test]
+fn remove_refuses_symlinked_data_directory_during_purge() {
+    let adapter = TestAdapter::new();
+    let (verify_key, pkg_dir) = setup_signed_package(&adapter);
+    let state_dir = PathBuf::from("/opt/helicoid/.installer");
+    let apply_input = ApplyInput {
+        contract_version: CONTRACT_VERSION,
+        plan: create_install_plan(),
+        preflight: create_preflight_ok(),
+        confirm: true,
+        package_dir: Some(pkg_dir),
+        verify_key: Some(verify_key),
+    };
+    machine::apply(&adapter, &apply_input, &state_dir).unwrap();
+    let database_path = PathBuf::from("/var/lib/helicoid/data/hs-server.db");
+    adapter
+        .fs
+        .lock()
+        .unwrap()
+        .insert(database_path.clone(), b"must-survive".to_vec());
+    adapter
+        .symlinks
+        .lock()
+        .unwrap()
+        .insert(PathBuf::from("/var/lib/helicoid/data"));
+
+    let result = machine::remove(
+        &adapter,
+        &RemoveInput {
+            contract_version: CONTRACT_VERSION,
+            state_dir: state_dir.to_string_lossy().to_string(),
+            delete_data: true,
+            confirm: true,
+        },
+    )
+    .unwrap();
+    assert!(!result.ok);
+    assert!(adapter.path_exists(&database_path));
+    assert!(adapter.path_exists(&state_dir.join("journal.json")));
+}
+
+#[test]
+fn remove_refuses_dangling_symlink_at_owned_product_path() {
+    let adapter = TestAdapter::new();
+    let (verify_key, pkg_dir) = setup_signed_package(&adapter);
+    let state_dir = PathBuf::from("/opt/helicoid/.installer");
+    let apply_input = ApplyInput {
+        contract_version: CONTRACT_VERSION,
+        plan: create_install_plan(),
+        preflight: create_preflight_ok(),
+        confirm: true,
+        package_dir: Some(pkg_dir),
+        verify_key: Some(verify_key),
+    };
+    machine::apply(&adapter, &apply_input, &state_dir).unwrap();
+
+    let binary_path = PathBuf::from("/opt/helicoid/bin/hs-server");
+    adapter.fs.lock().unwrap().remove(&binary_path);
+    adapter.symlinks.lock().unwrap().insert(binary_path.clone());
+
+    let result = machine::remove(
+        &adapter,
+        &RemoveInput {
+            contract_version: CONTRACT_VERSION,
+            state_dir: state_dir.to_string_lossy().to_string(),
+            delete_data: false,
+            confirm: true,
+        },
+    )
+    .unwrap();
+
+    assert!(!result.ok);
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.contains("symlink at product path")));
+    assert!(adapter.path_exists(&state_dir.join("journal.json")));
+}
+
+#[test]
+fn failed_remove_keeps_journal_for_a_safe_retry() {
+    let adapter = TestAdapter::new();
+    let (verify_key, pkg_dir) = setup_signed_package(&adapter);
+    let state_dir = PathBuf::from("/opt/helicoid/.installer");
+    let apply_input = ApplyInput {
+        contract_version: CONTRACT_VERSION,
+        plan: create_install_plan(),
+        preflight: create_preflight_ok(),
+        confirm: true,
+        package_dir: Some(pkg_dir),
+        verify_key: Some(verify_key),
+    };
+    machine::apply(&adapter, &apply_input, &state_dir).unwrap();
+
+    let remove_input = RemoveInput {
+        contract_version: CONTRACT_VERSION,
+        state_dir: state_dir.to_string_lossy().to_string(),
+        delete_data: false,
+        confirm: true,
+    };
+    adapter.fs.lock().unwrap().insert(
+        PathBuf::from("/var/lib/helicoid/data/hs-server.db"),
+        b"preserved".to_vec(),
+    );
+    adapter.force_failures.lock().unwrap().insert(
+        "remove_file".into(),
+        "simulated file removal refusal".into(),
+    );
+    let failed = machine::remove(&adapter, &remove_input).unwrap();
+    assert!(!failed.ok);
+    assert!(adapter.path_exists(&state_dir.join("journal.json")));
+
+    adapter.force_failures.lock().unwrap().clear();
+    let retried = machine::remove(&adapter, &remove_input).unwrap();
+    assert!(retried.ok, "retry must finish: {:?}", retried.errors);
+    assert!(!adapter.path_exists(&state_dir.join("journal.json")));
+    assert!(adapter.path_exists(Path::new("/var/lib/helicoid/data")));
+}
+
+#[test]
+fn remove_v2_records_completion_and_preserves_data() {
+    let adapter = TestAdapter::new();
+    let (verify_key, pkg_dir) = setup_signed_package(&adapter);
+    let state_dir = PathBuf::from("/opt/helicoid/.installer");
+    let apply_input = ApplyInput {
+        contract_version: CONTRACT_VERSION,
+        plan: create_install_plan(),
+        preflight: create_preflight_ok(),
+        confirm: true,
+        package_dir: Some(pkg_dir),
+        verify_key: Some(verify_key),
+    };
+    machine::apply(&adapter, &apply_input, &state_dir).unwrap();
+    let database_path = Path::new("/var/lib/helicoid/data/hs-server.db");
+    adapter
+        .fs
+        .lock()
+        .unwrap()
+        .insert(database_path.to_path_buf(), b"preserve-me".to_vec());
+
+    let input = lifecycle_v2::RemoveInput {
+        contract_version: lifecycle_v2::CONTRACT_VERSION,
+        configuration: v2_deployment_configuration(true),
+        confirm: true,
+    };
+    assert!(machine::lifecycle_capabilities_v2()
+        .supported_actions
+        .contains(&lifecycle_v2::LifecycleAction::Remove));
+    let status = machine::remove_v2(&adapter, &input, &state_dir).unwrap();
+    assert_eq!(status.state, lifecycle_v2::OperationState::Completed);
+    assert_eq!(status.action, Some(lifecycle_v2::LifecycleAction::Remove));
+    assert!(!status.service_installed);
+    assert!(adapter.path_exists(database_path));
+    assert!(adapter.path_exists(&state_dir.join("operation-v2.json")));
+    assert!(!adapter.path_exists(&state_dir.join("journal.json")));
+
+    let inspected = machine::operation_status_v2(
+        &adapter,
+        &lifecycle_v2::StatusInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration: input.configuration,
+        },
+        &state_dir,
+    )
+    .unwrap();
+    assert_eq!(inspected.state, lifecycle_v2::OperationState::Completed);
+    assert_eq!(inspected.result.code, "removed");
+}
+
+#[test]
+fn lifecycle_capabilities_explain_each_unavailable_recovery_operation() {
+    use hs_server::installer::lifecycle_v2::LifecycleAction;
+
+    let capabilities = machine::lifecycle_capabilities_v2();
+    assert!(!capabilities.online_update);
+    assert!(!capabilities.backup_and_restore);
+    assert!(!capabilities
+        .supported_actions
+        .contains(&LifecycleAction::Update));
+    assert!(!capabilities
+        .supported_actions
+        .contains(&LifecycleAction::Rollback));
+    assert!(!capabilities
+        .supported_actions
+        .contains(&LifecycleAction::Restore));
+
+    let update_reason = capabilities
+        .reasons_unavailable
+        .get("online_update")
+        .expect("online update must explain why it is unavailable");
+    let restore_reason = capabilities
+        .reasons_unavailable
+        .get("backup_and_restore")
+        .expect("deployment restore must explain why it is unavailable");
+    let cutover_reason = capabilities
+        .reasons_unavailable
+        .get("cutover")
+        .expect("two-host cutover must explain why it is unavailable");
+
+    assert!(update_reason.contains("downgrade protection"));
+    assert!(restore_reason.contains("restore-to-new-file"));
+    assert!(cutover_reason.contains("predecessor is fenced"));
+    assert_ne!(update_reason, restore_reason);
+    assert!(capabilities
+        .reasons_unavailable
+        .contains_key("online_update_backup_restore"));
+}
+
+#[test]
+fn remove_v2_refuses_a_symlinked_state_directory_before_host_changes() {
+    let adapter = TestAdapter::new();
+    let (verify_key, pkg_dir) = setup_signed_package(&adapter);
+    let state_dir = PathBuf::from("/opt/helicoid/.installer");
+    let apply_input = ApplyInput {
+        contract_version: CONTRACT_VERSION,
+        plan: create_install_plan(),
+        preflight: create_preflight_ok(),
+        confirm: true,
+        package_dir: Some(pkg_dir),
+        verify_key: Some(verify_key),
+    };
+    machine::apply(&adapter, &apply_input, &state_dir).unwrap();
+    adapter.symlinks.lock().unwrap().insert(state_dir.clone());
+
+    let error = machine::remove_v2(
+        &adapter,
+        &lifecycle_v2::RemoveInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration: v2_deployment_configuration(true),
+            confirm: true,
+        },
+        &state_dir,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Forbidden);
+    assert!(adapter.path_exists(Path::new("/opt/helicoid/bin/hs-server")));
+    assert!(adapter.path_exists(&state_dir.join("journal.json")));
+}
+
+#[test]
+fn remove_v2_deletes_data_only_when_the_confirmed_configuration_requests_it() {
+    let adapter = TestAdapter::new();
+    let (verify_key, pkg_dir) = setup_signed_package(&adapter);
+    let state_dir = PathBuf::from("/opt/helicoid/.installer");
+    let apply_input = ApplyInput {
+        contract_version: CONTRACT_VERSION,
+        plan: create_install_plan(),
+        preflight: create_preflight_ok(),
+        confirm: true,
+        package_dir: Some(pkg_dir),
+        verify_key: Some(verify_key),
+    };
+    machine::apply(&adapter, &apply_input, &state_dir).unwrap();
+    let database_path = Path::new("/var/lib/helicoid/data/hs-server.db");
+    adapter
+        .fs
+        .lock()
+        .unwrap()
+        .insert(database_path.to_path_buf(), b"delete-me".to_vec());
+
+    let status = machine::remove_v2(
+        &adapter,
+        &lifecycle_v2::RemoveInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration: v2_deployment_configuration(false),
+            confirm: true,
+        },
+        &state_dir,
+    )
+    .unwrap();
+    assert_eq!(status.state, lifecycle_v2::OperationState::Completed);
+    assert!(!adapter.path_exists(database_path));
+}
+
+#[test]
+fn remove_v2_failure_is_durable_and_retryable() {
+    let adapter = TestAdapter::new();
+    let (verify_key, pkg_dir) = setup_signed_package(&adapter);
+    let state_dir = PathBuf::from("/opt/helicoid/.installer");
+    let apply_input = ApplyInput {
+        contract_version: CONTRACT_VERSION,
+        plan: create_install_plan(),
+        preflight: create_preflight_ok(),
+        confirm: true,
+        package_dir: Some(pkg_dir),
+        verify_key: Some(verify_key),
+    };
+    machine::apply(&adapter, &apply_input, &state_dir).unwrap();
+    let input = lifecycle_v2::RemoveInput {
+        contract_version: lifecycle_v2::CONTRACT_VERSION,
+        configuration: v2_deployment_configuration(true),
+        confirm: true,
+    };
+
+    adapter.force_failures.lock().unwrap().insert(
+        "remove_file".into(),
+        "simulated file removal refusal".into(),
+    );
+    let failed = machine::remove_v2(&adapter, &input, &state_dir).unwrap();
+    assert_eq!(
+        failed.state,
+        lifecycle_v2::OperationState::AttentionRequired
+    );
+    assert!(failed.resume_available);
+    assert_eq!(failed.result.code, "remove_failed");
+    assert!(failed.result.summary.contains("incomplete"));
+    assert!(adapter.path_exists(&state_dir.join("journal.json")));
+
+    adapter.force_failures.lock().unwrap().clear();
+    let retried = machine::remove_v2(&adapter, &input, &state_dir).unwrap();
+    assert_eq!(retried.state, lifecycle_v2::OperationState::Completed);
+    assert_eq!(retried.operation_id, failed.operation_id);
+    assert!(!adapter.path_exists(&state_dir.join("journal.json")));
+}
+
+fn v2_deployment_configuration(
+    preserve_data_on_remove: bool,
+) -> lifecycle_v2::DeploymentConfiguration {
+    lifecycle_v2::DeploymentConfiguration {
+        deployment_kind: lifecycle_v2::DeploymentKind::LinuxSystemd,
+        network: lifecycle_v2::NetworkConfiguration {
+            scope: lifecycle_v2::NetworkScope::LoopbackDevelopment,
+            authority_port: 8787,
+            bind_address: None,
+            client_hostname: None,
+        },
+        storage: lifecycle_v2::StorageConfiguration {
+            data_directory: "/var/lib/helicoid/data".to_string(),
+            backup_directory: "/var/lib/helicoid/backups".to_string(),
+            preserve_data_on_remove,
+        },
+    }
+}
+
+#[test]
+fn v2_compose_preflight_reports_runtime_but_respects_host_failures() {
+    let mut adapter = TestAdapter::new();
+    adapter.is_root = false;
+    *adapter.docker_compose_runtime.lock().unwrap() = Some(DockerComposeRuntime {
+        docker_server_version: "28.3.3".into(),
+        compose_version: "2.39.4".into(),
+    });
+    let mut configuration = v2_deployment_configuration(true);
+    configuration.deployment_kind = lifecycle_v2::DeploymentKind::LinuxCompose;
+
+    let preflight = machine::preflight_v2(
+        &adapter,
+        &lifecycle_v2::PreflightInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration,
+        },
+    )
+    .unwrap();
+
+    let runtime = preflight
+        .docker_compose_runtime
+        .expect("Compose preflight reports runtime diagnostics");
+    assert!(runtime.available);
+    assert_eq!(runtime.docker_server_version.as_deref(), Some("28.3.3"));
+    assert_eq!(runtime.compose_version.as_deref(), Some("2.39.4"));
+    assert!(
+        !preflight.ok,
+        "failed host preconditions must block planning"
+    );
+    assert!(!preflight.host_checks.ok);
+    assert_eq!(
+        preflight
+            .capabilities
+            .supported_deployment_kinds
+            .contains(&lifecycle_v2::DeploymentKind::LinuxCompose),
+        cfg!(target_os = "linux")
+    );
+}
+
+#[test]
+fn v2_compose_preflight_fails_closed_when_engine_or_plugin_is_unavailable() {
+    let adapter = TestAdapter::new();
+    let mut configuration = v2_deployment_configuration(true);
+    configuration.deployment_kind = lifecycle_v2::DeploymentKind::LinuxCompose;
+
+    let preflight = machine::preflight_v2(
+        &adapter,
+        &lifecycle_v2::PreflightInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration,
+        },
+    )
+    .unwrap();
+
+    let runtime = preflight
+        .docker_compose_runtime
+        .expect("Compose preflight reports missing runtime");
+    assert!(!runtime.available);
+    assert!(runtime.reason.is_some());
+    assert!(!preflight.ok);
+}
+
+#[test]
+fn v2_compose_plan_requires_signed_compose_artifacts() {
+    let adapter = TestAdapter::new();
+    *adapter.docker_compose_runtime.lock().unwrap() = Some(DockerComposeRuntime {
+        docker_server_version: "28.3.3".into(),
+        compose_version: "2.39.4".into(),
+    });
+    let (verify_key, package_dir) = setup_signed_package(&adapter);
+    let verify_key: [u8; 32] = hex::decode(verify_key).unwrap().try_into().unwrap();
+    let mut configuration = v2_deployment_configuration(true);
+    configuration.deployment_kind = lifecycle_v2::DeploymentKind::LinuxCompose;
+    let preflight = machine::preflight_v2(
+        &adapter,
+        &lifecycle_v2::PreflightInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration: configuration.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(preflight.ok);
+    let plan = machine::plan_v2(
+        &adapter,
+        &lifecycle_v2::PlanInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration,
+            preflight,
+            package_dir,
+        },
+        Some(&verify_key),
+    )
+    .unwrap();
+
+    assert!(!plan.ok);
+    assert!(plan.plan.is_none());
+    assert!(plan
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("missing artifacts required")));
+}
+
+#[test]
+fn v2_installs_with_reviewed_custom_storage_and_service_ownership() {
+    let adapter = TestAdapter::new();
+    let (verify_key, package_dir) = setup_signed_package(&adapter);
+    let verify_key: [u8; 32] = hex::decode(verify_key).unwrap().try_into().unwrap();
+    let mut configuration = v2_deployment_configuration(true);
+    configuration.storage.data_directory = "/var/lib/helicoid/data/classroom-a".into();
+    configuration.storage.backup_directory = "/var/backups/helicoid/daily".into();
+
+    let preflight = machine::preflight_v2(
+        &adapter,
+        &lifecycle_v2::PreflightInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration: configuration.clone(),
+        },
+    )
+    .unwrap();
+    assert!(preflight.ok);
+    assert!(adapter
+        .storage_query_paths
+        .lock()
+        .unwrap()
+        .contains(&PathBuf::from("/var/lib/helicoid/data/classroom-a")));
+
+    let planned = machine::plan_v2(
+        &adapter,
+        &lifecycle_v2::PlanInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration: configuration.clone(),
+            preflight: preflight.clone(),
+            package_dir: package_dir.clone(),
+        },
+        Some(&verify_key),
+    )
+    .unwrap();
+    assert!(planned.ok, "{:?}", planned.error);
+    assert!(planned.capabilities.custom_storage_directories);
+    let plan = planned.plan.unwrap();
+    assert!(!plan
+        .files
+        .iter()
+        .any(|file| file.destination == "/etc/systemd/system/hs-server.service"));
+
+    let state_dir = PathBuf::from("/opt/helicoid/.installer");
+    assert_eq!(
+        machine::stored_configuration_v2(&adapter, &state_dir).unwrap(),
+        None
+    );
+    let apply_input = lifecycle_v2::ApplyInput {
+        contract_version: lifecycle_v2::CONTRACT_VERSION,
+        configuration: configuration.clone(),
+        preflight,
+        plan,
+        reviewed_plan_digest: planned.reviewed_plan_digest.unwrap(),
+        confirm: true,
+        package_dir,
+        verify_key: hex::encode(verify_key),
+    };
+    adapter.force_failures.lock().unwrap().insert(
+        "enable_unit".into(),
+        "simulated service enable interruption".into(),
+    );
+    let interrupted = machine::apply_v2(&adapter, &apply_input, &state_dir).unwrap();
+    assert_eq!(
+        interrupted.state,
+        lifecycle_v2::OperationState::AttentionRequired
+    );
+    adapter.force_failures.lock().unwrap().clear();
+    let status = machine::resume_v2(&adapter, &apply_input, &state_dir).unwrap();
+
+    assert_eq!(status.state, lifecycle_v2::OperationState::Completed);
+    assert_eq!(
+        machine::stored_configuration_v2(&adapter, &state_dir).unwrap(),
+        Some(configuration.clone())
+    );
+    let unit = String::from_utf8(
+        adapter
+            .read_file(Path::new("/etc/systemd/system/hs-server.service"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(unit.contains("--data /var/lib/helicoid/data/classroom-a/hs-server.db"));
+    assert!(adapter.path_exists(Path::new("/var/lib/helicoid/data/classroom-a")));
+    assert!(adapter.path_exists(Path::new("/var/backups/helicoid/daily")));
+    assert!(commands_contain(&adapter, "chown"));
+
+    adapter.fs.lock().unwrap().insert(
+        PathBuf::from("/var/lib/helicoid/data/classroom-a/hs-server.db"),
+        b"preserve-custom-data".to_vec(),
+    );
+    let mut removal_configuration = configuration;
+    removal_configuration.storage.preserve_data_on_remove = false;
+    let removed = machine::remove_v2(
+        &adapter,
+        &lifecycle_v2::RemoveInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration: removal_configuration,
+            confirm: true,
+        },
+        &state_dir,
+    )
+    .unwrap();
+    assert_eq!(
+        removed.state,
+        lifecycle_v2::OperationState::Completed,
+        "{:?}",
+        removed.result
+    );
+    assert!(!adapter.path_exists(Path::new("/var/lib/helicoid/data/classroom-a/hs-server.db")));
+}
+
+#[test]
+fn v2_preflight_refuses_an_existing_selected_backup_root() {
+    let adapter = TestAdapter::new();
+    adapter
+        .create_dir_all(Path::new("/var/backups/helicoid"))
+        .unwrap();
+    let mut configuration = v2_deployment_configuration(true);
+    configuration.storage.backup_directory = "/var/backups/helicoid/daily".into();
+
+    let preflight = machine::preflight_v2(
+        &adapter,
+        &lifecycle_v2::PreflightInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration,
+        },
+    )
+    .unwrap();
+
+    assert!(!preflight.ok);
+    let backup_root = preflight
+        .host_checks
+        .checks
+        .paths
+        .checked
+        .iter()
+        .find(|check| check.path == "/var/backups/helicoid")
+        .expect("selected backup root must be included in preflight");
+    assert_eq!(backup_root.reason.as_deref(), Some("path already exists"));
+    assert!(adapter.commands.lock().unwrap().is_empty());
+}
+
+#[test]
+fn v2_refuses_storage_paths_outside_owned_roots_and_symlinks() {
+    let adapter = TestAdapter::new();
+    let mut configuration = v2_deployment_configuration(true);
+    configuration.storage.data_directory = "/etc/helicoid/data".into();
+    let error = machine::preflight_v2(
+        &adapter,
+        &lifecycle_v2::PreflightInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration: configuration.clone(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::BadRequest);
+
+    configuration.storage.data_directory = "/var/lib/helicoid/data/classroom-a".into();
+    adapter
+        .symlinks
+        .lock()
+        .unwrap()
+        .insert(PathBuf::from("/var/lib/helicoid"));
+    let error = machine::preflight_v2(
+        &adapter,
+        &lifecycle_v2::PreflightInput {
+            contract_version: lifecycle_v2::CONTRACT_VERSION,
+            configuration,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Forbidden);
 }
 
 // ---------------------------------------------------------------------------

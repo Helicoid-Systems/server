@@ -22,6 +22,21 @@ pub struct FileMetadata {
     pub is_dir: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerComposeRuntime {
+    pub docker_server_version: String,
+    pub compose_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleLockError {
+    Busy,
+    Unavailable(String),
+}
+
+/// A held lock that serializes installer mutations until dropped.
+pub trait LifecycleOperationLock: Send {}
+
 // ---------------------------------------------------------------------------
 // Adapter trait
 // ---------------------------------------------------------------------------
@@ -35,6 +50,13 @@ pub trait CommandAdapter: Send + Sync {
 
     /// Write file contents (creates parent dirs if needed).
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), String>;
+
+    /// Create a new root-private file without replacing an existing path.
+    fn write_new_private_file(&self, path: &Path, contents: &[u8]) -> Result<(), String>;
+
+    /// Verify that the stored encrypted backup credential is a private,
+    /// regular file beneath trusted directories.
+    fn verify_backup_credential_file(&self, path: &Path) -> Result<(), String>;
 
     /// Create a directory (and parents).
     fn create_dir_all(&self, path: &Path) -> Result<(), String>;
@@ -60,11 +82,29 @@ pub trait CommandAdapter: Send + Sync {
     /// List directory entries (filenames only, non-recursive).
     fn list_dir(&self, path: &Path) -> Result<Vec<String>, String>;
 
-    /// Copy a file from src to dst.
-    fn copy_file(&self, src: &Path, dst: &Path) -> Result<(), String>;
+    /// Copy a package artifact whose size and digest came from its signed manifest.
+    fn copy_verified_file(
+        &self,
+        src: &Path,
+        dst: &Path,
+        expected_sha256: &str,
+        expected_size_bytes: u64,
+    ) -> Result<(), String>;
+
+    /// Copy validated root-private TLS material to the Compose project with a
+    /// dedicated container UID and restrictive destination permissions.
+    fn copy_compose_tls_file(
+        &self,
+        src: &Path,
+        dst: &Path,
+        certificate: bool,
+    ) -> Result<(), String>;
 
     /// Set file permissions (unix mode, e.g. 0o755).
     fn set_permissions(&self, path: &Path, mode: u32) -> Result<(), String>;
+
+    /// Set the owner of a Helicoid-managed path.
+    fn set_owner(&self, path: &Path, owner: &str) -> Result<(), String>;
 
     // --- System queries (preflight) ---
 
@@ -77,7 +117,8 @@ pub trait CommandAdapter: Send + Sync {
     /// Check if running as root.
     fn query_is_root(&self) -> Result<bool, String>;
 
-    /// Get storage info for a path: (total_bytes, available_bytes).
+    /// Get storage info for a path, resolving to its nearest existing
+    /// directory when the requested deployment directory has not been created.
     fn query_storage(&self, path: &Path) -> Result<(u64, u64), String>;
 
     /// Check if a TCP/UDP port has a listener. Returns process name if found.
@@ -88,6 +129,47 @@ pub trait CommandAdapter: Send + Sync {
 
     /// Check if a system user exists.
     fn query_user_exists(&self, username: &str) -> Result<bool, String>;
+
+    /// Return the Docker Engine and Compose plugin versions when both are
+    /// installed and the current user can reach the daemon. `None` means the
+    /// runtime is not ready for Compose deployment.
+    fn query_docker_compose_runtime(&self) -> Result<Option<DockerComposeRuntime>, String>;
+
+    /// Run Docker with the configured local daemon, fixed argv, bounded wait,
+    /// and bounded output. Callers must build arguments from reviewed
+    /// configuration and verified package paths; this method never invokes a
+    /// shell or inherits a remote Docker context.
+    fn docker_command(&self, args: &[String]) -> Result<(Vec<u8>, Vec<u8>, i32), String>;
+
+    /// Run a fixed Docker command with a caller-selected short deadline.
+    /// Adapters that cannot enforce a separate deadline fall back to their
+    /// bounded Docker command implementation.
+    fn docker_command_with_timeout(
+        &self,
+        args: &[String],
+        timeout_secs: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>, i32), String> {
+        let _ = timeout_secs;
+        self.docker_command(args)
+    }
+
+    /// Run one fixed Docker command while sending a bounded secret on stdin.
+    /// The secret must never be included in recorded arguments or diagnostics.
+    fn docker_command_with_input(
+        &self,
+        args: &[String],
+        input: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, i32), String>;
+
+    /// Validate a TLS certificate/key pair for the selected bind and client
+    /// name, returning the verified leaf certificate SHA-256 digest.
+    fn validate_tls_inputs(
+        &self,
+        bind: &str,
+        certificate_path: &Path,
+        private_key_path: &Path,
+        expected_server_name: &str,
+    ) -> Result<String, String>;
 
     // --- System commands (apply/remove) ---
 
@@ -100,6 +182,14 @@ pub trait CommandAdapter: Send + Sync {
     /// Install a systemd unit file.
     fn install_unit(&self, name: &str, content: &[u8]) -> Result<(), String>;
 
+    /// Encrypt an unattended-backup secret with the local systemd credential
+    /// key. Implementations must keep the plaintext out of argv and logs.
+    fn encrypt_backup_credential(&self, plaintext: &[u8]) -> Result<Vec<u8>, String>;
+
+    /// Whether the installed systemd manager supports encrypted unit
+    /// credentials (`LoadCredentialEncrypted=`, available since systemd 250).
+    fn supports_encrypted_credentials(&self) -> Result<bool, String>;
+
     /// Remove a systemd unit file.
     fn remove_unit(&self, name: &str) -> Result<(), String>;
 
@@ -108,6 +198,9 @@ pub trait CommandAdapter: Send + Sync {
 
     /// Enable a systemd unit.
     fn enable_unit(&self, name: &str) -> Result<(), String>;
+
+    /// Start a systemd unit.
+    fn start_unit(&self, name: &str) -> Result<(), String>;
 
     /// Disable a systemd unit.
     fn disable_unit(&self, name: &str) -> Result<(), String>;
@@ -126,6 +219,12 @@ pub trait CommandAdapter: Send + Sync {
 
     /// Get the current timestamp as ISO 8601.
     fn now_iso8601(&self) -> String;
+
+    /// Serialize lifecycle mutations across processes for this installation.
+    fn acquire_lifecycle_operation_lock(
+        &self,
+        state_dir: &Path,
+    ) -> Result<Box<dyn LifecycleOperationLock>, LifecycleLockError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +242,8 @@ pub struct RecordedCommand {
 pub struct TestAdapter {
     /// In-memory filesystem: path -> contents.
     pub fs: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
+    /// In-memory directories, distinct from empty regular files.
+    pub directories: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     /// Recorded commands.
     pub commands: Arc<Mutex<Vec<RecordedCommand>>>,
     /// Pre-configured port listeners.
@@ -151,6 +252,8 @@ pub struct TestAdapter {
     pub existing_users: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Pre-configured existing units.
     pub existing_units: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Pre-configured Docker Engine and Compose runtime state.
+    pub docker_compose_runtime: Arc<Mutex<Option<DockerComposeRuntime>>>,
     /// OS info: (name, version).
     pub os_info: (String, String),
     /// Architecture.
@@ -159,26 +262,47 @@ pub struct TestAdapter {
     pub is_root: bool,
     /// Storage: (total, available).
     pub storage: (u64, u64),
+    /// Paths supplied to storage checks, for configuration-bound assertions.
+    pub storage_query_paths: Arc<Mutex<Vec<PathBuf>>>,
     /// Force command failures (command name -> error message).
     pub force_failures: Arc<Mutex<HashMap<String, String>>>,
     /// Paths that report as symlinks via `symlink_metadata`.
     pub symlinks: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Held lifecycle locks, shared by clones of the same test fixture.
+    pub operation_locks: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+}
+
+struct TestLifecycleOperationLock {
+    operation_locks: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    state_dir: PathBuf,
+}
+
+impl LifecycleOperationLock for TestLifecycleOperationLock {}
+
+impl Drop for TestLifecycleOperationLock {
+    fn drop(&mut self) {
+        self.operation_locks.lock().unwrap().remove(&self.state_dir);
+    }
 }
 
 impl TestAdapter {
     pub fn new() -> Self {
         TestAdapter {
             fs: Arc::new(Mutex::new(HashMap::new())),
+            directories: Arc::new(Mutex::new(std::collections::HashSet::new())),
             commands: Arc::new(Mutex::new(Vec::new())),
             port_listeners: Arc::new(Mutex::new(HashMap::new())),
             existing_users: Arc::new(Mutex::new(std::collections::HashSet::new())),
             existing_units: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            docker_compose_runtime: Arc::new(Mutex::new(None)),
             os_info: ("ubuntu".into(), "26.04".into()),
             arch: "x86_64".into(),
             is_root: true,
             storage: (100 * 1024 * 1024 * 1024, 50 * 1024 * 1024 * 1024),
+            storage_query_paths: Arc::new(Mutex::new(Vec::new())),
             force_failures: Arc::new(Mutex::new(HashMap::new())),
             symlinks: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            operation_locks: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -195,6 +319,15 @@ impl TestAdapter {
             Err(msg.clone())
         } else {
             Ok(())
+        }
+    }
+
+    fn record_directories(&self, path: &Path) {
+        let mut directories = self.directories.lock().unwrap();
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component);
+            directories.insert(current.clone());
         }
     }
 }
@@ -215,19 +348,46 @@ impl CommandAdapter for TestAdapter {
 
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), String> {
         self.check_failure("write_file")?;
-        let mut fs = self.fs.lock().unwrap();
-        // Auto-create parent dirs.
         if let Some(parent) = path.parent() {
-            fs.entry(parent.to_path_buf()).or_default();
+            self.record_directories(parent);
         }
+        self.directories.lock().unwrap().remove(path);
+        let mut fs = self.fs.lock().unwrap();
         fs.insert(path.to_path_buf(), contents.to_vec());
         Ok(())
     }
 
+    fn write_new_private_file(&self, path: &Path, contents: &[u8]) -> Result<(), String> {
+        self.check_failure("write_new_private_file")?;
+        if self.path_exists(path) || self.symlink_metadata(path).is_ok() {
+            return Err(format!(
+                "private file destination already exists: {}",
+                path.display()
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            self.record_directories(parent);
+        }
+        self.fs
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), contents.to_vec());
+        Ok(())
+    }
+
+    fn verify_backup_credential_file(&self, path: &Path) -> Result<(), String> {
+        self.check_failure("verify_backup_credential_file")?;
+        let metadata = self.symlink_metadata(path)?;
+        if metadata.is_symlink || metadata.is_dir {
+            Err("backup credential is not a regular file".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
     fn create_dir_all(&self, path: &Path) -> Result<(), String> {
         self.check_failure("create_dir_all")?;
-        let mut fs = self.fs.lock().unwrap();
-        fs.entry(path.to_path_buf()).or_default();
+        self.record_directories(path);
         Ok(())
     }
 
@@ -235,13 +395,30 @@ impl CommandAdapter for TestAdapter {
         self.check_failure("remove_file")?;
         let mut fs = self.fs.lock().unwrap();
         fs.remove(path);
+        drop(fs);
+        self.directories.lock().unwrap().remove(path);
         Ok(())
     }
 
     fn remove_dir(&self, path: &Path) -> Result<(), String> {
         self.check_failure("remove_dir")?;
-        let mut fs = self.fs.lock().unwrap();
-        fs.remove(path);
+        if self
+            .fs
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|entry| entry != path && entry.starts_with(path))
+            || self
+                .directories
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry != path && entry.starts_with(path))
+        {
+            return Err(format!("directory is not empty: {}", path.display()));
+        }
+        self.fs.lock().unwrap().remove(path);
+        self.directories.lock().unwrap().remove(path);
         Ok(())
     }
 
@@ -250,34 +427,63 @@ impl CommandAdapter for TestAdapter {
         let mut fs = self.fs.lock().unwrap();
         let prefix = path.to_path_buf();
         fs.retain(|k, _| !k.starts_with(&prefix) && k != &prefix);
+        drop(fs);
+        self.directories
+            .lock()
+            .unwrap()
+            .retain(|entry| !entry.starts_with(&prefix) && entry != &prefix);
         Ok(())
     }
 
     fn path_exists(&self, path: &Path) -> bool {
-        let fs = self.fs.lock().unwrap();
-        if fs.contains_key(path) {
+        let exact_file = self.fs.lock().unwrap().contains_key(path);
+        let exact_directory = self.directories.lock().unwrap().contains(path);
+        if exact_file || exact_directory {
             return true;
         }
-        // Also check if any key starts with this path (directory exists).
-        fs.keys().any(|k| k.starts_with(path))
+        let has_file_below = self
+            .fs
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|entry| entry.starts_with(path));
+        has_file_below
+            || self
+                .directories
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with(path))
     }
 
     fn metadata(&self, path: &Path) -> Result<FileMetadata, String> {
         // Follows symlinks: reports the target entry, never is_symlink.
-        let fs = self.fs.lock().unwrap();
-        if let Some(data) = fs.get(path) {
-            return Ok(FileMetadata {
-                len: data.len() as u64,
-                is_symlink: false,
-                is_dir: false,
-            });
-        }
-        // Directory implied by a descendant entry (matches path_exists).
-        if fs.keys().any(|k| k.starts_with(path) && k != path) {
+        let exact_directory = self.directories.lock().unwrap().contains(path);
+        let has_file_below = self
+            .fs
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|entry| entry != path && entry.starts_with(path));
+        let has_directory_below = self
+            .directories
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry != path && entry.starts_with(path));
+        let is_directory = exact_directory || has_file_below || has_directory_below;
+        if is_directory {
             return Ok(FileMetadata {
                 len: 0,
                 is_symlink: false,
                 is_dir: true,
+            });
+        }
+        if let Some(data) = self.fs.lock().unwrap().get(path) {
+            return Ok(FileMetadata {
+                len: data.len() as u64,
+                is_symlink: false,
+                is_dir: false,
             });
         }
         Err(format!("path not found: {}", path.display()))
@@ -313,7 +519,13 @@ impl CommandAdapter for TestAdapter {
         Ok(entries)
     }
 
-    fn copy_file(&self, src: &Path, dst: &Path) -> Result<(), String> {
+    fn copy_verified_file(
+        &self,
+        src: &Path,
+        dst: &Path,
+        expected_sha256: &str,
+        expected_size_bytes: u64,
+    ) -> Result<(), String> {
         self.check_failure("copy_file")?;
         let data = {
             let fs = self.fs.lock().unwrap();
@@ -321,13 +533,54 @@ impl CommandAdapter for TestAdapter {
                 .cloned()
                 .ok_or_else(|| format!("source not found: {}", src.display()))?
         };
+        if data.len() as u64 != expected_size_bytes
+            || crate::installer::manifest::sha256_hex(&data) != expected_sha256
+        {
+            return Err(format!("verified artifact changed: {}", src.display()));
+        }
+        if let Some(parent) = dst.parent() {
+            self.record_directories(parent);
+        }
+        self.directories.lock().unwrap().remove(dst);
         let mut fs = self.fs.lock().unwrap();
         fs.insert(dst.to_path_buf(), data);
         Ok(())
     }
 
+    fn copy_compose_tls_file(
+        &self,
+        src: &Path,
+        dst: &Path,
+        certificate: bool,
+    ) -> Result<(), String> {
+        self.check_failure("copy_compose_tls_file")?;
+        let data = self
+            .fs
+            .lock()
+            .unwrap()
+            .get(src)
+            .cloned()
+            .ok_or_else(|| format!("TLS source not found: {}", src.display()))?;
+        if self.path_exists(dst) || self.symlink_metadata(dst).is_ok() {
+            return Err(format!("TLS destination already exists: {}", dst.display()));
+        }
+        if let Some(parent) = dst.parent() {
+            self.record_directories(parent);
+        }
+        self.fs.lock().unwrap().insert(dst.to_path_buf(), data);
+        self.set_owner(dst, "10001:10001")?;
+        self.set_permissions(dst, if certificate { 0o444 } else { 0o400 })
+    }
+
     fn set_permissions(&self, _path: &Path, _mode: u32) -> Result<(), String> {
         self.check_failure("set_permissions")?;
+        Ok(())
+    }
+
+    fn set_owner(&self, path: &Path, owner: &str) -> Result<(), String> {
+        self.check_failure("set_owner")?;
+        let path = path.to_string_lossy();
+        self.record("chown", &[owner, &path]);
         Ok(())
     }
 
@@ -346,8 +599,12 @@ impl CommandAdapter for TestAdapter {
         Ok(self.is_root)
     }
 
-    fn query_storage(&self, _path: &Path) -> Result<(u64, u64), String> {
+    fn query_storage(&self, path: &Path) -> Result<(u64, u64), String> {
         self.check_failure("query_storage")?;
+        self.storage_query_paths
+            .lock()
+            .unwrap()
+            .push(path.to_path_buf());
         Ok(self.storage)
     }
 
@@ -359,14 +616,60 @@ impl CommandAdapter for TestAdapter {
 
     fn query_unit_exists(&self, unit_name: &str) -> Result<bool, String> {
         self.check_failure("query_unit_exists")?;
-        let units = self.existing_units.lock().unwrap();
-        Ok(units.contains(unit_name))
+        if self.existing_units.lock().unwrap().contains(unit_name) {
+            return Ok(true);
+        }
+        let fragment = PathBuf::from(format!("/etc/systemd/system/{unit_name}"));
+        if self.path_exists(&fragment) || self.symlinks.lock().unwrap().contains(&fragment) {
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn query_user_exists(&self, username: &str) -> Result<bool, String> {
         self.check_failure("query_user_exists")?;
         let users = self.existing_users.lock().unwrap();
         Ok(users.contains(username))
+    }
+
+    fn query_docker_compose_runtime(&self) -> Result<Option<DockerComposeRuntime>, String> {
+        self.check_failure("query_docker_compose_runtime")?;
+        Ok(self.docker_compose_runtime.lock().unwrap().clone())
+    }
+
+    fn docker_command(&self, args: &[String]) -> Result<(Vec<u8>, Vec<u8>, i32), String> {
+        self.check_failure("docker_command")?;
+        self.commands.lock().unwrap().push(RecordedCommand {
+            command: "docker".to_string(),
+            args: args.to_vec(),
+        });
+        Ok((Vec::new(), Vec::new(), 0))
+    }
+
+    fn docker_command_with_input(
+        &self,
+        args: &[String],
+        _input: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, i32), String> {
+        self.check_failure("docker_command_with_input")?;
+        self.commands.lock().unwrap().push(RecordedCommand {
+            command: "docker".to_string(),
+            args: args.to_vec(),
+        });
+        Ok((Vec::new(), Vec::new(), 0))
+    }
+
+    fn validate_tls_inputs(
+        &self,
+        _bind: &str,
+        _certificate_path: &Path,
+        _private_key_path: &Path,
+        _expected_server_name: &str,
+    ) -> Result<String, String> {
+        // The TLS transport suite tests real parsing, key matching, and SAN
+        // validation. Installer tests use this deterministic fixture so they
+        // never read host certificate paths.
+        Ok("a".repeat(64))
     }
 
     fn create_system_user(&self, username: &str, _home_dir: &Path) -> Result<(), String> {
@@ -385,17 +688,42 @@ impl CommandAdapter for TestAdapter {
         Ok(())
     }
 
-    fn install_unit(&self, name: &str, _content: &[u8]) -> Result<(), String> {
+    fn install_unit(&self, name: &str, content: &[u8]) -> Result<(), String> {
         self.check_failure("install_unit")?;
         self.record("install_unit", &[name]);
+        self.write_file(
+            &PathBuf::from(format!("/etc/systemd/system/{name}")),
+            content,
+        )?;
         let mut units = self.existing_units.lock().unwrap();
         units.insert(name.to_string());
         Ok(())
     }
 
+    fn encrypt_backup_credential(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        self.check_failure("encrypt_backup_credential")?;
+        if plaintext.len() < 16 || plaintext.len() > 4096 {
+            return Err("backup credential length is outside the supported range".to_string());
+        }
+        self.record(
+            "systemd-creds",
+            &["encrypt", "--name=helicoid-backup-passphrase", "-", "-"],
+        );
+        Ok(b"test-encrypted-systemd-credential".to_vec())
+    }
+
+    fn supports_encrypted_credentials(&self) -> Result<bool, String> {
+        self.check_failure("supports_encrypted_credentials")?;
+        Ok(true)
+    }
+
     fn remove_unit(&self, name: &str) -> Result<(), String> {
         self.check_failure("remove_unit")?;
         self.record("remove_unit", &[name]);
+        self.fs
+            .lock()
+            .unwrap()
+            .remove(&PathBuf::from(format!("/etc/systemd/system/{name}")));
         let mut units = self.existing_units.lock().unwrap();
         units.remove(name);
         Ok(())
@@ -410,6 +738,12 @@ impl CommandAdapter for TestAdapter {
     fn enable_unit(&self, name: &str) -> Result<(), String> {
         self.check_failure("enable_unit")?;
         self.record("systemctl", &["enable", name]);
+        Ok(())
+    }
+
+    fn start_unit(&self, name: &str) -> Result<(), String> {
+        self.check_failure("start_unit")?;
+        self.record("systemctl", &["start", name]);
         Ok(())
     }
 
@@ -466,6 +800,24 @@ impl CommandAdapter for TestAdapter {
 
     fn now_iso8601(&self) -> String {
         "2026-01-15T10:30:00Z".to_string()
+    }
+
+    fn acquire_lifecycle_operation_lock(
+        &self,
+        state_dir: &Path,
+    ) -> Result<Box<dyn LifecycleOperationLock>, LifecycleLockError> {
+        self.check_failure("lifecycle_operation_lock")
+            .map_err(LifecycleLockError::Unavailable)?;
+        let state_dir = state_dir.to_path_buf();
+        let mut locks = self.operation_locks.lock().unwrap();
+        if !locks.insert(state_dir.clone()) {
+            return Err(LifecycleLockError::Busy);
+        }
+        drop(locks);
+        Ok(Box::new(TestLifecycleOperationLock {
+            operation_locks: Arc::clone(&self.operation_locks),
+            state_dir,
+        }))
     }
 }
 
@@ -827,17 +1179,59 @@ pub fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 pub struct LinuxAdapter;
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+struct UnixLifecycleOperationLock {
+    _file: std::fs::File,
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+impl LifecycleOperationLock for UnixLifecycleOperationLock {}
+
 /// Absolute paths for system commands used by LinuxAdapter.
 #[cfg(target_os = "linux")]
 const CMD_USERADD: &str = "/usr/sbin/useradd";
 #[cfg(target_os = "linux")]
 const CMD_USERDEL: &str = "/usr/sbin/userdel";
 #[cfg(target_os = "linux")]
+const CMD_CHOWN: &str = "/usr/bin/chown";
+#[cfg(target_os = "linux")]
 const CMD_SYSTEMCTL: &str = "/usr/bin/systemctl";
+#[cfg(target_os = "linux")]
+const CMD_SYSTEMD_CREDS: &str = "/usr/bin/systemd-creds";
 #[cfg(target_os = "linux")]
 const CMD_UFW: &str = "/usr/sbin/ufw";
 #[cfg(target_os = "linux")]
 const CMD_UNAME: &str = "/usr/bin/uname";
+#[cfg(target_os = "linux")]
+const CMD_DOCKER: &str = "/usr/bin/docker";
+#[cfg(target_os = "linux")]
+const DOCKER_SOCKET_ENDPOINT: &str = "unix:///var/run/docker.sock";
+
+#[cfg(target_os = "linux")]
+fn validate_docker_command_args(args: &[String]) -> Result<(), String> {
+    const MAX_DOCKER_ARGS: usize = 64;
+    const MAX_DOCKER_ARG_BYTES: usize = 8192;
+
+    if args.is_empty() || args.len() > MAX_DOCKER_ARGS {
+        return Err("Docker command has an invalid argument count".to_string());
+    }
+    let total_bytes = args.iter().try_fold(0usize, |total, arg| {
+        if arg.as_bytes().contains(&0)
+            || arg == "--host"
+            || arg.starts_with("--host=")
+            || arg == "-H"
+            || arg == "--context"
+            || arg.starts_with("--context=")
+        {
+            return None;
+        }
+        total.checked_add(arg.len())
+    });
+    if total_bytes.is_none_or(|bytes| bytes > MAX_DOCKER_ARG_BYTES) {
+        return Err("Docker command arguments are invalid or exceed the size bound".to_string());
+    }
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 impl LinuxAdapter {
@@ -939,6 +1333,123 @@ impl LinuxAdapter {
         Ok((stdout, stderr, status.code().unwrap_or(-1)))
     }
 
+    /// Run one fixed command with bounded plaintext stdin. Secret bytes are
+    /// held only in zeroizing memory and are never included in argv or errors.
+    fn run_command_with_input(
+        argv: &[&str],
+        input: &[u8],
+        timeout_secs: u64,
+    ) -> AppResult<(Vec<u8>, Vec<u8>, i32)> {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+
+        const MAX_CMD_OUTPUT: usize = 64 * 1024;
+        if argv.is_empty() {
+            return Err(AppError::internal("empty command argv"));
+        }
+        if input.len() > 4096 {
+            return Err(AppError::bad_request(
+                "systemd credential input exceeds the supported bound",
+            ));
+        }
+
+        let mut cmd = Command::new(argv[0]);
+        cmd.args(&argv[1..])
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|_| AppError::internal("could not start systemd credential encryption"))?;
+        let mut stdin_pipe = child
+            .stdin
+            .take()
+            .ok_or_else(|| AppError::internal("systemd credential stdin is unavailable"))?;
+        let secret = zeroize::Zeroizing::new(input.to_vec());
+        let input_handle = std::thread::spawn(move || stdin_pipe.write_all(&secret));
+
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let out_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(ref mut pipe) = stdout_pipe {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if buf.len() < MAX_CMD_OUTPUT {
+                                let room = MAX_CMD_OUTPUT - buf.len();
+                                buf.extend_from_slice(&chunk[..n.min(room)]);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            buf
+        });
+        let err_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(ref mut pipe) = stderr_pipe {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if buf.len() < MAX_CMD_OUTPUT {
+                                let room = MAX_CMD_OUTPUT - buf.len();
+                                buf.extend_from_slice(&chunk[..n.min(room)]);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            buf
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = input_handle.join();
+                    return Err(AppError::internal(
+                        "systemd credential encryption timed out",
+                    ));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = input_handle.join();
+                    return Err(AppError::internal(
+                        "could not inspect systemd credential encryption status",
+                    ));
+                }
+            }
+        };
+        let input_result = input_handle
+            .join()
+            .map_err(|_| AppError::internal("systemd credential input failed"))?;
+        input_result.map_err(|_| AppError::internal("systemd credential input failed"))?;
+        let stdout = out_handle.join().unwrap_or_default();
+        let stderr = err_handle.join().unwrap_or_default();
+        if stdout.len() == MAX_CMD_OUTPUT || stderr.len() == MAX_CMD_OUTPUT {
+            return Err(AppError::internal(
+                "systemd credential command output exceeded its bound",
+            ));
+        }
+        Ok((stdout, stderr, status.code().unwrap_or(-1)))
+    }
+
     /// Read /etc/os-release and parse key=value pairs.
     fn parse_os_release() -> AppResult<(String, String)> {
         let content = std::fs::read_to_string("/etc/os-release")
@@ -963,6 +1474,25 @@ impl LinuxAdapter {
 
         Ok((id, version))
     }
+
+    fn docker_version_output(argv: &[&str]) -> Result<Option<String>, String> {
+        let (stdout, _, code) = Self::run_command(argv, 10).map_err(|error| error.to_string())?;
+        if code != 0 {
+            return Ok(None);
+        }
+        let value = std::str::from_utf8(&stdout)
+            .map_err(|_| "Docker returned a non-UTF-8 version string".to_string())?
+            .trim();
+        if value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
+        {
+            return Err("Docker returned an invalid version string".to_string());
+        }
+        Ok(Some(value.to_string()))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -973,6 +1503,16 @@ impl CommandAdapter for LinuxAdapter {
 
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), String> {
         write_file_atomic(path, contents)
+    }
+
+    fn write_new_private_file(&self, path: &Path, contents: &[u8]) -> Result<(), String> {
+        crate::private_file::create_new_private_file(path, contents)
+            .map_err(|error| format!("create private file '{}': {error}", path.display()))
+    }
+
+    fn verify_backup_credential_file(&self, path: &Path) -> Result<(), String> {
+        crate::private_file::verify_private_store_file(path)
+            .map_err(|error| format!("verify backup credential '{}': {error}", path.display()))
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<(), String> {
@@ -1029,14 +1569,190 @@ impl CommandAdapter for LinuxAdapter {
         Ok(names)
     }
 
-    fn copy_file(&self, src: &Path, dst: &Path) -> Result<(), String> {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir '{}': {e}", parent.display()))?;
+    fn copy_verified_file(
+        &self,
+        src: &Path,
+        dst: &Path,
+        expected_sha256: &str,
+        expected_size_bytes: u64,
+    ) -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+        use std::fs::{self, OpenOptions};
+        use std::io::{Read, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        const COPY_BUFFER_BYTES: usize = 64 * 1024;
+        if expected_size_bytes > super::manifest::MAX_ARTIFACT_BYTES {
+            return Err("signed artifact exceeds the configured copy bound".to_string());
         }
-        std::fs::copy(src, dst)
-            .map_err(|e| format!("cp '{}' '{}': {e}", src.display(), dst.display()))?;
-        Ok(())
+        let mut source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(src)
+            .map_err(|error| format!("open signed artifact '{}': {error}", src.display()))?;
+        let metadata = source
+            .metadata()
+            .map_err(|error| format!("inspect signed artifact '{}': {error}", src.display()))?;
+        if !metadata.is_file() || metadata.len() != expected_size_bytes {
+            return Err(format!("signed artifact shape changed: {}", src.display()));
+        }
+
+        let parent = dst
+            .parent()
+            .ok_or_else(|| format!("destination has no parent: {}", dst.display()))?;
+        let temporary_path = parent.join(format!(".helicoid-install-{}.tmp", uuid::Uuid::new_v4()));
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary_path)
+            .map_err(|error| {
+                format!(
+                    "create private artifact staging file '{}': {error}",
+                    temporary_path.display()
+                )
+            })?;
+
+        let result = (|| {
+            let mut hasher = Sha256::new();
+            let mut copied_bytes = 0u64;
+            let mut buffer = [0u8; COPY_BUFFER_BYTES];
+            loop {
+                let count = source.read(&mut buffer).map_err(|error| {
+                    format!("read signed artifact '{}': {error}", src.display())
+                })?;
+                if count == 0 {
+                    break;
+                }
+                copied_bytes = copied_bytes
+                    .checked_add(count as u64)
+                    .ok_or_else(|| "signed artifact size overflow".to_string())?;
+                if copied_bytes > expected_size_bytes {
+                    return Err(format!(
+                        "signed artifact grew while copying: {}",
+                        src.display()
+                    ));
+                }
+                hasher.update(&buffer[..count]);
+                temporary.write_all(&buffer[..count]).map_err(|error| {
+                    format!("stage signed artifact '{}': {error}", dst.display())
+                })?;
+            }
+            if copied_bytes != expected_size_bytes
+                || hex::encode(hasher.finalize()) != expected_sha256
+            {
+                return Err(format!("signed artifact digest changed: {}", src.display()));
+            }
+            temporary
+                .sync_all()
+                .map_err(|error| format!("sync staged artifact '{}': {error}", dst.display()))?;
+            drop(temporary);
+            fs::rename(&temporary_path, dst).map_err(|error| {
+                format!(
+                    "atomically install artifact '{}' to '{}': {error}",
+                    src.display(),
+                    dst.display()
+                )
+            })?;
+            let parent_directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(parent)
+                .map_err(|error| {
+                    format!(
+                        "open installed artifact directory '{}': {error}",
+                        parent.display()
+                    )
+                })?;
+            parent_directory.sync_all().map_err(|error| {
+                format!(
+                    "sync installed artifact directory '{}': {error}",
+                    parent.display()
+                )
+            })?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary_path);
+        }
+        result
+    }
+
+    fn copy_compose_tls_file(
+        &self,
+        src: &Path,
+        dst: &Path,
+        certificate: bool,
+    ) -> Result<(), String> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
+        const CONTAINER_OWNER: &str = "10001:10001";
+        const ALLOWED_SOURCES: &[&str] = &[
+            "/etc/ssl/helicoid/fullchain.pem",
+            "/etc/ssl/helicoid/private-key.pem",
+        ];
+        const ALLOWED_DESTINATIONS: &[&str] = &[
+            "/opt/helicoid/compose/tls/fullchain.pem",
+            "/opt/helicoid/compose/tls/private-key.pem",
+        ];
+
+        let expected_source = if certificate {
+            Path::new("/etc/ssl/helicoid/fullchain.pem")
+        } else {
+            Path::new("/etc/ssl/helicoid/private-key.pem")
+        };
+        let expected_destination = if certificate {
+            Path::new("/opt/helicoid/compose/tls/fullchain.pem")
+        } else {
+            Path::new("/opt/helicoid/compose/tls/private-key.pem")
+        };
+        if src != expected_source
+            || dst != expected_destination
+            || !ALLOWED_SOURCES.contains(&src.to_str().unwrap_or_default())
+            || !ALLOWED_DESTINATIONS.contains(&dst.to_str().unwrap_or_default())
+        {
+            return Err("refusing unsupported Compose TLS source or destination".to_string());
+        }
+
+        let mut source = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(src)
+            .map_err(|error| format!("open root-private TLS source: {error}"))?;
+        let metadata = source
+            .metadata()
+            .map_err(|error| format!("inspect root-private TLS source: {error}"))?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() == 0
+            || metadata.len() > MAX_TLS_FILE_BYTES
+        {
+            return Err("TLS source must be a bounded root-owned private regular file".to_string());
+        }
+        let mut contents = zeroize::Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+        source
+            .take(MAX_TLS_FILE_BYTES + 1)
+            .read_to_end(&mut contents)
+            .map_err(|error| format!("read root-private TLS source: {error}"))?;
+        if contents.len() as u64 != metadata.len() {
+            return Err("TLS source size changed while copying".to_string());
+        }
+
+        match std::fs::symlink_metadata(dst) {
+            Ok(_) => return Err(format!("TLS destination already exists: {}", dst.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect TLS destination: {error}")),
+        }
+
+        let destination_mode = if certificate { 0o444 } else { 0o400 };
+        write_file_atomic(dst, contents.as_slice())?;
+        self.set_owner(dst, CONTAINER_OWNER)?;
+        self.set_permissions(dst, destination_mode)
     }
 
     fn set_permissions(&self, path: &Path, mode: u32) -> Result<(), String> {
@@ -1044,6 +1760,44 @@ impl CommandAdapter for LinuxAdapter {
         let perms = std::fs::Permissions::from_mode(mode);
         std::fs::set_permissions(path, perms)
             .map_err(|e| format!("chmod '{}': {e}", path.display()))
+    }
+
+    fn set_owner(&self, path: &Path, owner: &str) -> Result<(), String> {
+        let path_text = path.to_string_lossy();
+        let storage_roots = [
+            "/var/lib/helicoid/data",
+            "/var/lib/helicoid/backups",
+            "/var/backups/helicoid",
+        ];
+        let allowed_container_tls_path = owner == "10001:10001"
+            && (path == Path::new("/opt/helicoid/compose/tls/fullchain.pem")
+                || path == Path::new("/opt/helicoid/compose/tls/private-key.pem"));
+        let allowed_container_storage_path = owner == "10001:10001"
+            && (path == Path::new("/var/lib/helicoid")
+                || storage_roots
+                    .iter()
+                    .any(|root| path == Path::new(root) || path.starts_with(root)));
+        if (owner != "hs-server" && !allowed_container_tls_path && !allowed_container_storage_path)
+            || !path.is_absolute()
+            || path_text.is_empty()
+            || path_text.as_bytes().contains(&0)
+            || (!allowed_container_tls_path
+                && !allowed_container_storage_path
+                && !storage_roots
+                    .iter()
+                    .any(|root| path == Path::new(root) || path.starts_with(root)))
+        {
+            return Err("refusing unsupported owner or path".to_string());
+        }
+        let (_, _, code) = Self::run_command(&[CMD_CHOWN, "--", owner, &path_text], 30)
+            .map_err(|e| e.to_string())?;
+        if code != 0 {
+            return Err(format!(
+                "chown {owner} '{}' exited with code {code}",
+                path.display()
+            ));
+        }
+        Ok(())
     }
 
     fn query_os(&self) -> Result<(String, String), String> {
@@ -1065,13 +1819,26 @@ impl CommandAdapter for LinuxAdapter {
     }
 
     fn query_storage(&self, path: &Path) -> Result<(u64, u64), String> {
-        let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
-            .map_err(|_| format!("invalid path: {}", path.display()))?;
+        let storage_path = path
+            .ancestors()
+            .find(|candidate| candidate.is_dir())
+            .ok_or_else(|| {
+                format!(
+                    "no existing directory for storage path '{}'",
+                    path.display()
+                )
+            })?;
+        let c_path = std::ffi::CString::new(storage_path.to_string_lossy().as_bytes())
+            .map_err(|_| format!("invalid path: {}", storage_path.display()))?;
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         // SAFETY: statvfs writes to stat; c_path is valid CString.
         let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
         if rc != 0 {
-            return Err(format!("statvfs failed for '{}': {}", path.display(), rc));
+            return Err(format!(
+                "statvfs failed for '{}': {}",
+                storage_path.display(),
+                rc
+            ));
         }
         let block_size = if stat.f_frsize > 0 {
             stat.f_frsize as u64
@@ -1183,6 +1950,109 @@ impl CommandAdapter for LinuxAdapter {
         Ok(false)
     }
 
+    fn query_docker_compose_runtime(&self) -> Result<Option<DockerComposeRuntime>, String> {
+        if !Path::new(CMD_DOCKER).is_file() {
+            return Ok(None);
+        }
+        let Some(docker_server_version) = Self::docker_version_output(&[
+            CMD_DOCKER,
+            "--host",
+            DOCKER_SOCKET_ENDPOINT,
+            "info",
+            "--format",
+            "{{.ServerVersion}}",
+        ])?
+        else {
+            return Ok(None);
+        };
+        let Some(compose_version) = Self::docker_version_output(&[
+            CMD_DOCKER,
+            "--host",
+            DOCKER_SOCKET_ENDPOINT,
+            "compose",
+            "version",
+            "--short",
+        ])?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(DockerComposeRuntime {
+            docker_server_version,
+            compose_version,
+        }))
+    }
+
+    fn docker_command(&self, args: &[String]) -> Result<(Vec<u8>, Vec<u8>, i32), String> {
+        const DOCKER_COMMAND_TIMEOUT_SECS: u64 = 600;
+        validate_docker_command_args(args)?;
+
+        let mut argv = vec![
+            CMD_DOCKER.to_string(),
+            "--host".to_string(),
+            DOCKER_SOCKET_ENDPOINT.to_string(),
+        ];
+        argv.extend(args.iter().cloned());
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        Self::run_command(&argv_refs, DOCKER_COMMAND_TIMEOUT_SECS)
+            .map_err(|error| error.to_string())
+    }
+
+    fn docker_command_with_timeout(
+        &self,
+        args: &[String],
+        timeout_secs: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>, i32), String> {
+        validate_docker_command_args(args)?;
+        if !(1..=10).contains(&timeout_secs) {
+            return Err("bounded Docker command timeout is outside its allowed range".to_string());
+        }
+        let mut argv = vec![
+            CMD_DOCKER.to_string(),
+            "--host".to_string(),
+            DOCKER_SOCKET_ENDPOINT.to_string(),
+        ];
+        argv.extend(args.iter().cloned());
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        Self::run_command(&argv_refs, timeout_secs).map_err(|error| error.to_string())
+    }
+
+    fn docker_command_with_input(
+        &self,
+        args: &[String],
+        input: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, i32), String> {
+        const DOCKER_COMMAND_TIMEOUT_SECS: u64 = 6 * 60 * 60;
+        validate_docker_command_args(args)?;
+
+        let mut argv = vec![
+            CMD_DOCKER.to_string(),
+            "--host".to_string(),
+            DOCKER_SOCKET_ENDPOINT.to_string(),
+        ];
+        argv.extend(args.iter().cloned());
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        Self::run_command_with_input(&argv_refs, input, DOCKER_COMMAND_TIMEOUT_SECS)
+            .map_err(|error| error.to_string())
+    }
+
+    fn validate_tls_inputs(
+        &self,
+        bind: &str,
+        certificate_path: &Path,
+        private_key_path: &Path,
+        expected_server_name: &str,
+    ) -> Result<String, String> {
+        crate::tls::validate_serve_tls_inputs_with_network_and_name(
+            bind,
+            certificate_path,
+            private_key_path,
+            true,
+            Some(expected_server_name),
+        )
+        .map(|transport| transport.certificate_sha256().to_string())
+        .map_err(|error| error.to_string())
+    }
+
     fn create_system_user(&self, username: &str, home_dir: &Path) -> Result<(), String> {
         let (_, _, code) = Self::run_command(
             &[
@@ -1216,6 +2086,42 @@ impl CommandAdapter for LinuxAdapter {
         self.write_file(&path, content)
     }
 
+    fn encrypt_backup_credential(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let (encrypted, _, code) = Self::run_command_with_input(
+            &[
+                CMD_SYSTEMD_CREDS,
+                "encrypt",
+                "--name=helicoid-backup-passphrase",
+                "-",
+                "-",
+            ],
+            plaintext,
+            15,
+        )
+        .map_err(|_| "systemd credential encryption could not be completed".to_string())?;
+        if code != 0 || encrypted.is_empty() {
+            return Err(
+                "systemd-creds could not encrypt the unattended-backup credential".to_string(),
+            );
+        }
+        Ok(encrypted)
+    }
+
+    fn supports_encrypted_credentials(&self) -> Result<bool, String> {
+        let (stdout, _, code) = Self::run_command(&[CMD_SYSTEMCTL, "--version"], 5)
+            .map_err(|_| "systemd version could not be checked".to_string())?;
+        if code != 0 {
+            return Err("systemd version could not be checked".to_string());
+        }
+        let version = std::str::from_utf8(&stdout)
+            .ok()
+            .and_then(|output| output.lines().next())
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.split('.').next())
+            .and_then(|major| major.parse::<u32>().ok());
+        Ok(version.is_some_and(|major| major >= 250))
+    }
+
     fn remove_unit(&self, name: &str) -> Result<(), String> {
         let path = PathBuf::from(format!("/etc/systemd/system/{name}"));
         self.remove_file(&path)
@@ -1235,6 +2141,15 @@ impl CommandAdapter for LinuxAdapter {
             Self::run_command(&[CMD_SYSTEMCTL, "enable", name], 30).map_err(|e| e.to_string())?;
         if code != 0 {
             return Err(format!("enable {name} exited with code {code}"));
+        }
+        Ok(())
+    }
+
+    fn start_unit(&self, name: &str) -> Result<(), String> {
+        let (_, _, code) =
+            Self::run_command(&[CMD_SYSTEMCTL, "start", name], 60).map_err(|e| e.to_string())?;
+        if code != 0 {
+            return Err(format!("start {name} exited with code {code}"));
         }
         Ok(())
     }
@@ -1313,6 +2228,119 @@ impl CommandAdapter for LinuxAdapter {
 
         format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
     }
+
+    fn acquire_lifecycle_operation_lock(
+        &self,
+        _state_dir: &Path,
+    ) -> Result<Box<dyn LifecycleOperationLock>, LifecycleLockError> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        const LOCK_DIRECTORIES: &[&str] = &["/run", "/run/lock"];
+        const LOCK_PATH: &str = "/run/lock/helicoid-installer.lock";
+
+        for directory_path in LOCK_DIRECTORIES {
+            let directory = std::fs::symlink_metadata(directory_path).map_err(|error| {
+                LifecycleLockError::Unavailable(format!(
+                    "inspect lifecycle lock directory {directory_path}: {error}"
+                ))
+            })?;
+            if directory.file_type().is_symlink()
+                || !directory.is_dir()
+                || directory.uid() != 0
+                || directory.mode() & 0o022 != 0
+            {
+                return Err(LifecycleLockError::Unavailable(format!(
+                    "lifecycle lock directory {directory_path} is not protected and root-owned"
+                )));
+            }
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(LOCK_PATH)
+            .map_err(|error| {
+                LifecycleLockError::Unavailable(format!("open lifecycle lock {LOCK_PATH}: {error}"))
+            })?;
+        let metadata = file.metadata().map_err(|error| {
+            LifecycleLockError::Unavailable(format!("inspect lifecycle lock {LOCK_PATH}: {error}"))
+        })?;
+        if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+            return Err(LifecycleLockError::Unavailable(
+                "lifecycle lock is not a private root-owned regular file".into(),
+            ));
+        }
+
+        lock_lifecycle_file(file, Path::new(LOCK_PATH))
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn lock_lifecycle_file(
+    file: std::fs::File,
+    path: &Path,
+) -> Result<Box<dyn LifecycleOperationLock>, LifecycleLockError> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: flock only borrows the valid descriptor while acquiring the
+    // lock; the returned guard retains the File for the entire operation.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || error.raw_os_error() == Some(libc::EAGAIN)
+        {
+            return Err(LifecycleLockError::Busy);
+        }
+        return Err(LifecycleLockError::Unavailable(format!(
+            "acquire lifecycle lock {}: {error}",
+            path.display()
+        )));
+    }
+
+    Ok(Box::new(UnixLifecycleOperationLock { _file: file }))
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_lock_tests {
+    use super::{lock_lifecycle_file, LifecycleLockError};
+    use std::fs::{self, OpenOptions};
+    use std::path::PathBuf;
+
+    fn open_lock(path: &PathBuf) -> fs::File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("create test lifecycle lock file")
+    }
+
+    #[test]
+    fn exclusive_lifecycle_lock_rejects_competitor_and_releases_on_drop() {
+        let directory =
+            std::env::temp_dir().join(format!("helicoid-lifecycle-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).expect("create private test directory");
+        let path = directory.join("installer.lock");
+
+        let first = lock_lifecycle_file(open_lock(&path), &path)
+            .expect("first installer operation acquires the lock");
+        assert!(matches!(
+            lock_lifecycle_file(open_lock(&path), &path),
+            Err(LifecycleLockError::Busy)
+        ));
+
+        drop(first);
+        let next = lock_lifecycle_file(open_lock(&path), &path)
+            .expect("lock is available after the prior operation exits");
+        drop(next);
+        fs::remove_file(&path).expect("remove test lock file");
+        fs::remove_dir(&directory).expect("remove test directory");
+    }
 }
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
@@ -1357,4 +2385,33 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 #[cfg(target_os = "linux")]
 const fn is_leap(year: u64) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+#[cfg(test)]
+mod docker_stdin_tests {
+    use super::{CommandAdapter, TestAdapter};
+
+    #[test]
+    fn docker_command_with_input_records_only_fixed_arguments() {
+        let adapter = TestAdapter::new();
+        let secret = b"this is a scheduled backup secret";
+        let args = vec![
+            "exec".to_string(),
+            "--interactive".to_string(),
+            "0123456789abcdef".to_string(),
+            "hs-server".to_string(),
+            "backup".to_string(),
+            "scheduled-stdin-create".to_string(),
+        ];
+
+        adapter
+            .docker_command_with_input(&args, secret)
+            .expect("fake Docker stdin command");
+
+        let recorded = adapter.commands.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].args, args);
+        assert!(!format!("{:?}", recorded[0])
+            .contains(std::str::from_utf8(secret).expect("secret is UTF-8")));
+    }
 }
