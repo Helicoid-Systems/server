@@ -12,7 +12,9 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
-use std::os::unix::net::{Shutdown, UnixStream};
+use std::net::Shutdown;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 
 use clap::{Parser, Subcommand};
 
@@ -1286,6 +1288,8 @@ fn run_installer(action: InstallerAction) -> AppResult<()> {
     use hs_server::installer::machine;
     use hs_server::installer::models::*;
 
+    let adapter = hs_server::installer::adapter::LinuxAdapter;
+
     if matches!(&action, InstallerAction::CapabilitiesV2) {
         let output =
             serde_json::to_string_pretty(&machine::lifecycle_capabilities_v2()).map_err(|err| {
@@ -1329,8 +1333,6 @@ fn run_installer(action: InstallerAction) -> AppResult<()> {
             "installer input exceeds {MAX_INSTALLER_STDIN_BYTES} bytes"
         )));
     }
-
-    let adapter = hs_server::installer::adapter::LinuxAdapter;
 
     let output: serde_json::Value = match action {
         InstallerAction::CapabilitiesV2 => {
@@ -1731,8 +1733,6 @@ fn request_compose_backup_control(action: u8, passphrase: Option<&[u8]>) -> AppR
 
 #[cfg(target_os = "linux")]
 fn run_compose_backup_control_request() -> AppResult<()> {
-    use std::os::fd::AsRawFd;
-
     let mut compose_logs = None;
     let result = (|| {
         verify_compose_control_peer()?;
@@ -1814,6 +1814,7 @@ fn run_compose_backup_control_request() -> AppResult<()> {
 #[cfg(target_os = "linux")]
 fn verify_compose_control_peer() -> AppResult<()> {
     use std::mem::size_of;
+    use std::os::fd::AsRawFd;
 
     let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
     let mut length = size_of::<libc::ucred>() as libc::socklen_t;

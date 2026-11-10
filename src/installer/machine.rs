@@ -2048,8 +2048,8 @@ fn compose_scheduled_backup_args(
     backup_directory: &str,
 ) -> AppResult<Vec<String>> {
     if !is_valid_container_id(container_id)
-        || !Path::new(data_directory).is_absolute()
-        || !Path::new(backup_directory).is_absolute()
+        || !data_directory.starts_with('/')
+        || !backup_directory.starts_with('/')
     {
         return Err(AppError::unprocessable(
             "verified Compose backup paths or container identity are invalid",
@@ -2061,10 +2061,7 @@ fn compose_scheduled_backup_args(
         container_id.to_string(),
         "hs-server".to_string(),
         "--data".to_string(),
-        Path::new(data_directory)
-            .join("hs-server.db")
-            .to_string_lossy()
-            .into_owned(),
+        format!("{}/hs-server.db", data_directory.trim_end_matches('/')),
         "backup".to_string(),
         "scheduled-stdin-create".to_string(),
         "--directory".to_string(),

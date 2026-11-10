@@ -582,8 +582,23 @@ fn backup_database(conn: &Connection, backup_dir: &Path, from: i64) -> AppResult
 }
 
 fn apply_migrations(conn: &Connection, from: i64, signer_enabled: bool) -> AppResult<()> {
+    apply_migrations_until(conn, from, SCHEMA_VERSION, signer_enabled)
+}
+
+/// Apply every migration step after `from` through `to` in one transaction.
+///
+/// Production always targets [`SCHEMA_VERSION`]. Tests pass earlier targets to
+/// build historical fixtures with the same forward migrations, so a fixture
+/// labeled v3/v5/v6/v14 cannot retain artifacts from a later schema version.
+fn apply_migrations_until(
+    conn: &Connection,
+    from: i64,
+    to: i64,
+    signer_enabled: bool,
+) -> AppResult<()> {
+    debug_assert!(from <= to && to <= SCHEMA_VERSION);
     let tx = conn.unchecked_transaction()?;
-    if from < 2 {
+    if from < 2 && to >= 2 {
         migrate_v1_to_v2(&tx)?;
         // Mint a server-owned deployment key for existing databases.
         let key = new_deployment_key();
@@ -592,63 +607,63 @@ fn apply_migrations(conn: &Connection, from: i64, signer_enabled: bool) -> AppRe
             params![key],
         )?;
     }
-    if from < 3 {
+    if from < 3 && to >= 3 {
         migrate_v2_to_v3(&tx)?;
     }
-    if from < 4 {
+    if from < 4 && to >= 4 {
         migrate_v3_to_v4(&tx)?;
     }
-    if from < 5 {
+    if from < 5 && to >= 5 {
         migrate_v4_to_v5(&tx)?;
     }
-    if from < 6 {
+    if from < 6 && to >= 6 {
         migrate_v5_to_v6(&tx)?;
     }
-    if from < 7 {
+    if from < 7 && to >= 7 {
         migrate_v6_to_v7(&tx)?;
     }
-    if from < 8 {
+    if from < 8 && to >= 8 {
         migrate_v7_to_v8(&tx)?;
     }
-    if from < 9 {
+    if from < 9 && to >= 9 {
         migrate_v8_to_v9(&tx)?;
     }
-    if from < 10 {
+    if from < 10 && to >= 10 {
         migrate_v9_to_v10(&tx)?;
     }
-    if from < 11 {
+    if from < 11 && to >= 11 {
         migrate_v10_to_v11(&tx)?;
     }
-    if from < 12 {
+    if from < 12 && to >= 12 {
         migrate_v11_to_v12(&tx)?;
     }
-    if from < 13 {
+    if from < 13 && to >= 13 {
         migrate_v12_to_v13(&tx)?;
     }
-    if from < 14 {
+    if from < 14 && to >= 14 {
         migrate_v13_to_v14(&tx)?;
     }
-    if from < 15 {
+    if from < 15 && to >= 15 {
         migrate_v14_to_v15(&tx)?;
     }
-    if from < 16 {
+    if from < 16 && to >= 16 {
         migrate_v15_to_v16(&tx, signer_enabled)?;
     }
-    if from < 17 {
+    if from < 17 && to >= 17 {
         migrate_v16_to_v17(&tx)?;
     }
-    if from < 18 {
+    if from < 18 && to >= 18 {
         migrate_v17_to_v18(&tx)?;
     }
-    if from < 19 {
+    if from < 19 && to >= 19 {
         migrate_v18_to_v19(&tx)?;
     }
-    if from < 20 {
+    if from < 20 && to >= 20 {
         migrate_v19_to_v20(&tx)?;
     }
     tx.execute(
         "UPDATE schema_meta SET schema_version = ?1 WHERE id = 1",
-        params![SCHEMA_VERSION],
+        params![to],
     )?;
     tx.commit()?;
     Ok(())
@@ -1795,36 +1810,75 @@ mod tests {
         (dir, base)
     }
 
-    /// Make a current-schema fixture represent a pre-v18 database before its
-    /// schema version is rewound by an explicit migration test.
-    fn drop_v18_recovery_columns(conn: &Connection) {
-        conn.execute_batch(
-            "DROP TABLE authority_cutovers;
-             DROP INDEX accounts_username_unique;
-             ALTER TABLE deployment DROP COLUMN predecessor_deployment_key;
-             ALTER TABLE deployment DROP COLUMN authority_generation;
-             ALTER TABLE deployment DROP COLUMN authority_state;
-             ALTER TABLE deployment DROP COLUMN recovery_quarantined;
-             ALTER TABLE accounts DROP COLUMN recovery_quarantined;
-             CREATE UNIQUE INDEX accounts_username_unique
-                 ON accounts (username COLLATE NOCASE);",
+    /// Advance a v1 connection to `version` through the production migration
+    /// steps. Tests use this instead of deleting current-schema features so an
+    /// older fixture cannot silently retain a later schema version's shape.
+    fn seed_historical_schema(conn: &Connection, version: i64) {
+        apply_migrations_until(conn, 1, version, private_file::private_file_supported())
+            .expect("advance historical schema fixture");
+        assert_eq!(
+            schema_version(conn).expect("fixture schema version"),
+            Some(version)
+        );
+    }
+
+    /// Seed a v3+ policy row that must survive the remaining migrations.
+    fn set_vintage_security_policy(conn: &Connection) {
+        conn.execute(
+            "UPDATE security_policy
+             SET operator_mfa_policy = 'required', updated_at = 4242
+             WHERE id = 1",
+            [],
         )
-        .expect("downgrade recovery quarantine schema fixture");
+        .expect("seed vintage security policy");
+    }
+
+    /// Assert the real v19→v20 step installed bounded audit storage and
+    /// preserved pre-v20 policy/account data.
+    fn assert_v20_audit_migration(conn: &Connection) {
+        assert!(table_exists(conn, "audit_events").expect("audit events table"));
+        for index in [
+            "audit_events_time_idx",
+            "audit_events_actor_time_idx",
+            "audit_events_action_time_idx",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .expect("audit index probe");
+            assert_eq!(count, 1, "missing {index}");
+        }
+        let (policy, retention, updated): (String, i64, i64) = conn
+            .query_row(
+                "SELECT operator_mfa_policy, audit_retention_days, updated_at
+                 FROM security_policy WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("migrated security policy");
+        assert_eq!(policy, "required", "pre-v20 policy choice preserved");
+        assert_eq!(updated, 4242, "pre-v20 policy timestamp preserved");
+        assert_eq!(retention, 30, "v20 default retention");
+        let account: String = conn
+            .query_row("SELECT state FROM accounts WHERE id = 'a1'", [], |row| {
+                row.get(0)
+            })
+            .expect("pre-v20 account");
+        assert_eq!(account, "active", "pre-v20 account preserved");
     }
 
     #[test]
     fn migration_v14_to_current_adds_interaction_tables_and_local_signer() {
-        let db = open_in_memory().expect("open current in-memory schema");
-        let conn = db.lock().expect("lock in-memory store");
-        drop_v18_recovery_columns(&conn);
-        conn.execute_batch(
-            "DROP TABLE observation_admission_grants;
-             DROP TABLE interaction_claims;
-             DROP TABLE computer_interaction_revisions;
-             ALTER TABLE deployment DROP COLUMN grant_signing_secret;
-             UPDATE schema_meta SET schema_version = 14 WHERE id = 1;",
-        )
-        .expect("prepare v14 schema snapshot");
+        let conn = Connection::open_in_memory().expect("open in-memory fixture");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("enable foreign keys");
+        create_v1_schema(&conn);
+        seed_historical_schema(&conn, 14);
+        set_vintage_security_policy(&conn);
 
         apply_migrations(&conn, 14, private_file::private_file_supported())
             .expect("apply v14 to current migration");
@@ -1833,6 +1887,7 @@ mod tests {
             schema_version(&conn).expect("read schema version"),
             Some(SCHEMA_VERSION)
         );
+        assert_v20_audit_migration(&conn);
         assert!(table_exists(&conn, "computer_interaction_revisions").expect("revision table"));
         assert!(table_exists(&conn, "interaction_claims").expect("claim table"));
         let secret: Option<Vec<u8>> = conn
@@ -1849,6 +1904,41 @@ mod tests {
         } else {
             assert!(secret.is_none(), "unverified store gets no signer secret");
         }
+    }
+
+    /// A store that claims v19 but already carries the v20 column is
+    /// inconsistent. Migration must fail closed and roll back instead of
+    /// treating the duplicate column as an idempotent no-op.
+    #[test]
+    fn migration_refuses_labeled_v19_store_with_v20_audit_column() {
+        let conn = Connection::open_in_memory().expect("open in-memory fixture");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("enable foreign keys");
+        create_v1_schema(&conn);
+        seed_historical_schema(&conn, 19);
+        conn.execute_batch(
+            "ALTER TABLE security_policy ADD COLUMN audit_retention_days INTEGER NOT NULL DEFAULT 30
+                CHECK (audit_retention_days BETWEEN 1 AND 3650);",
+        )
+        .expect("simulate a v19 store that already has the v20 column");
+
+        let err = apply_migrations(&conn, 19, private_file::private_file_supported())
+            .expect_err("duplicate v20 column must refuse");
+        match err {
+            AppError::Storage(rusqlite::Error::SqliteFailure(_, Some(message))) => {
+                assert_eq!(message, "duplicate column name: audit_retention_days");
+            }
+            other => panic!("unexpected migration error: {other:?}"),
+        }
+        assert_eq!(
+            schema_version(&conn).expect("schema version after refusal"),
+            Some(19),
+            "failed migration must leave the v19 store untouched"
+        );
+        assert!(
+            !table_exists(&conn, "audit_events").expect("audit table probe"),
+            "failed migration must not leave partial v20 storage"
+        );
     }
 
     #[test]
@@ -2067,72 +2157,92 @@ mod tests {
         );
     }
 
+    /// The oldest supported on-disk schema. Historical fixtures start here and
+    /// are advanced only by [`apply_migrations_until`].
+    const V1_SCHEMA_SQL: &str = r#"
+        CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL);
+        INSERT INTO schema_meta (id, schema_version) VALUES (1, 1);
+        CREATE TABLE deployment (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            bootstrap_completed INTEGER NOT NULL DEFAULT 0,
+            bootstrap_completed_at INTEGER,
+            security_state_ok INTEGER NOT NULL DEFAULT 1,
+            security_state_note TEXT,
+            created_at INTEGER NOT NULL
+        );
+        INSERT INTO deployment (id, bootstrap_completed, security_state_ok, created_at)
+            VALUES (1, 1, 1, 100);
+        CREATE TABLE bootstrap_tokens (
+            token_hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, consumed_at INTEGER);
+        CREATE TABLE accounts (
+            id TEXT PRIMARY KEY, username TEXT NOT NULL COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('active', 'disabled')),
+            can_operate INTEGER NOT NULL DEFAULT 0,
+            can_manage_enrollment INTEGER NOT NULL DEFAULT 0,
+            can_manage_access INTEGER NOT NULL DEFAULT 0,
+            can_manage_accounts INTEGER NOT NULL DEFAULT 0,
+            can_manage_security INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        INSERT INTO accounts (id, username, password_hash, state, created_at, updated_at)
+            VALUES ('a1', 'admin', 'hash', 'active', 100, 100);
+        CREATE UNIQUE INDEX accounts_username_unique ON accounts (username COLLATE NOCASE);
+        CREATE TABLE managers (
+            id TEXT PRIMARY KEY, public_identity TEXT NOT NULL,
+            friendly_name TEXT NOT NULL,
+            lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN ('pending', 'approved', 'revoked')),
+            approved_by_account_id TEXT REFERENCES accounts(id),
+            approved_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE UNIQUE INDEX managers_public_identity_unique ON managers (public_identity);
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id),
+            manager_id TEXT REFERENCES managers(id), token_hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER);
+        CREATE TABLE computers (
+            id TEXT PRIMARY KEY, public_identity TEXT NOT NULL,
+            friendly_name TEXT NOT NULL, platform TEXT NOT NULL,
+            enrollment_state TEXT NOT NULL,
+            enrollment_epoch INTEGER NOT NULL DEFAULT 1,
+            approved_incarnation_identity TEXT,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE TABLE access_assignments (
+            id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id),
+            capability TEXT NOT NULL, computer_scope_all INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE TABLE access_computer_scope (
+            assignment_id TEXT NOT NULL REFERENCES access_assignments(id) ON DELETE CASCADE,
+            computer_id TEXT NOT NULL REFERENCES computers(id),
+            PRIMARY KEY (assignment_id, computer_id));
+        CREATE TABLE login_attempts (
+            username_key TEXT PRIMARY KEY, failure_count INTEGER NOT NULL DEFAULT 0,
+            locked_until INTEGER, updated_at INTEGER NOT NULL);
+    "#;
+
+    fn create_v1_schema(conn: &Connection) {
+        conn.execute_batch(V1_SCHEMA_SQL).expect("seed v1 schema");
+    }
+
     /// Seed a full v1-schema database file and leave it as a clean single file.
     fn seed_v1_schema_file(path: &Path) {
         create_private_db_for_seed(path);
         {
             let conn = Connection::open(path).expect("open");
-            conn.execute_batch(
-                "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL);
-                 INSERT INTO schema_meta (id, schema_version) VALUES (1, 1);
-                 CREATE TABLE deployment (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    bootstrap_completed INTEGER NOT NULL DEFAULT 0,
-                    bootstrap_completed_at INTEGER,
-                    security_state_ok INTEGER NOT NULL DEFAULT 1,
-                    security_state_note TEXT,
-                    created_at INTEGER NOT NULL
-                 );
-                 INSERT INTO deployment (id, bootstrap_completed, security_state_ok, created_at)
-                    VALUES (1, 1, 1, 100);
-                 CREATE TABLE bootstrap_tokens (
-                    token_hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL, consumed_at INTEGER);
-                 CREATE TABLE accounts (
-                    id TEXT PRIMARY KEY, username TEXT NOT NULL COLLATE NOCASE,
-                    password_hash TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (state IN ('active', 'disabled')),
-                    can_operate INTEGER NOT NULL DEFAULT 0,
-                    can_manage_enrollment INTEGER NOT NULL DEFAULT 0,
-                    can_manage_access INTEGER NOT NULL DEFAULT 0,
-                    can_manage_accounts INTEGER NOT NULL DEFAULT 0,
-                    can_manage_security INTEGER NOT NULL DEFAULT 0,
-                    revision INTEGER NOT NULL DEFAULT 1,
-                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-                 INSERT INTO accounts (id, username, password_hash, state, created_at, updated_at)
-                    VALUES ('a1', 'admin', 'hash', 'active', 100, 100);
-                 CREATE UNIQUE INDEX accounts_username_unique ON accounts (username COLLATE NOCASE);
-                 CREATE TABLE managers (
-                    id TEXT PRIMARY KEY, public_identity TEXT NOT NULL,
-                    friendly_name TEXT NOT NULL,
-                    lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN ('pending', 'approved', 'revoked')),
-                    approved_by_account_id TEXT REFERENCES accounts(id),
-                    approved_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-                 CREATE UNIQUE INDEX managers_public_identity_unique ON managers (public_identity);
-                 CREATE TABLE sessions (
-                    id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id),
-                    manager_id TEXT REFERENCES managers(id), token_hash TEXT NOT NULL,
-                    created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER);
-                 CREATE TABLE computers (
-                    id TEXT PRIMARY KEY, public_identity TEXT NOT NULL,
-                    friendly_name TEXT NOT NULL, platform TEXT NOT NULL,
-                    enrollment_state TEXT NOT NULL,
-                    enrollment_epoch INTEGER NOT NULL DEFAULT 1,
-                    approved_incarnation_identity TEXT,
-                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-                 CREATE TABLE access_assignments (
-                    id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id),
-                    capability TEXT NOT NULL, computer_scope_all INTEGER NOT NULL DEFAULT 0,
-                    revision INTEGER NOT NULL DEFAULT 1,
-                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-                 CREATE TABLE access_computer_scope (
-                    assignment_id TEXT NOT NULL REFERENCES access_assignments(id) ON DELETE CASCADE,
-                    computer_id TEXT NOT NULL REFERENCES computers(id),
-                    PRIMARY KEY (assignment_id, computer_id));
-                 CREATE TABLE login_attempts (
-                    username_key TEXT PRIMARY KEY, failure_count INTEGER NOT NULL DEFAULT 0,
-                    locked_until INTEGER, updated_at INTEGER NOT NULL);",
-            )
-            .expect("seed v1");
+            create_v1_schema(&conn);
+        }
+        assert_no_sqlite_sidecars(path);
+    }
+
+    /// Seed a persistent database at `version` by replaying the real forward
+    /// migrations from v1. Leaves the file clean for `force_private_mode`.
+    fn seed_historical_schema_file(path: &Path, version: i64) {
+        create_private_db_for_seed(path);
+        {
+            let conn = Connection::open(path).expect("open historical fixture");
+            create_v1_schema(&conn);
+            seed_historical_schema(&conn, version);
+            set_vintage_security_policy(&conn);
         }
         assert_no_sqlite_sidecars(path);
     }
@@ -2194,32 +2304,7 @@ mod tests {
         let (_dir, base) = real_tempdir();
         let path = base.join("v3.db");
         let backup_dir = base.join("backups");
-        seed_current_schema_file(&path);
-        {
-            let conn = Connection::open(&path).expect("open v4 fixture");
-            drop_v18_recovery_columns(&conn);
-            conn.execute_batch(
-                "ALTER TABLE deployment DROP COLUMN grant_signing_secret;
-                 DROP TABLE observation_admission_grants;
-                 DROP TABLE interaction_claims;
-                 DROP TABLE computer_interaction_revisions;
-                 DROP TABLE file_request_submission_chunks;
-                 DROP TABLE file_request_submission_files;
-                 DROP TABLE file_request_submissions;
-                 DROP TABLE file_request_computers;
-                 DROP TABLE file_requests;
-                 DROP TABLE file_job_chunks;
-                 DROP TABLE file_job_targets;
-                 DROP TABLE file_jobs;
-                 DROP TABLE endpoint_sessions;
-                 DROP TABLE endpoint_auth_challenges;
-                 DROP TABLE computer_enrollment_invitations;
-                 DROP TABLE computer_group_members;
-                 DROP TABLE computer_groups;
-                 UPDATE schema_meta SET schema_version = 3 WHERE id = 1;",
-            )
-            .expect("downgrade test fixture to v3 shape");
-        }
+        seed_historical_schema_file(&path, 3);
         force_private_mode(&path);
 
         let report = migrate(&path, &backup_dir).expect("explicit v3 migration");
@@ -2237,6 +2322,7 @@ mod tests {
             schema_version(&conn).expect("version"),
             Some(SCHEMA_VERSION)
         );
+        assert_v20_audit_migration(&conn);
         assert!(table_exists(&conn, "computer_groups").expect("groups table"));
         assert!(table_exists(&conn, "computer_group_members").expect("group members table"));
         assert!(table_exists(&conn, "computer_enrollment_invitations")
@@ -2256,29 +2342,7 @@ mod tests {
         let (_dir, base) = real_tempdir();
         let path = base.join("v5.db");
         let backup_dir = base.join("backups");
-        seed_current_schema_file(&path);
-        {
-            let conn = Connection::open(&path).expect("open v5 fixture");
-            drop_v18_recovery_columns(&conn);
-            conn.execute_batch(
-                "ALTER TABLE deployment DROP COLUMN grant_signing_secret;
-                 DROP TABLE observation_admission_grants;
-                 DROP TABLE interaction_claims;
-                 DROP TABLE computer_interaction_revisions;
-                 DROP TABLE file_request_submission_chunks;
-                 DROP TABLE file_request_submission_files;
-                 DROP TABLE file_request_submissions;
-                 DROP TABLE file_request_computers;
-                 DROP TABLE file_requests;
-                 DROP TABLE file_job_chunks;
-                 DROP TABLE file_job_targets;
-                 DROP TABLE file_jobs;
-                 DROP TABLE endpoint_sessions;
-                 DROP TABLE endpoint_auth_challenges;
-                 UPDATE schema_meta SET schema_version = 5 WHERE id = 1;",
-            )
-            .expect("downgrade test fixture to v5 shape");
-        }
+        seed_historical_schema_file(&path, 5);
         force_private_mode(&path);
 
         let report = migrate(&path, &backup_dir).expect("explicit v5 migration");
@@ -2293,6 +2357,7 @@ mod tests {
             schema_version(&conn).expect("version"),
             Some(SCHEMA_VERSION)
         );
+        assert_v20_audit_migration(&conn);
         assert!(table_exists(&conn, "endpoint_auth_challenges").expect("challenge table"));
         assert!(table_exists(&conn, "endpoint_sessions").expect("session table"));
         assert!(table_exists(&conn, "file_jobs").expect("file jobs"));
@@ -2308,31 +2373,7 @@ mod tests {
         let (_dir, base) = real_tempdir();
         let path = base.join("v6.db");
         let backup_dir = base.join("backups");
-        seed_current_schema_file(&path);
-        {
-            let conn = Connection::open(&path).expect("open v6 fixture");
-            drop_v18_recovery_columns(&conn);
-            conn.execute_batch(
-                "ALTER TABLE deployment DROP COLUMN grant_signing_secret;
-                 DROP TABLE observation_admission_grants;
-                 DROP TABLE interaction_claims;
-                 DROP TABLE computer_interaction_revisions;
-                 DROP TABLE file_request_submission_chunks;
-                 DROP TABLE file_request_submission_files;
-                 DROP TABLE file_request_submissions;
-                 DROP TABLE file_request_computers;
-                 DROP TABLE file_requests;
-                 DROP TABLE file_job_chunks;
-                 DROP TABLE file_job_targets;
-                 DROP TABLE file_jobs;
-                 ALTER TABLE endpoint_auth_challenges DROP COLUMN local_user_display_name;
-                 ALTER TABLE endpoint_auth_challenges DROP COLUMN local_user_id;
-                 ALTER TABLE endpoint_sessions DROP COLUMN local_user_display_name;
-                 ALTER TABLE endpoint_sessions DROP COLUMN local_user_id;
-                 UPDATE schema_meta SET schema_version = 6 WHERE id = 1;",
-            )
-            .expect("downgrade test fixture to v6 shape");
-        }
+        seed_historical_schema_file(&path, 6);
         force_private_mode(&path);
 
         let report = migrate(&path, &backup_dir).expect("explicit v6 migration");
@@ -2347,6 +2388,7 @@ mod tests {
             schema_version(&conn).expect("version"),
             Some(SCHEMA_VERSION)
         );
+        assert_v20_audit_migration(&conn);
         assert!(table_exists(&conn, "file_jobs").expect("file jobs"));
         assert!(table_exists(&conn, "file_job_targets").expect("file job targets"));
         assert!(table_exists(&conn, "file_job_chunks").expect("file job chunks"));

@@ -8,19 +8,31 @@
 //! archive uses an independent passphrase-derived encryption key; the
 //! package-signing authority is not reused for backup confidentiality.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use crate::error::{AppError, AppResult};
 
+#[cfg(unix)]
 const MAGIC: &[u8; 8] = b"HSDBAK01";
+#[cfg(unix)]
 const HEADER_BYTES: usize = 8 + 16 + 4;
+#[cfg(unix)]
 const SALT_BYTES: usize = 16;
+#[cfg(unix)]
 const NONCE_PREFIX_BYTES: usize = 4;
+#[cfg(unix)]
 const NONCE_BYTES: usize = 12;
+#[cfg(unix)]
 const TAG_BYTES: usize = 16;
+#[cfg(unix)]
 const CHUNK_BYTES: usize = 1024 * 1024;
+#[cfg(unix)]
 const MAX_DATABASE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+#[cfg(unix)]
 const ARGON_MEMORY_KIB: u32 = 19 * 1024;
+#[cfg(unix)]
 const ARGON_ITERATIONS: u32 = 2;
 
 /// Metadata verified from an encrypted SQLite backup.
@@ -434,6 +446,7 @@ pub fn prune_scheduled_database_backups(
     ))
 }
 
+#[cfg(unix)]
 fn scheduled_backup_timestamp(name: &std::ffi::OsStr) -> Option<u64> {
     let name = name.to_str()?;
     let rest = name.strip_prefix("hs-server-")?;

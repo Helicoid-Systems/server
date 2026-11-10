@@ -1834,7 +1834,7 @@ impl CommandAdapter for LinuxAdapter {
             return Err("refusing unsupported Compose TLS source or destination".to_string());
         }
 
-        let mut source = std::fs::OpenOptions::new()
+        let source = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(src)
