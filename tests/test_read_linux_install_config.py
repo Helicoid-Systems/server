@@ -77,7 +77,7 @@ class InstallerConfigTests(unittest.TestCase):
         config["network"]["authority_port"] = 8787
         result = self.run_config(json.dumps(config))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b"LAN requires", result.stderr)
+        self.assertIn(b"LAN/private DNS requires", result.stderr)
 
     def test_preserves_empty_loopback_address_fields(self):
         config = sample_config()
