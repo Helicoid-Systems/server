@@ -231,6 +231,15 @@ impl Drop for MacosApplyLock {
     }
 }
 
+impl std::fmt::Debug for MacosApplyLock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MacosApplyLock")
+            .field("held", &self.release.is_some())
+            .finish()
+    }
+}
+
 #[cfg(unix)]
 struct ValidatedApply {
     plan: InstallPlan,
