@@ -277,6 +277,10 @@ enum BackupAction {
     },
 }
 
+fn default_installer_state_dir_path() -> PathBuf {
+    PathBuf::from(default_installer_state_dir())
+}
+
 fn default_installer_state_dir() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -389,7 +393,7 @@ enum InstallerAction {
         #[arg(long)]
         verify_key: String,
         /// Persistent TUF datastore and verified package staging root.
-        #[arg(long, default_value_t = default_installer_state_dir())]
+        #[arg(long, default_value_os_t = default_installer_state_dir_path())]
         state_dir: PathBuf,
     },
     /// Remove the installation and retain a durable v2 operation result.

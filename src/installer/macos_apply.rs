@@ -44,10 +44,12 @@ use crate::error::{AppError, AppResult};
 use super::lifecycle_v2 as v2;
 #[cfg(target_os = "macos")]
 use super::macos_identity::{observe_service_identity, MacosIdentityObserver};
+#[cfg(target_os = "macos")]
+use super::macos_identity::{parse_group_record, parse_user_record};
 #[cfg(unix)]
 use super::macos_identity::{
-    parse_group_record, parse_identity_search, parse_user_record, IdentityRefusal,
-    NON_LOGIN_SHELLS, PRODUCT_SERVICE_ACCOUNT, PRODUCT_SERVICE_GROUP,
+    parse_identity_search, IdentityRefusal, NON_LOGIN_SHELLS, PRODUCT_SERVICE_ACCOUNT,
+    PRODUCT_SERVICE_GROUP,
 };
 use super::macos_identity::{
     GroupRecordFacts, IdentityObservation, IdentityQuery, ServiceIdentityDecision, UserRecordFacts,
@@ -314,12 +316,14 @@ pub fn apply_v2_with_adapter(
         created_at: adapter.now_iso8601(),
         outcome: None,
     };
-    write_state_file(
-        adapter,
-        &record_path,
-        &serde_json::to_vec_pretty(&record)
-            .map_err(|error| AppError::internal(format!("serialize operation record: {error}")))?,
-    )?;
+    adapter
+        .write_state_file(
+            &record_path,
+            &serde_json::to_vec_pretty(&record).map_err(|error| {
+                AppError::internal(format!("serialize operation record: {error}"))
+            })?,
+        )
+        .map_err(|error| AppError::internal(format!("save operation record: {error}")))?;
 
     let mut journal = create_journal(adapter, &validated.plan.review_digest);
     save_journal(adapter, &journal_path, &journal)?;
@@ -1531,6 +1535,7 @@ fn rollback(
                     )),
                 }
             }
+            ResourceStatus::RolledBack => {}
             ResourceStatus::Intent | ResourceStatus::Failed => match adapter.path_metadata(&path) {
                 Ok(None) => {}
                 Ok(Some(_)) => errors.push(format!(
@@ -2981,8 +2986,7 @@ impl MacosApplyAdapter for MacosSystemApplyAdapter {
             );
         }
         let mut certificate_bytes = Vec::new();
-        certificate_file
-            .by_ref()
+        std::io::Read::by_ref(&mut certificate_file)
             .take(64 * 1024)
             .read_to_end(&mut certificate_bytes)
             .map_err(|error| format!("read installed TLS certificate: {error}"))?;
@@ -3031,7 +3035,7 @@ impl MacosApplyAdapter for MacosSystemApplyAdapter {
         tls.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
             .map_err(|error| format!("write macOS health request: {error}"))?;
         let mut response = Vec::new();
-        tls.by_ref()
+        std::io::Read::by_ref(&mut tls)
             .take(8192)
             .read_to_end(&mut response)
             .map_err(|error| format!("read macOS health response: {error}"))?;
@@ -3704,7 +3708,6 @@ fn run_fixed(argv: &[String]) -> Result<(i32, String, String), String> {
 
 #[cfg(target_os = "macos")]
 fn read_capped(mut pipe: impl std::io::Read) -> String {
-    use std::io::Read;
     let mut captured = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
