@@ -1,9 +1,11 @@
-//! hs-server CLI: init, bootstrap, serve.
+//! hs-server CLI: init, bootstrap, serve, installer, and the fixed macOS
+//! service entry.
 //!
 //! Default bind is loopback only. Network listeners require explicit TLS
 //! opt-in and expose only the versioned API surface. This foundation still
 //! provides no control or media authority (B03/RD03 proofs pending).
 
+use std::future::IntoFuture;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -188,7 +190,17 @@ enum Command {
         #[arg(long)]
         allow_network: bool,
     },
-    /// Guided Linux installer backend. Reads bounded versioned JSON from stdin.
+    /// Fixed macOS launchd service entry. It is not a working installer or
+    /// enrollment path: the identity/product-ownership gate is unavailable in
+    /// this build, so startup fails closed. The loopback listener it prepares
+    /// uses the local development/bootstrap router, not the v2 network router.
+    /// The fixed product paths and protected configuration are the only
+    /// inputs; the global --data option is ignored.
+    #[command(name = "macos-service")]
+    MacosService,
+    /// Guided installer backend. Reads bounded versioned JSON from stdin.
+    /// macOS currently accepts only the read-only capabilities, preflight, and
+    /// plan v2 commands.
     Installer {
         #[command(subcommand)]
         action: InstallerAction,
@@ -929,6 +941,9 @@ fn run(cli: Cli) -> AppResult<()> {
             &tls_key,
             allow_network,
         ),
+        // The global --data option is parsed by clap but deliberately not
+        // read: the fixed product configuration is the only data input.
+        Command::MacosService => hs_server::macos_service::run(),
         Command::Installer { action } => run_installer(action),
     }
 }
@@ -1171,6 +1186,13 @@ fn refresh_systemd_readiness(status: &mut hs_server::installer::lifecycle_v2::Op
     }
 }
 
+/// Bound on draining in-flight plain-HTTP connections **after** a stop request.
+///
+/// Normal uptime is never timed. This bound only keeps a client that stops
+/// mid-request from holding the process past launchd's stop window, where the
+/// service manager would escalate to `SIGKILL`.
+const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn serve_blocking(addr: SocketAddr, service: Arc<Service>) -> AppResult<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1178,6 +1200,9 @@ fn serve_blocking(addr: SocketAddr, service: Arc<Service>) -> AppResult<()> {
         .map_err(|err| hs_server::AppError::internal(format!("tokio runtime: {err}")))?;
 
     runtime.block_on(async move {
+        // Fail closed before binding or reporting readiness: a serve process
+        // that cannot observe a stop request must not start.
+        let mut stop_signals = hs_server::tls::ShutdownSignal::register()?;
         let maintenance_service = service.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -1199,13 +1224,48 @@ fn serve_blocking(addr: SocketAddr, service: Arc<Service>) -> AppResult<()> {
             .await
             .map_err(|err| hs_server::AppError::internal(format!("bind {addr}: {err}")))?;
         tracing::info!(%addr, "hs-server listening (HTTP, development foundation)");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("shutdown requested");
-            })
-            .await
-            .map_err(|err| hs_server::AppError::internal(format!("serve: {err}")))?;
+        // The accept loop stays untimed during normal uptime: only the drain
+        // that runs after a stop request is bounded. `axum::serve` otherwise
+        // waits for every connection, and a client stopped mid-request would
+        // hold the process open indefinitely.
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let graceful = async move {
+            if !*shutdown_rx.borrow() {
+                let _ = shutdown_rx.changed().await;
+            }
+        };
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(graceful)
+            .into_future();
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => {
+                result.map_err(|err| hs_server::AppError::internal(format!("serve: {err}")))?;
+            }
+            stop = stop_signals.recv() => {
+                match &stop {
+                    Ok(()) => tracing::info!("shutdown requested"),
+                    Err(err) => tracing::error!(
+                        error = %err,
+                        "cannot observe stop requests; stopping"
+                    ),
+                }
+                let _ = shutdown_tx.send(true);
+                match tokio::time::timeout(HTTP_SHUTDOWN_TIMEOUT, &mut server).await {
+                    Ok(result) => result.map_err(|err| {
+                        hs_server::AppError::internal(format!("serve: {err}"))
+                    })?,
+                    Err(_) => {
+                        return Err(hs_server::AppError::internal(format!(
+                            "plain HTTP shutdown timed out with connections still open after {}s",
+                            HTTP_SHUTDOWN_TIMEOUT.as_secs()
+                        )));
+                    }
+                }
+                // The stop cause is still reported after a clean drain.
+                stop?;
+            }
+        }
         Ok(())
     })
 }
@@ -1284,12 +1344,82 @@ fn run_tuf_release_verification(
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_installer(_action: InstallerAction) -> AppResult<()> {
     Err(hs_server::AppError::unprocessable(format!(
-        "installer requires a Linux host (running on {})",
+        "installer is not available on this host (running on {})",
         std::env::consts::OS
     )))
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_installer_stdin() -> AppResult<String> {
+    const MAX_INSTALLER_STDIN_BYTES: u64 = 8 * 1024 * 1024;
+    let mut stdin_buf = String::new();
+    let mut handle = std::io::stdin().take(MAX_INSTALLER_STDIN_BYTES + 1);
+    handle
+        .read_to_string(&mut stdin_buf)
+        .map_err(|err| hs_server::AppError::bad_request(format!("read stdin: {err}")))?;
+    if stdin_buf.len() as u64 > MAX_INSTALLER_STDIN_BYTES {
+        return Err(hs_server::AppError::bad_request(format!(
+            "installer input exceeds {MAX_INSTALLER_STDIN_BYTES} bytes"
+        )));
+    }
+    Ok(stdin_buf)
+}
+
+#[cfg(target_os = "macos")]
+fn run_installer(action: InstallerAction) -> AppResult<()> {
+    use hs_server::installer::lifecycle_v2;
+    use hs_server::installer::machine;
+    use hs_server::installer::macos_launchd;
+
+    match action {
+        InstallerAction::CapabilitiesV2 => {
+            let output = serde_json::to_string_pretty(&macos_launchd::capabilities_v2())
+                .map_err(|err| {
+                    hs_server::AppError::internal(format!(
+                        "serialize lifecycle capabilities: {err}"
+                    ))
+                })?;
+            println!("{output}");
+            Ok(())
+        }
+        InstallerAction::PreflightV2 => {
+            let stdin_buf = read_macos_installer_stdin()?;
+            let input: lifecycle_v2::PreflightInput =
+                serde_json::from_str(&stdin_buf).map_err(|err| {
+                    hs_server::AppError::bad_request(format!("invalid v2 preflight input: {err}"))
+                })?;
+            let result = machine::preflight_v2_macos(&input)?;
+            let json = serde_json::to_string_pretty(&result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize v2 preflight result: {err}"))
+            })?;
+            println!("{json}");
+            Ok(())
+        }
+        InstallerAction::PlanV2 {
+            package_dir,
+            verify_key,
+        } => {
+            let stdin_buf = read_macos_installer_stdin()?;
+            let mut input: lifecycle_v2::PlanInput =
+                serde_json::from_str(&stdin_buf).map_err(|err| {
+                    hs_server::AppError::bad_request(format!("invalid v2 plan input: {err}"))
+                })?;
+            input.package_dir = package_dir;
+            let key_bytes = hex_decode_32(&verify_key)?;
+            let result = machine::plan_v2_macos(&input, &key_bytes)?;
+            let json = serde_json::to_string_pretty(&result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize v2 plan result: {err}"))
+            })?;
+            println!("{json}");
+            Ok(())
+        }
+        _ => Err(hs_server::AppError::not_implemented(
+            "only installer capabilities-v2, preflight-v2, and plan-v2 are available in the read-only macOS build",
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]

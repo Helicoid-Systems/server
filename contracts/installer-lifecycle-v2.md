@@ -2,8 +2,16 @@
 
 Owner: `modules/server`. Status: Linux systemd and Docker Compose support
 loopback development, a certificate-backed private LAN listener, and a
-certificate-backed private-DNS listener. Other deployment modes and operations
-remain capability-gated.
+certificate-backed private-DNS listener. macOS supports read-only loopback
+launchd preflight and plan review plus a prepared service entry that fails
+closed. Other deployment modes and operations remain capability-gated.
+
+A macOS build reports the `macos_launchd` deployment kind, the
+`loopback_development` network scope, and only the `preflight` and `plan`
+actions. It does not advertise `install`, `resume`, `cancel`, `inspect`, or
+`remove`. The macOS plan is a read-only review artifact: it verifies the signed
+package and fixed paths, but no apply/install, account creation, launchd plist
+writing or loading, readiness, backup, or removal implementation exists.
 
 This local JSON contract is shared by installers, the SSH TUI, and desktop
 hosting adapters. It does not itself create an HTTP route. The installed
@@ -163,6 +171,66 @@ configuration. Resume instead
 requires the existing v2 operation record and journal, and re-verifies the
 package, canonical plan, TLS certificate name, and certificate-chain digest.
 
+## macOS read-only plan and prepared service entry
+
+macOS accepts only `macos_launchd`, `loopback_development`, an unprivileged
+authority port, the Manager-owned data path
+`/Library/Application Support/Helicoid/Data`, and a caller-selected normalized
+backup directory outside the product, data, plist, and LaunchDaemons paths.
+Backup overlap is refused component-wise under case-insensitive comparison,
+matching the default macOS filesystem. The reviewed paths are fixed:
+
+- executable: `/Library/Application Support/Helicoid/bin/hs-server`
+- configuration: `/Library/Application Support/Helicoid/Configuration/service.json`
+- TLS directory: `/Library/Application Support/Helicoid/TLS`
+- launchd label and plist: `com.helicoid.server` and
+  `/Library/LaunchDaemons/com.helicoid.server.plist`
+
+Every reviewed path ancestor must be a real root-owned directory without unsafe
+write access or an ALLOW ACL. Symlink ancestors are refused with a diagnostic;
+the adapter does not resolve them. On a default macOS host `/tmp` and `/var` are
+commonly symlinks to `/private/tmp` and `/private/var`, and those targets are
+also group/world-writable. Use another reviewed, root-owned directory rather
+than weakening the symlink or write-permission checks.
+
+`plan-v2` runs only on the target Mac. It re-runs the read-only macOS
+preflight, refuses a submitted preflight that no longer matches the stable
+observed host facts, and rejects inconsistent `preflight.ok` /
+`host_checks.ok` values. It derives the frozen `macos-arm64` or
+`macos-x86_64` package target from the observed architecture. It then observes
+the fixed `_helicoid` service account and group. A fresh-install review plan is
+allowed only when both the account and group are absent. An absent account with
+an existing `_helicoid` group is not a fresh identity and is refused. Every
+existing account is refused unless an independent Helicoid-owned receipt can be
+verified. No receipt verifier exists in this build, so every existing account is
+refused. Unavailable Directory Services facts fail closed. Only after the
+identity observation permits a fresh review does the command verify the exact
+signed macOS package shape against the caller-supplied key.
+
+The macOS plan contains the fixed directories, the verified executable, the
+launchd unit, the loopback listener, the current schema migration, and explicit
+`not_implemented` entries for apply/install, `_helicoid` account creation,
+configuration/plist writing/loading, TLS material installation, readiness,
+updates, backup, restore, and removal. It never claims the service is installed
+or ready. `reviewed_plan_digest` binds the contract version, deployment
+configuration, stable preflight projection, canonical plan digest, exact
+signature-verified manifest bytes, caller-supplied verifying-key fingerprint,
+frozen target, artifact path/hash/size, and the service-account/group decision.
+`package_evidence` and `identity_evidence` expose those audit facts; the key is
+caller-supplied and must be distributed and verified out of band. macOS
+`apply-v2`, `resume-v2`, `status-v2`, `cancel-v2`, `remove-v2`, and the legacy
+mutation commands remain unavailable.
+
+`hs-server macos-service` is a separate prepared fixed launchd entry, not an
+installer. It reads no options and uses only the fixed root-owned configuration
+and fixed product paths. It requires equal nonzero real/effective IDs resolving
+to `_helicoid`, a product-owned identity decision, owner-private data/TLS
+material, a TLS leaf covering literal `127.0.0.1`, and a literal loopback bind.
+The product-ownership seam has no accepting decision in this build, so startup
+fails closed before configuration bytes, TLS material, the database, or the
+listener are touched. This command does not create an account, write or load a
+plist, install TLS/trust material, or establish readiness.
+
 ## Durable operations
 
 V2 apply writes `operation-v2.json` under the state directory before invoking
@@ -236,3 +304,5 @@ hs-server installer remove-v2 --state-dir DIR
 The v2 request schemas are Rust-owned in
 `src/installer/lifecycle_v2.rs`. Do not hand-construct a plan or infer support
 from a command's existence; discover capabilities and honor explicit refusal.
+On macOS, only `capabilities-v2`, `preflight-v2`, and `plan-v2` are available;
+every mutation command fails closed.

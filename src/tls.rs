@@ -23,6 +23,11 @@ use std::time::Duration;
 use sha2::Digest;
 use zeroize::Zeroizing;
 
+#[cfg(unix)]
+use std::io;
+#[cfg(unix)]
+use tokio::signal::unix::{signal as unix_signal, Signal, SignalKind};
+
 use crate::error::{AppError, AppResult};
 use crate::private_file;
 
@@ -162,8 +167,28 @@ pub fn run_serve_tls_with_network(
     key_path: &Path,
     allow_network: bool,
 ) -> AppResult<()> {
-    let transport =
-        validate_serve_tls_inputs_with_network(bind, cert_path, key_path, allow_network)?;
+    run_serve_tls_with_network_and_name(data, bind, cert_path, key_path, allow_network, None)
+}
+
+/// TLS entry that additionally requires the leaf certificate to cover a
+/// caller-supplied DNS name or IP address before the store is opened or the
+/// listener binds. Used by the fixed macOS service to require coverage of
+/// literal `127.0.0.1`; `None` preserves the existing `serve-tls` behavior.
+pub fn run_serve_tls_with_network_and_name(
+    data: &Path,
+    bind: &str,
+    cert_path: &Path,
+    key_path: &Path,
+    allow_network: bool,
+    expected_server_name: Option<&str>,
+) -> AppResult<()> {
+    let transport = validate_serve_tls_inputs_with_network_and_name(
+        bind,
+        cert_path,
+        key_path,
+        allow_network,
+        expected_server_name,
+    )?;
     let service = crate::open_service(data)?;
     serve_blocking(transport, service)
 }
@@ -212,6 +237,97 @@ pub fn run_serve_dual(
     serve_dual_blocking(local_addr, transport, service)
 }
 
+/// Require both Unix stop-signal registrations.
+///
+/// `SIGINT` keeps interactive Ctrl-C working and `SIGTERM` is how launchd and
+/// systemd stop a hosted service, so both are mandatory. There is deliberately
+/// no partial fallback: serving with an unobservable stop signal leaves only
+/// `SIGKILL`, so a failed registration is returned to the caller instead.
+#[cfg(unix)]
+fn require_both_registrations<A, T>(
+    interrupt: io::Result<A>,
+    terminate: io::Result<T>,
+) -> AppResult<(A, T)> {
+    let interrupt =
+        interrupt.map_err(|err| AppError::internal(format!("register SIGINT handler: {err}")))?;
+    let terminate =
+        terminate.map_err(|err| AppError::internal(format!("register SIGTERM handler: {err}")))?;
+    Ok((interrupt, terminate))
+}
+
+/// Stop requests a serve process can observe, armed before it serves.
+///
+/// Registration is explicit and fallible so a process that cannot observe a
+/// stop request fails closed instead of serving on with no way to stop except
+/// `SIGKILL`. On Unix, Ctrl-C (`SIGINT`) is the interactive request and
+/// `SIGTERM` is the launchd/systemd service stop; both must reach the same
+/// bounded graceful drain, so both registrations are required. Callers
+/// register before binding a listener or reporting readiness, then await
+/// [`ShutdownSignal::recv`].
+pub struct ShutdownSignal {
+    #[cfg(unix)]
+    interrupt: Signal,
+    #[cfg(unix)]
+    terminate: Signal,
+}
+
+impl ShutdownSignal {
+    /// Arm every stop signal this platform uses. Unix arms `SIGINT` and
+    /// `SIGTERM` here; Windows installs its CTRL_C handler on first poll of
+    /// [`ShutdownSignal::recv`] and reports any setup error there.
+    ///
+    /// Must run inside a Tokio runtime with the signal driver enabled, and
+    /// before the listener binds or logs readiness: a registration failure is
+    /// returned so the caller stops instead of serving unsupervised.
+    pub fn register() -> AppResult<Self> {
+        #[cfg(unix)]
+        {
+            let (interrupt, terminate) = require_both_registrations(
+                unix_signal(SignalKind::interrupt()),
+                unix_signal(SignalKind::terminate()),
+            )?;
+            Ok(ShutdownSignal {
+                interrupt,
+                terminate,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows keeps its existing CTRL_C path; its handler is installed
+            // on first poll and any error is reported by `recv`.
+            Ok(ShutdownSignal {})
+        }
+    }
+
+    /// Resolve when Ctrl-C or (on Unix) `SIGTERM` asks the server to stop.
+    ///
+    /// Callers own their bounded drain. Unix registration errors are returned
+    /// earlier by [`ShutdownSignal::register`]; this only fails if the signal
+    /// stream closes. Other platforms report their `CTRL_C` setup error here so
+    /// the caller stops and reports it instead of serving unobservably.
+    pub async fn recv(&mut self) -> AppResult<()> {
+        #[cfg(unix)]
+        {
+            let arrived = tokio::select! {
+                arrived = self.interrupt.recv() => arrived,
+                arrived = self.terminate.recv() => arrived,
+            };
+            match arrived {
+                Some(()) => Ok(()),
+                // A closed stream is not a stop request: report it so the
+                // caller stops and reports instead of exiting as if asked.
+                None => Err(AppError::internal("stop-signal stream closed")),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .map_err(|err| AppError::internal(format!("wait for Ctrl-C: {err}")))
+        }
+    }
+}
+
 /// Serve the selected loopback or v2-only network router over real TLS.
 pub fn serve_blocking(
     transport: TlsTransport,
@@ -223,6 +339,9 @@ pub fn serve_blocking(
         .map_err(|err| AppError::internal(format!("tokio runtime: {err}")))?;
 
     runtime.block_on(async move {
+        // Fail closed before binding or reporting readiness: a serve process
+        // that cannot observe a stop request must not start.
+        let mut stop_signals = ShutdownSignal::register()?;
         let maintenance_service = service.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -255,8 +374,13 @@ pub fn serve_blocking(
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutdown requested");
+            match stop_signals.recv().await {
+                Ok(()) => tracing::info!("shutdown requested"),
+                Err(err) => tracing::error!(
+                    error = %err,
+                    "cannot observe stop requests; stopping"
+                ),
+            }
             shutdown_handle.graceful_shutdown(Some(TLS_SHUTDOWN_TIMEOUT));
         });
         axum_server::from_tcp(
@@ -288,6 +412,9 @@ fn serve_dual_blocking(
         .map_err(|err| AppError::internal(format!("tokio runtime: {err}")))?;
 
     runtime.block_on(async move {
+        // Fail closed before binding or reporting readiness: a serve process
+        // that cannot observe a stop request must not start.
+        let mut stop_signals = ShutdownSignal::register()?;
         let maintenance_service = service.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -344,9 +471,14 @@ fn serve_dual_blocking(
         tracing::info!(%local_addr, network_addr = %transport.addr(),
             "hs-server listening on loopback HTTP and v2-only network HTTPS");
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|err| AppError::internal(format!("wait for shutdown signal: {err}")))?;
-                tracing::info!("shutdown requested");
+            stop = stop_signals.recv() => {
+                match &stop {
+                    Ok(()) => tracing::info!("shutdown requested"),
+                    Err(err) => tracing::error!(
+                        error = %err,
+                        "cannot observe stop requests; stopping"
+                    ),
+                }
                 let _ = shutdown_tx.send(true);
                 network_handle.graceful_shutdown(Some(TLS_SHUTDOWN_TIMEOUT));
                 let (local_result, network_result) = tokio::time::timeout(
@@ -355,6 +487,9 @@ fn serve_dual_blocking(
                 )
                 .await
                 .map_err(|_| AppError::internal("dual-listener shutdown timed out"))?;
+                // The bounded drain above already ran; the stop cause is still
+                // reported instead of being replaced by a clean exit.
+                stop?;
                 local_result.map_err(|err| AppError::internal(format!("serve local: {err}")))?;
                 network_result.map_err(|err| AppError::internal(format!("serve network TLS: {err}")))?;
                 Ok(())
@@ -577,4 +712,53 @@ fn build_server_config(
     // ALPN is set explicitly (axum_server::from_config requires this).
     config.alpn_protocols = ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect();
     Ok(Arc::new(config))
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_signal_tests {
+    //! Focused proof that stop-signal registration fails closed.
+    //!
+    //! Signal delivery is deliberately not simulated in this process:
+    //! end-to-end `SIGINT`/`SIGTERM` delivery against the real binary is
+    //! covered by `tests/shutdown_signals.rs` and `tests/tls_transport.rs`.
+    //! These tests pin the both-or-error mapping those paths depend on, which
+    //! no fixture can force through the OS.
+
+    use super::*;
+    use std::io;
+
+    fn registration_failure() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "signal registration failed",
+        )
+    }
+
+    /// A failed SIGTERM registration is an error, not a Ctrl-C-only listener:
+    /// launchd/systemd could otherwise never stop the service.
+    #[test]
+    fn failed_sigterm_registration_fails_closed() {
+        let err = match require_both_registrations::<(), ()>(Ok(()), Err(registration_failure())) {
+            Ok(_) => panic!("failed SIGTERM registration must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("SIGTERM"),
+            "error must name the failed signal: {err}"
+        );
+    }
+
+    /// A failed SIGINT registration is reported the same way, so Ctrl-C never
+    /// silently disappears when SIGTERM happens to register first.
+    #[test]
+    fn failed_sigint_registration_is_reported() {
+        let err = match require_both_registrations::<(), ()>(Err(registration_failure()), Ok(())) {
+            Ok(_) => panic!("failed SIGINT registration must fail the listener"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("SIGINT"),
+            "error must name the failed signal: {err}"
+        );
+    }
 }

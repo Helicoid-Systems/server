@@ -80,12 +80,15 @@ jobs:
       - name: Test plan, identity, and package custody
         run: >-
           cargo test --locked
+          --lib
           --test installer_macos_plan
           --test installer_macos_launchd
           --test installer_macos_identity
           --test installer_macos_capabilities
           --test installer_package_custody
           --test installer_verified_manifest
+          --test macos_service_runtime
+          --test shutdown_signals
 
   windows:
     name: windows-latest test / build

@@ -775,3 +775,209 @@ fn wrong_package_key_or_failed_preflight_yields_no_plan() {
     assert!(!failed_result.ok);
     assert!(failed_result.plan.is_none());
 }
+
+#[cfg(target_os = "macos")]
+mod cli {
+    //! macOS-only CLI evidence for the read-only installer path and the
+    //! fail-closed fixed service entry. These tests invoke the real binary;
+    //! they do not install, load, elevate, or write a system resource.
+
+    use std::io::Write;
+    use std::process::{Command, Output, Stdio};
+
+    use serde_json::Value;
+
+    fn run_installer(arguments: &[&str], stdin: &str) -> Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hs-server"))
+            .args(["installer"])
+            .args(arguments)
+            .env("RUST_LOG", "off")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn hs-server");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(stdin.as_bytes())
+            .expect("write installer stdin");
+        child.wait_with_output().expect("wait for hs-server")
+    }
+
+    fn preflight_input() -> String {
+        serde_json::json!({
+            "contract_version": 2,
+            "configuration": {
+                "deployment_kind": "macos_launchd",
+                "network": {
+                    "scope": "loopback_development",
+                    "authority_port": 8920
+                },
+                "storage": {
+                    "data_directory": "/Library/Application Support/Helicoid/Data",
+                    "backup_directory": "/private/tmp/helicoid-backup-fixture",
+                    "preserve_data_on_remove": true
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn cli_capabilities_do_not_advertise_installation_or_readiness() {
+        let output = run_installer(&["capabilities-v2"], "");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("capabilities JSON");
+
+        assert_eq!(value["contract_version"], 2);
+        assert_eq!(
+            value["supported_deployment_kinds"],
+            serde_json::json!(["macos_launchd"])
+        );
+        assert_eq!(
+            value["supported_actions"],
+            serde_json::json!(["preflight", "plan"])
+        );
+        assert_eq!(value["cancellation"], serde_json::json!(false));
+        assert_eq!(value["durable_operation_journal"], serde_json::json!(false));
+        assert!(value["reasons_unavailable"]["enrollment_readiness"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("development-only")));
+    }
+
+    #[test]
+    fn cli_preflight_v2_emits_existing_contract_without_readiness_claims() {
+        let output = run_installer(&["preflight-v2"], &preflight_input());
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).expect("preflight JSON");
+
+        assert_eq!(value["contract_version"], 2);
+        assert_eq!(value["configuration"]["deployment_kind"], "macos_launchd");
+        assert_eq!(value["configuration"]["network"]["authority_port"], 8920);
+        assert_eq!(value["host_checks"]["contract_version"], 1);
+
+        let paths = value["host_checks"]["checks"]["paths"]["checked"]
+            .as_array()
+            .expect("path evidence");
+        for expected in [
+            "/Library/Application Support/Helicoid",
+            "/Library/Application Support/Helicoid/Data",
+            "/Library/LaunchDaemons/com.helicoid.server.plist",
+            "/private/tmp/helicoid-backup-fixture",
+        ] {
+            assert!(
+                paths.iter().any(|path| path["path"] == expected),
+                "missing reviewed path {expected}"
+            );
+        }
+
+        assert_eq!(
+            value["capabilities"]["supported_deployment_kinds"],
+            serde_json::json!(["macos_launchd"])
+        );
+        assert_eq!(
+            value["capabilities"]["supported_actions"],
+            serde_json::json!(["preflight", "plan"])
+        );
+        assert!(value.get("service_installed").is_none());
+        assert!(value.get("bootstrap_ready").is_none());
+        assert!(value.get("server_ready_for_enrollment").is_none());
+    }
+
+    #[test]
+    fn cli_rejects_mutation_commands_on_macos() {
+        let output = run_installer(&["apply-v2"], "");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("read-only macOS build"),
+            "unexpected stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn cli_plan_v2_is_wired_without_enabling_install() {
+        let output = run_installer(
+            &[
+                "plan-v2",
+                "--package-dir",
+                "/nonexistent-helicoid-package",
+                "--verify-key",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ],
+            "{}",
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("invalid v2 plan input"),
+            "plan-v2 must be a recognized read-only command, stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("only installer capabilities-v2"),
+            "plan-v2 must not be rejected as an unavailable command: {stderr}"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_linux_deployment_input_on_macos() {
+        let linux = serde_json::json!({
+            "contract_version": 2,
+            "configuration": {
+                "deployment_kind": "linux_systemd",
+                "network": {
+                    "scope": "loopback_development",
+                    "authority_port": 8787
+                },
+                "storage": {
+                    "data_directory": "/var/lib/helicoid/data",
+                    "backup_directory": "/var/lib/helicoid/backups",
+                    "preserve_data_on_remove": true
+                }
+            }
+        })
+        .to_string();
+
+        let output = run_installer(&["preflight-v2"], &linux);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("macOS launchd deployment"),
+            "unexpected stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn cli_fixed_service_verb_fails_closed_without_starting() {
+        let output = Command::new(env!("CARGO_BIN_EXE_hs-server"))
+            .arg("macos-service")
+            .env("RUST_LOG", "off")
+            .output()
+            .expect("run hs-server macos-service");
+        assert!(
+            !output.status.success(),
+            "the prepared macOS service must not start in this build"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("refusing")
+                || stderr.contains("must not run as root")
+                || stderr.contains("cannot verify"),
+            "unexpected fail-closed diagnostic: {stderr}"
+        );
+        assert!(
+            !stderr.contains("listening"),
+            "the service must not reach the listener: {stderr}"
+        );
+    }
+}

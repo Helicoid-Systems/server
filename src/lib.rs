@@ -20,6 +20,7 @@ pub mod file_requests;
 pub mod http;
 pub mod installer;
 pub mod interactions;
+pub mod macos_service;
 pub mod models;
 pub mod private_file;
 #[cfg(windows)]

@@ -140,6 +140,16 @@ declared path. Directories are descended only when they are a path prefix of a
 declared artifact, and never through a symlink (symlinked parents of declared
 artifacts are already refused by the artifact symlink-parent guard).
 
+## macOS read-only review
+
+The macOS CLI accepts only `capabilities-v2`, `preflight-v2`, and `plan-v2`.
+`plan-v2` may verify an exact signed macOS package (one `artifacts/hs-server`
+artifact) against a caller-supplied key and emit a read-only review plan, but it
+does not install, create the `_helicoid` account, write or load a launchd plist,
+install TLS/trust material, or claim readiness. Apply/install and every mutation
+command remain unavailable. This is integrity evidence, not authenticated key
+distribution or installation authority.
+
 ## Non-goals and proof limits
 
 - Windows/macOS installation, Service Management/SCM/systemd runtime

@@ -1,3 +1,22 @@
+## macOS read-only CLI/service source candidate, 10 November 2026
+
+Source-only slice on the read-only macOS planning branch. It wires the existing
+macOS v2 preflight and plan entry points to the CLI (`capabilities-v2`,
+`preflight-v2`, `plan-v2`), adds the fixed `macos-service` launchd entry, and
+adds bounded `SIGINT`/`SIGTERM` stop handling for the HTTP and TLS serve paths.
+The fixed service entry fails closed at the `_helicoid` identity/product-
+ownership gate before reading configuration, TLS material, the database, or
+binding a listener. macOS mutation commands remain unavailable. Portable
+service-policy and stop-signal tests are wired into the existing
+Linux/Windows `cargo test` jobs; macOS CLI checks are added to the existing
+macOS read-only plan test target, so no workflow file changed.
+
+**Not Verified:** this slice has not been run in native macOS/Linux CI at the
+time of writing. No macOS installation, apply/install, service-account
+creation, launchd plist writing/loading, TLS/trust distribution,
+recovery/cutover, backup scheduling, removal, installed service identity, or
+readiness is claimed. No production data, host service, or VM was changed.
+
 ## Native conditional-MFA prerequisite acceptance, 16 October 2026
 
 [CI38932191897](https://github.com/Helicoid-Systems/server/actions/runs/38932191897)

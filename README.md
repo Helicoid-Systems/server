@@ -62,6 +62,7 @@ Existing SQLite store files accept only currentUser/SYSTEM/Administrators owners
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
 | Installer package targets | Typed trusted target (`linux-x86_64`, `windows-x86_64`, `macos-arm64`, `macos-x86_64`), exact `hs-server` product binding, strict release `major.minor.patch`, nonempty bounded artifact list, and portable artifact paths in [contracts/installer-package-targets-v1.md](contracts/installer-package-targets-v1.md); verification only — Windows/macOS installation remains unavailable |
+| macOS read-only planning | CLI `capabilities-v2`, `preflight-v2`, and `plan-v2`; re-observed host facts, package verification, and fresh-identity refusal. The prepared `macos-service` entry fails closed at the identity/ownership gate; it does not install, load launchd, or start a working service |
 | Windows/macOS host installation | Unavailable in this server build |
 | Windows persistent v2 MFA | **Verified prerequisite**: real native bootstrap/MFA/reopen, strict current-user directories/material, trusted SQLite file owners and private child inheritance. Installed service identity and security review remain Not Verified |
 
@@ -305,6 +306,43 @@ Native clients integrate from **[contracts/http-v1.md](contracts/http-v1.md)**.
 Its version-1 wire shape remains unchanged. The v2 manager routes add
 device-bound sessions, bootstrap, account lifecycle, access, MFA recovery, and
 MFA policy operations in [contracts/http-v2.md](contracts/http-v2.md).
+
+## macOS read-only planning and prepared service entry
+
+The macOS build exposes only the read-only installer v2 commands:
+
+```sh
+hs-server installer capabilities-v2
+hs-server installer preflight-v2   # bounded v2 preflight JSON on stdin
+hs-server installer plan-v2 --package-dir /path/to/package --verify-key <hex>
+```
+
+`plan-v2` re-runs local preflight, refuses a submitted preflight that no longer
+matches stable observed host facts, derives the frozen `macos-arm64` or
+`macos-x86_64` target from the observed architecture, observes the fixed
+`_helicoid` service account and group, and only then verifies the exact signed
+macOS package shape against the caller-supplied key. A fresh-install review plan
+requires both the account and group to be absent. An absent account with an
+existing group, every existing account (no independently verified Helicoid-owned
+receipt exists yet), and unavailable Directory Services facts fail closed. The
+caller-supplied verifying key is bound only by fingerprint in the reviewed
+digest and must be distributed out of band.
+
+`hs-server macos-service` is the prepared fixed launchd entry. It reads no
+command-line options, uses only the reviewed root-owned configuration at
+`/Library/Application Support/Helicoid/Configuration/service.json`, and prepares
+a literal `127.0.0.1` TLS listener whose certificate must cover `127.0.0.1`.
+The fixed `_helicoid` identity/product-ownership gate always refuses startup in
+this build, before configuration, TLS material, database, or listener effects.
+The service command is therefore **not an installer and does not start a
+working hosted service**.
+
+Apply/install, `_helicoid` account creation, launchd plist writing/loading, TLS
+material and trust distribution, recovery/cutover, backup scheduling, status,
+cancellation, and removal remain unavailable on macOS. The Linux-only TUI and
+Linux installer are not part of this path. A valid plan, package, or command
+name grants no installation authority and does not claim an installed or
+readiness state.
 
 ## Linux server TUI
 
