@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
+use super::package_fs::UnixPinnedPackage;
+use super::package_fs::{InMemoryPinnedPackage, PackageFsError, PinnedPackage};
+
+#[cfg(target_os = "linux")]
 use crate::error::{AppError, AppResult};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +51,27 @@ pub trait LifecycleOperationLock: Send {}
 pub trait CommandAdapter: Send + Sync {
     /// Read entire file contents.
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, String>;
+
+    /// Read at most `max_bytes` without allocating for a larger file. The
+    /// default refuses rather than risking an unbounded allocation; production
+    /// and in-memory adapters implement the bounded path explicitly.
+    fn read_file_bounded(&self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let _ = (path, max_bytes);
+        Err("adapter does not support bounded file reads".to_string())
+    }
+
+    /// Open a package directory as a held handle for descriptor-relative
+    /// verification. The default refuses rather than allowing verification to
+    /// fall back to path-based reads.
+    fn open_pinned_package(
+        &self,
+        package_dir: &Path,
+    ) -> Result<Arc<dyn PinnedPackage>, PackageFsError> {
+        let _ = package_dir;
+        Err(PackageFsError::Unsupported(
+            "adapter does not support pinned package custody".to_string(),
+        ))
+    }
 
     /// Write file contents (creates parent dirs if needed).
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), String>;
@@ -346,6 +371,46 @@ impl CommandAdapter for TestAdapter {
             .ok_or_else(|| format!("file not found: {}", path.display()))
     }
 
+    fn read_file_bounded(&self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let fs = self.fs.lock().unwrap();
+        let bytes = fs
+            .get(path)
+            .ok_or_else(|| format!("file not found: {}", path.display()))?;
+        if bytes.len() > max_bytes {
+            return Err(format!(
+                "file '{}' exceeds {max_bytes} byte bound",
+                path.display()
+            ));
+        }
+        Ok(bytes.clone())
+    }
+
+    fn open_pinned_package(
+        &self,
+        package_dir: &Path,
+    ) -> Result<Arc<dyn PinnedPackage>, PackageFsError> {
+        let metadata = self.symlink_metadata(package_dir).map_err(|error| {
+            PackageFsError::Uninspectable(format!("{}: {error}", package_dir.display()))
+        })?;
+        if metadata.is_symlink {
+            return Err(PackageFsError::Symlink(package_dir.display().to_string()));
+        }
+        if !metadata.is_dir {
+            return Err(PackageFsError::NotDirectory(
+                package_dir.display().to_string(),
+            ));
+        }
+        let files = self.fs.lock().unwrap().clone();
+        let directories = self.directories.lock().unwrap().clone();
+        let symlinks = self.symlinks.lock().unwrap().clone();
+        Ok(Arc::new(InMemoryPinnedPackage::new(
+            package_dir,
+            files,
+            directories,
+            symlinks,
+        )?) as Arc<dyn PinnedPackage>)
+    }
+
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), String> {
         self.check_failure("write_file")?;
         if let Some(parent) = path.parent() {
@@ -490,6 +555,7 @@ impl CommandAdapter for TestAdapter {
     }
 
     fn symlink_metadata(&self, path: &Path) -> Result<FileMetadata, String> {
+        self.check_failure(&format!("symlink_metadata:{}", path.display()))?;
         if self.symlinks.lock().unwrap().contains(path) {
             return Ok(FileMetadata {
                 len: 0,
@@ -1499,6 +1565,56 @@ impl LinuxAdapter {
 impl CommandAdapter for LinuxAdapter {
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, String> {
         std::fs::read(path).map_err(|e| format!("read '{}': {e}", path.display()))
+    }
+
+    fn read_file_bounded(&self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            // O_NONBLOCK prevents a FIFO from hanging the verifier before the
+            // regular-file check below can reject it.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| format!("open '{}': {e}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("metadata '{}': {e}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("file '{}' is not a regular file", path.display()));
+        }
+        if metadata.len() > max_bytes as u64 {
+            return Err(format!(
+                "file '{}' exceeds {max_bytes} byte bound",
+                path.display()
+            ));
+        }
+        let mut contents = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = file
+                .read(&mut chunk)
+                .map_err(|e| format!("read '{}': {e}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            if contents.len().saturating_add(read) > max_bytes {
+                return Err(format!(
+                    "file '{}' exceeds {max_bytes} byte bound",
+                    path.display()
+                ));
+            }
+            contents.extend_from_slice(&chunk[..read]);
+        }
+        Ok(contents)
+    }
+
+    fn open_pinned_package(
+        &self,
+        package_dir: &Path,
+    ) -> Result<Arc<dyn PinnedPackage>, PackageFsError> {
+        Ok(Arc::new(UnixPinnedPackage::open(package_dir)?) as Arc<dyn PinnedPackage>)
     }
 
     fn write_file(&self, path: &Path, contents: &[u8]) -> Result<(), String> {

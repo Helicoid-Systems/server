@@ -146,11 +146,42 @@ pub struct PlanResult {
     pub plan: Option<InstallPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewed_plan_digest: Option<String>,
+    /// Exact package bytes, trust key, target, and artifact that the macOS
+    /// review digest binds. Absent for non-macOS plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_evidence: Option<PackageEvidence>,
+    /// Service-identity observation bound into the macOS review digest.
+    /// Absent for non-macOS plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_evidence: Option<IdentityEvidence>,
     pub capabilities: LifecycleCapabilities,
     #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Exact package evidence bound into a macOS reviewed plan digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageEvidence {
+    /// SHA-256 of the exact signature-verified manifest bytes.
+    pub manifest_sha256: String,
+    /// SHA-256 of the caller-supplied Ed25519 verifying key.
+    pub verifying_key_sha256: String,
+    /// Frozen target selected from the observed host architecture.
+    pub target: String,
+    pub artifact_path: String,
+    pub artifact_sha256: String,
+    pub artifact_size_bytes: u64,
+}
+
+/// Service-identity observation bound into a macOS reviewed plan digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityEvidence {
+    pub service_account: String,
+    pub service_group: String,
+    /// Stable decision label such as `account_absent_group_absent`.
+    pub decision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

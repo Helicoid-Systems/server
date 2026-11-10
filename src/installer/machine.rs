@@ -495,13 +495,29 @@ fn plan_requiring_artifacts(
 
 /// Current capability report for the v2 lifecycle contract.
 pub fn lifecycle_capabilities_v2() -> v2::LifecycleCapabilities {
+    #[cfg(target_os = "macos")]
+    {
+        // The library must report the same read-only preflight/plan truth as
+        // the CLI and the macOS adapter. Linux keeps its existing capability
+        // document.
+        super::macos_launchd::capabilities_v2()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        lifecycle_capabilities_v2_non_macos()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn lifecycle_capabilities_v2_non_macos() -> v2::LifecycleCapabilities {
     use v2::{DeploymentKind, LifecycleAction, NetworkScope};
 
     let on_linux = cfg!(target_os = "linux");
     let mut reasons_unavailable = BTreeMap::new();
     reasons_unavailable.insert(
         "macos_launchd".to_string(),
-        "the launchd host adapter is not implemented in this server package".to_string(),
+        "the macOS read-only preflight and plan adapter exists, but apply/install, service-account creation, status, cancellation, and removal are not implemented in this server package"
+            .to_string(),
     );
     reasons_unavailable.insert(
         "windows_service".to_string(),
@@ -671,6 +687,415 @@ pub fn preflight_v2(
         docker_compose_runtime,
         capabilities: lifecycle_capabilities_v2(),
     })
+}
+
+/// Read-only macOS v2 preflight entry point.
+///
+/// This is intentionally separate from [`preflight_v2`]: the Linux lifecycle
+/// preflight keeps its existing adapter and behavior, and macOS has no
+/// production `CommandAdapter`. The macOS path performs only the observations
+/// in [`super::macos_launchd`] and returns the same v2 wire types. It cannot
+/// apply, resume, cancel, remove, or claim readiness.
+#[cfg(target_os = "macos")]
+pub fn preflight_v2_macos(input: &v2::PreflightInput) -> AppResult<v2::PreflightResult> {
+    super::macos_launchd::preflight_v2(&super::macos_launchd::MacosSystemObserver, input)
+}
+
+/// Read-only macOS v2 plan entry point.
+///
+/// The plan re-observes the local host, binds the caller-supplied preflight to
+/// that observation, derives the frozen package target from the observed
+/// architecture, checks the service-identity observation, and then verifies the
+/// exact signed macOS package. A fresh-install review plan requires both the
+/// fixed `_helicoid` account and group to be absent; either an existing account
+/// or an existing group with an absent account is refused. Every existing
+/// account is refused until an independent Helicoid-owned receipt can be
+/// verified. This function never creates an account, writes a plist, loads
+/// launchd, or enables apply/install.
+#[cfg(target_os = "macos")]
+pub fn plan_v2_macos(
+    input: &v2::PlanInput,
+    verifying_key_bytes: &[u8; 32],
+) -> AppResult<v2::PlanResult> {
+    plan_v2_macos_with_observers(
+        &super::macos_launchd::MacosSystemObserver,
+        &super::macos_identity::MacosSystemIdentityObserver,
+        input,
+        verifying_key_bytes,
+    )
+}
+
+/// Observable core of [`plan_v2_macos`]. Production passes the real macOS
+/// observers; tests pass bounded in-memory fixtures. The package verifier is
+/// the real pinned-file verifier.
+#[cfg(unix)]
+pub fn plan_v2_macos_with_observers(
+    launchd_observer: &dyn super::macos_launchd::MacosLaunchdObserver,
+    identity_observer: &dyn super::macos_identity::MacosIdentityObserver,
+    input: &v2::PlanInput,
+    verifying_key_bytes: &[u8; 32],
+) -> AppResult<v2::PlanResult> {
+    use super::macos_identity::ServiceIdentityDecision;
+
+    if input.contract_version != v2::CONTRACT_VERSION {
+        return Err(AppError::bad_request(format!(
+            "unsupported lifecycle contract_version: {} (expected {})",
+            input.contract_version,
+            v2::CONTRACT_VERSION
+        )));
+    }
+    if input.preflight.contract_version != v2::CONTRACT_VERSION
+        || input.preflight.host_checks.contract_version != CONTRACT_VERSION
+        || input.preflight.configuration != input.configuration
+    {
+        return Err(AppError::bad_request(format!(
+            "unsupported nested preflight contract version; expected lifecycle v{} wrapping host v{}",
+            v2::CONTRACT_VERSION,
+            CONTRACT_VERSION
+        )));
+    }
+    if input.preflight.ok != input.preflight.host_checks.ok {
+        return Err(AppError::bad_request(
+            "preflight.ok must match host_checks.ok; refusing an inconsistent review",
+        ));
+    }
+
+    // Re-observe instead of trusting the caller's submitted host facts. The
+    // reviewed-plan digest binds this fresh observation below.
+    let observed_preflight = super::macos_launchd::preflight_v2(
+        launchd_observer,
+        &v2::PreflightInput {
+            contract_version: v2::CONTRACT_VERSION,
+            configuration: input.configuration.clone(),
+        },
+    )?;
+    let supplied_preflight = macos_preflight_review_value(&input.preflight)?;
+    let fresh_preflight = macos_preflight_review_value(&observed_preflight)?;
+    if supplied_preflight != fresh_preflight {
+        return Err(AppError::conflict(
+            "macOS host preflight changed after review; generate a new plan",
+            None,
+        ));
+    }
+    if !observed_preflight.ok {
+        return Ok(refused_macos_plan(
+            &input.configuration,
+            "preflight checks failed; cannot generate plan".to_string(),
+            Vec::new(),
+        ));
+    }
+
+    let target =
+        macos_package_target_for_architecture(&observed_preflight.host_checks.checks.arch.value)?;
+
+    match super::macos_identity::observe_service_identity(identity_observer) {
+        ServiceIdentityDecision::AccountAbsentObservation => {}
+        ServiceIdentityDecision::AccountAbsentGroupPresentObservation => {
+            return Ok(refused_macos_plan(
+                &input.configuration,
+                format!(
+                    "service account '{}' is absent but the fixed group '{}' already exists; this is not a fresh service identity",
+                    super::macos_identity::PRODUCT_SERVICE_ACCOUNT,
+                    super::macos_identity::PRODUCT_SERVICE_GROUP
+                ),
+                Vec::new(),
+            ));
+        }
+        ServiceIdentityDecision::ExistingAccountRefused { reasons } => {
+            let reasons = reasons
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Ok(refused_macos_plan(
+                &input.configuration,
+                format!(
+                    "existing service account '{}' is refused: {reasons}; no independently verified Helicoid-owned receipt is available for macOS plan-v2",
+                    super::macos_identity::PRODUCT_SERVICE_ACCOUNT
+                ),
+                Vec::new(),
+            ));
+        }
+        ServiceIdentityDecision::Unavailable { reason } => {
+            return Err(AppError::security_state_unavailable(format!(
+                "cannot verify the macOS service identity for planning: {reason}"
+            )));
+        }
+    }
+
+    let identity_evidence = v2::IdentityEvidence {
+        service_account: super::macos_identity::PRODUCT_SERVICE_ACCOUNT.to_string(),
+        service_group: super::macos_identity::PRODUCT_SERVICE_GROUP.to_string(),
+        decision: "account_absent_group_absent".to_string(),
+    };
+
+    let verified = match super::macos_package::verify_macos_package_for_target_real(
+        Path::new(&input.package_dir),
+        verifying_key_bytes,
+        target,
+    ) {
+        Ok(verified) => verified,
+        Err(error) => {
+            return Ok(refused_macos_plan(
+                &input.configuration,
+                format!("macOS package verification failed: {error}"),
+                Vec::new(),
+            ));
+        }
+    };
+    if verified.target() != target {
+        return Ok(refused_macos_plan(
+            &input.configuration,
+            "verified macOS package target does not match the observed host architecture"
+                .to_string(),
+            Vec::new(),
+        ));
+    }
+
+    let verified_manifest = verified.verified_manifest();
+    let artifact = verified.artifact();
+    let package_evidence = v2::PackageEvidence {
+        manifest_sha256: verified_manifest.manifest_sha256().to_string(),
+        verifying_key_sha256: verified_manifest.verifying_key_sha256().to_string(),
+        target: target.platform_str().to_string(),
+        artifact_path: artifact.path.clone(),
+        artifact_sha256: artifact.sha256.clone(),
+        artifact_size_bytes: artifact.size_bytes,
+    };
+
+    let mut plan = generate_canonical_macos_plan(
+        &verified.manifest().product,
+        &verified.manifest().version,
+        &input.configuration,
+    );
+    plan.review_digest = compute_plan_digest(&plan);
+    let reviewed_plan_digest = compute_macos_reviewed_plan_digest(
+        &input.configuration,
+        &fresh_preflight,
+        &plan,
+        &package_evidence,
+        &identity_evidence,
+    )?;
+
+    Ok(v2::PlanResult {
+        contract_version: v2::CONTRACT_VERSION,
+        ok: true,
+        configuration: input.configuration.clone(),
+        plan: Some(plan),
+        reviewed_plan_digest: Some(reviewed_plan_digest),
+        package_evidence: Some(package_evidence),
+        identity_evidence: Some(identity_evidence),
+        capabilities: super::macos_launchd::capabilities_v2(),
+        warnings: vec![
+            "macOS plan-v2 is read-only: apply/install, service-account creation, launchd plist writing/loading, and readiness are not implemented"
+                .to_string(),
+            "the caller-supplied package verifying key is bound only by its SHA-256 in reviewed_plan_digest and package_evidence; distribute and verify that key out of band"
+                .to_string(),
+        ],
+        error: None,
+    })
+}
+
+#[cfg(unix)]
+fn refused_macos_plan(
+    configuration: &v2::DeploymentConfiguration,
+    error: String,
+    warnings: Vec<String>,
+) -> v2::PlanResult {
+    v2::PlanResult {
+        contract_version: v2::CONTRACT_VERSION,
+        ok: false,
+        configuration: configuration.clone(),
+        plan: None,
+        reviewed_plan_digest: None,
+        package_evidence: None,
+        identity_evidence: None,
+        capabilities: super::macos_launchd::capabilities_v2(),
+        warnings,
+        error: Some(error),
+    }
+}
+
+/// Stable subset of the macOS preflight used to detect a stale review.
+///
+/// Free-space byte counts and occupied-listener process descriptions naturally
+/// change between two observations. The success flag still changes when
+/// storage or port availability crosses the reviewed boundary, so omitting the
+/// volatile detail does not hide a material host change.
+#[cfg(unix)]
+fn macos_preflight_review_value(preflight: &v2::PreflightResult) -> AppResult<serde_json::Value> {
+    #[derive(serde::Serialize)]
+    struct StableReview<'a> {
+        contract_version: u32,
+        host_contract_version: u32,
+        configuration: &'a v2::DeploymentConfiguration,
+        ok: bool,
+        os: &'a CheckResult,
+        arch: &'a CheckResult,
+        privileges: &'a PrivilegesCheck,
+        storage_ok: bool,
+        ports_ok: bool,
+        paths: &'a PathsCheck,
+        services: &'a ServicesCheck,
+        existing_install: &'a ExistingInstallCheck,
+        tls_certificate_sha256: &'a Option<String>,
+        tls_subject_name_verified: bool,
+    }
+
+    let checks = &preflight.host_checks.checks;
+    serde_json::to_value(StableReview {
+        contract_version: preflight.contract_version,
+        host_contract_version: preflight.host_checks.contract_version,
+        configuration: &preflight.configuration,
+        ok: preflight.ok,
+        os: &checks.os,
+        arch: &checks.arch,
+        privileges: &checks.privileges,
+        storage_ok: checks.storage.ok,
+        ports_ok: checks.ports.ok,
+        paths: &checks.paths,
+        services: &checks.services,
+        existing_install: &checks.existing_install,
+        tls_certificate_sha256: &preflight.tls_certificate_sha256,
+        tls_subject_name_verified: preflight.tls_subject_name_verified,
+    })
+    .map_err(|error| AppError::internal(format!("serialize stable preflight review: {error}")))
+}
+
+/// Bind the macOS review to the stable host observation, exact verified package
+/// bytes, caller-supplied trust key, target/artifact, service identity, and
+/// canonical resource plan. This is a review digest, not a signature or an
+/// authorization token.
+#[cfg(unix)]
+fn compute_macos_reviewed_plan_digest(
+    configuration: &v2::DeploymentConfiguration,
+    stable_preflight: &serde_json::Value,
+    plan: &InstallPlan,
+    package: &v2::PackageEvidence,
+    identity: &v2::IdentityEvidence,
+) -> AppResult<String> {
+    #[derive(serde::Serialize)]
+    struct Review<'a> {
+        contract_version: u32,
+        configuration: &'a v2::DeploymentConfiguration,
+        stable_host_preflight: &'a serde_json::Value,
+        package: &'a v2::PackageEvidence,
+        identity: &'a v2::IdentityEvidence,
+        installer_plan_digest: &'a str,
+    }
+
+    let canonical = Review {
+        contract_version: v2::CONTRACT_VERSION,
+        configuration,
+        stable_host_preflight: stable_preflight,
+        package,
+        identity,
+        installer_plan_digest: &plan.review_digest,
+    };
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| AppError::internal(format!("serialize macOS review: {error}")))?;
+    Ok(manifest::sha256_hex(&bytes))
+}
+
+#[cfg(unix)]
+fn macos_package_target_for_architecture(architecture: &str) -> AppResult<InstallerTarget> {
+    match architecture {
+        "arm64" => Ok(InstallerTarget::MacosArm64),
+        "x86_64" => Ok(InstallerTarget::MacosX86_64),
+        other => Err(AppError::unprocessable(format!(
+            "unsupported macOS architecture '{other}' for package planning; require arm64 or x86_64"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn generate_canonical_macos_plan(
+    product: &str,
+    version: &str,
+    configuration: &v2::DeploymentConfiguration,
+) -> InstallPlan {
+    let service_account = super::macos_identity::PRODUCT_SERVICE_ACCOUNT;
+    InstallPlan {
+        review_digest: String::new(),
+        product: product.to_string(),
+        version: version.to_string(),
+        service_user: ServiceUserSpec {
+            name: service_account.to_string(),
+            // The reviewed plan names the dedicated fresh-install account, but
+            // this read-only slice performs no creation.
+            create: false,
+        },
+        directories: vec![
+            DirectorySpec {
+                path: super::macos_launchd::PRODUCT_ROOT_PATH.to_string(),
+                owner: "root".to_string(),
+                mode: "0755".to_string(),
+                create: true,
+            },
+            DirectorySpec {
+                path: super::macos_launchd::EXECUTABLE_DIRECTORY.to_string(),
+                owner: "root".to_string(),
+                mode: "0755".to_string(),
+                create: true,
+            },
+            DirectorySpec {
+                path: super::macos_launchd::CONFIGURATION_DIRECTORY.to_string(),
+                owner: "root".to_string(),
+                mode: "0755".to_string(),
+                create: true,
+            },
+            DirectorySpec {
+                path: super::macos_launchd::DATA_PATH.to_string(),
+                owner: service_account.to_string(),
+                mode: "0700".to_string(),
+                create: true,
+            },
+            DirectorySpec {
+                path: super::macos_launchd::TLS_DIRECTORY.to_string(),
+                owner: service_account.to_string(),
+                mode: "0700".to_string(),
+                create: true,
+            },
+            DirectorySpec {
+                path: configuration.storage.backup_directory.clone(),
+                owner: service_account.to_string(),
+                mode: "0700".to_string(),
+                create: true,
+            },
+        ],
+        files: vec![FileSpec {
+            source: super::macos_package::MACOS_ARTIFACT_PATH.to_string(),
+            destination: super::macos_launchd::EXECUTABLE_PATH.to_string(),
+            mode: "0755".to_string(),
+        }],
+        units: vec![UnitSpec {
+            name: super::macos_launchd::LAUNCHD_LABEL.to_string(),
+            action: "install".to_string(),
+            enabled: true,
+            restart_policy: "on-failure".to_string(),
+        }],
+        firewall: Vec::new(),
+        listeners: vec![ListenerSpec {
+            port: configuration.network.authority_port,
+            protocol: "tcp".to_string(),
+            description: format!(
+                "literal loopback HTTPS at 127.0.0.1:{}; v2 routes only after a future reviewed apply",
+                configuration.network.authority_port
+            ),
+        }],
+        migrations: MigrationSpec {
+            schema_version: crate::db::SCHEMA_VERSION,
+            backup_required: true,
+        },
+        not_implemented: vec![
+            "Apply/install is not implemented for macOS".to_string(),
+            "Creating the dedicated _helicoid service account and group is not implemented".to_string(),
+            "Writing the reviewed service configuration is not implemented".to_string(),
+            "Writing the launchd plist, loading the service, and enabling startup are not implemented".to_string(),
+            "Installing operator-provided TLS certificate and private-key material is not implemented".to_string(),
+            "Status, readiness, enrollment, cancellation, online update, backup, restore, and removal are not implemented".to_string(),
+        ],
+    }
 }
 
 fn check_docker_compose_runtime(adapter: &dyn CommandAdapter) -> v2::DockerComposeRuntimeCheck {
@@ -1178,6 +1603,8 @@ pub fn plan_v2(
         configuration: input.configuration.clone(),
         plan: configured_plan,
         reviewed_plan_digest: digest,
+        package_evidence: None,
+        identity_evidence: None,
         capabilities: lifecycle_capabilities_v2(),
         warnings,
         error: generated.error,
@@ -7334,6 +7761,81 @@ fn hex_decode_32(hex_str: &str) -> AppResult<[u8; 32]> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(arr)
+}
+
+#[cfg(all(test, unix))]
+mod macos_plan_digest_tests {
+    use super::{compute_macos_reviewed_plan_digest, generate_canonical_macos_plan};
+    use crate::installer::lifecycle_v2 as v2;
+
+    fn configuration() -> v2::DeploymentConfiguration {
+        v2::DeploymentConfiguration {
+            deployment_kind: v2::DeploymentKind::MacosLaunchd,
+            network: v2::NetworkConfiguration {
+                scope: v2::NetworkScope::LoopbackDevelopment,
+                authority_port: 8920,
+                bind_address: None,
+                client_hostname: None,
+            },
+            storage: v2::StorageConfiguration {
+                data_directory: crate::installer::macos_launchd::DATA_PATH.to_string(),
+                backup_directory: "/Library/Application Support/Helicoid-Backups".to_string(),
+                preserve_data_on_remove: true,
+            },
+        }
+    }
+
+    fn package() -> v2::PackageEvidence {
+        v2::PackageEvidence {
+            manifest_sha256: "a".repeat(64),
+            verifying_key_sha256: "b".repeat(64),
+            target: "macos-arm64".to_string(),
+            artifact_path: "artifacts/hs-server".to_string(),
+            artifact_sha256: "c".repeat(64),
+            artifact_size_bytes: 14,
+        }
+    }
+
+    fn identity(decision: &str) -> v2::IdentityEvidence {
+        v2::IdentityEvidence {
+            service_account: "_helicoid".to_string(),
+            service_group: "_helicoid".to_string(),
+            decision: decision.to_string(),
+        }
+    }
+
+    #[test]
+    fn macos_review_digest_binds_identity_and_stable_preflight() {
+        let configuration = configuration();
+        let plan = generate_canonical_macos_plan("hs-server", "0.1.0", &configuration);
+        let stable = serde_json::json!({"paths": {"ok": true}, "storage_ok": true});
+        let changed_stable = serde_json::json!({"paths": {"ok": false}, "storage_ok": true});
+        let package = package();
+        let absent = identity("account_absent_group_absent");
+
+        let base =
+            compute_macos_reviewed_plan_digest(&configuration, &stable, &plan, &package, &absent)
+                .expect("base digest");
+        let changed_identity = compute_macos_reviewed_plan_digest(
+            &configuration,
+            &stable,
+            &plan,
+            &package,
+            &identity("existing_account_verified"),
+        )
+        .expect("identity digest");
+        let changed_preflight = compute_macos_reviewed_plan_digest(
+            &configuration,
+            &changed_stable,
+            &plan,
+            &package,
+            &absent,
+        )
+        .expect("preflight digest");
+
+        assert_ne!(base, changed_identity);
+        assert_ne!(base, changed_preflight);
+    }
 }
 
 #[cfg(test)]

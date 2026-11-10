@@ -1,20 +1,33 @@
 //! Package manifest verification: Ed25519 signature, SHA-256 integrity,
 //! portable path safety, platform/schema/version compatibility.
 //!
-//! Trust anchor (verifying key) is supplied independently by app/packaging,
-//! never read from the same unsigned package. No signing keys in repo.
-//! The target is supplied by a trusted server/native caller (which may derive
-//! it from authenticated target-host/preflight platform facts). This verifier
-//! never infers the target from the untrusted package or from its own local OS.
+//! This is library-only verification against a caller-supplied public key. It
+//! establishes integrity relative to that key and a trusted target; it is not
+//! authenticated key distribution, a working installer, or launchd authority.
+//! The key must be supplied independently by app/packaging, never read from the
+//! same unsigned package. No signing keys are in the repo. The target is
+//! supplied by a trusted server/native caller (which may derive it from
+//! authenticated target-host/preflight platform facts). This verifier never
+//! infers the target from the untrusted package or from its own local OS.
+//!
+//! Verification opens the package directory once as a held handle and resolves
+//! manifest, signature, artifact, and traversal operations relative to that
+//! handle. The returned [`VerifiedManifest`] retains the handle for later
+//! digest-checked artifact reads.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use super::adapter::CommandAdapter;
 use super::models::{InstallerTarget, PackageManifest};
+#[cfg(unix)]
+use super::package_fs::UnixPinnedPackage;
+use super::package_fs::{PackageFsError, PinnedEntryKind, PinnedPackage, PinnedReadPolicy};
 use crate::error::{AppError, AppResult};
 use crate::installer::models::ArtifactEntry;
 
@@ -36,6 +49,7 @@ pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARTIFACT_PATH_BYTES: usize = 256;
 const MAX_ARTIFACT_SEGMENT_BYTES: usize = 64;
 const MAX_ARTIFACT_SEGMENTS: usize = 16;
+const MAX_TRAVERSAL_ENTRIES: usize = 8192;
 
 /// Windows reserved DOS device basenames (with or without an extension).
 const WINDOWS_RESERVED_BASENAMES: &[&str] = &[
@@ -59,32 +73,175 @@ pub fn verify_manifest(
     )
 }
 
-/// Verify the full package manifest for a trusted target:
-/// 1. Parse manifest.json
-/// 2. Strict Ed25519 signature (manifest.sig); refuse weak keys/signatures
-/// 3. Require a nonempty artifact list within the existing bound
-/// 4. Check product equals the canonical server product identity
-/// 5. Check release version is strict major.minor.patch
-/// 6. Check platform equals the trusted target's frozen string
-/// 7. Check min_schema_version <= SCHEMA_VERSION
-/// 8. Check min_installer_version <= INSTALLER_VERSION
-/// 9. Validate portable artifact paths and reject duplicates/collisions
-/// 10. Verify each artifact: safe path, sha256, size, no symlinks
-/// 11. Ensure no unknown files in artifacts/ directory
-pub fn verify_manifest_for_target(
+/// Exact bytes whose signature was verified, together with an unkeyed digest,
+/// the caller-supplied trust-key fingerprint, and the held package handle.
+///
+/// Fields are private so only the verifier can construct this evidence type.
+/// The digest covers the exact manifest bytes, including signed fields the
+/// parser does not interpret. The package handle remains pinned after this
+/// value is returned. Use [`Self::read_artifact`] for digest-checked bytes, or
+/// [`Self::package`] for raw handle operations; never reopen the original path.
+/// This is library-level integrity evidence, not authenticated trust or
+/// installation authority.
+#[derive(Clone)]
+pub struct VerifiedManifest {
+    manifest: PackageManifest,
+    target: InstallerTarget,
+    manifest_sha256: String,
+    verifying_key_sha256: String,
+    package: Arc<dyn PinnedPackage>,
+}
+
+impl fmt::Debug for VerifiedManifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerifiedManifest")
+            .field("manifest", &self.manifest)
+            .field("target", &self.target)
+            .field("manifest_sha256", &self.manifest_sha256)
+            .field("verifying_key_sha256", &self.verifying_key_sha256)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedManifest {
+    /// Parsed manifest whose signature and artifacts were verified.
+    pub fn manifest(&self) -> &PackageManifest {
+        &self.manifest
+    }
+
+    /// Target supplied by the trusted caller and matched by the manifest.
+    pub fn target(&self) -> InstallerTarget {
+        self.target
+    }
+
+    /// Unkeyed SHA-256 snapshot of the exact manifest bytes that were
+    /// signature-verified. Not authentication.
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
+    /// SHA-256 of the operator-supplied Ed25519 verifying key.
+    pub fn verifying_key_sha256(&self) -> &str {
+        &self.verifying_key_sha256
+    }
+
+    /// Held package handle. Reads through this handle cannot be redirected by
+    /// replacing the original directory path.
+    pub fn package(&self) -> &dyn PinnedPackage {
+        self.package.as_ref()
+    }
+
+    /// Re-read one manifest-declared artifact through the held package handle,
+    /// rejecting a changed size or digest. This is the safe accessor for a
+    /// caller that needs artifact bytes after verification.
+    pub fn read_artifact(&self, path: &str) -> AppResult<Vec<u8>> {
+        let artifact = self
+            .manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == path)
+            .ok_or_else(|| {
+                AppError::forbidden(format!("artifact '{path}' is not in the verified manifest"))
+            })?;
+        let file = self
+            .package
+            .read_file(path, PinnedReadPolicy::Exact(artifact.size_bytes))
+            .map_err(|error| map_artifact_read_error(path, error))?;
+        if file.size != artifact.size_bytes
+            || file.bytes.len() as u64 != artifact.size_bytes
+            || sha256_hex(&file.bytes) != artifact.sha256
+        {
+            return Err(AppError::forbidden(format!(
+                "artifact '{path}' changed after verification"
+            )));
+        }
+        Ok(file.bytes)
+    }
+}
+
+/// Verify the full package manifest for a trusted target and return the exact
+/// verified-byte digest:
+/// 1. Open the package directory as a held handle; reject symlink or
+///    uninspectable path components
+/// 2. Read bounded manifest/signature bytes relative to that handle
+/// 3. Strict Ed25519 signature (manifest.sig); refuse weak keys/signatures
+/// 4. Require a nonempty artifact list within the existing bound
+/// 5. Check product equals the canonical server product identity
+/// 6. Check release version is strict major.minor.patch
+/// 7. Check platform equals the trusted target's frozen string
+/// 8. Check min_schema_version <= SCHEMA_VERSION
+/// 9. Check min_installer_version <= INSTALLER_VERSION
+/// 10. Validate portable artifact paths and reject duplicates/collisions
+/// 11. Verify each artifact through the handle: regular file, exact size,
+///     sha256, no symlink traversal
+/// 12. Ensure no unknown files in artifacts/ with bounded traversal
+/// 13. Re-check the held root identity before returning
+pub fn verify_manifest_for_target_verified(
     adapter: &dyn CommandAdapter,
     package_dir: &Path,
     verifying_key_bytes: &[u8; 32],
     target: InstallerTarget,
-) -> AppResult<PackageManifest> {
-    let manifest_path = package_dir.join("manifest.json");
-    let sig_path = package_dir.join("manifest.sig");
+) -> AppResult<VerifiedManifest> {
+    let package_dir = normalize_package_dir(package_dir)?;
+    let package = adapter
+        .open_pinned_package(&package_dir)
+        .map_err(map_package_open_error)?;
+    verify_manifest_from_package(package, verifying_key_bytes, target)
+}
 
-    // Read manifest bytes.
-    let manifest_bytes = adapter
-        .read_file(&manifest_path)
-        .map_err(|e| AppError::bad_request(format!("cannot read manifest.json: {e}")))?;
+/// Verify a package through an already-held package handle. The caller owns
+/// custody of the handle; no path is reopened by this function. The handle is
+/// not a trust anchor: it only selects the bytes verified against the
+/// caller-supplied key and target.
+pub fn verify_manifest_for_target_pinned(
+    package: Arc<dyn PinnedPackage>,
+    verifying_key_bytes: &[u8; 32],
+    target: InstallerTarget,
+) -> AppResult<VerifiedManifest> {
+    verify_manifest_from_package(package, verifying_key_bytes, target)
+}
 
+/// Verify a real on-disk package through a freshly pinned Unix directory
+/// handle. Library-only: this does not install, launch, or authorize a service.
+#[cfg(unix)]
+pub fn verify_manifest_for_target_real(
+    package_dir: &Path,
+    verifying_key_bytes: &[u8; 32],
+    target: InstallerTarget,
+) -> AppResult<VerifiedManifest> {
+    let package_dir = normalize_package_dir(package_dir)?;
+    let package = UnixPinnedPackage::open(&package_dir).map_err(map_package_open_error)?;
+    verify_manifest_from_package(Arc::new(package), verifying_key_bytes, target)
+}
+
+fn verify_manifest_from_package(
+    package: Arc<dyn PinnedPackage>,
+    verifying_key_bytes: &[u8; 32],
+    target: InstallerTarget,
+) -> AppResult<VerifiedManifest> {
+    // Bounded reads are resolved from the held package handle, never from the
+    // caller's original path. The digest returned below is computed from
+    // exactly these bytes.
+    let manifest_bytes =
+        match package.read_file("manifest.json", PinnedReadPolicy::Max(MAX_MANIFEST_BYTES)) {
+            Ok(file) => file.bytes,
+            Err(PackageFsError::Symlink(message)) => {
+                return Err(AppError::forbidden(format!(
+                    "manifest.json must not be a symlink: {message}"
+                )));
+            }
+            Err(PackageFsError::TooLarge { .. }) => {
+                return Err(AppError::unprocessable(format!(
+                    "manifest.json exceeds {} bytes",
+                    MAX_MANIFEST_BYTES
+                )));
+            }
+            Err(error) => {
+                return Err(AppError::bad_request(format!(
+                    "cannot read manifest.json: {error}"
+                )));
+            }
+        };
     if manifest_bytes.len() > MAX_MANIFEST_BYTES {
         return Err(AppError::unprocessable(format!(
             "manifest.json exceeds {} bytes",
@@ -92,10 +249,19 @@ pub fn verify_manifest_for_target(
         )));
     }
 
-    // Read signature bytes.
-    let sig_bytes = adapter
-        .read_file(&sig_path)
-        .map_err(|e| AppError::bad_request(format!("cannot read manifest.sig: {e}")))?;
+    let sig_bytes = match package.read_file("manifest.sig", PinnedReadPolicy::Max(64)) {
+        Ok(file) => file.bytes,
+        Err(PackageFsError::Symlink(message)) => {
+            return Err(AppError::forbidden(format!(
+                "manifest.sig must not be a symlink: {message}"
+            )));
+        }
+        Err(error) => {
+            return Err(AppError::bad_request(format!(
+                "cannot read manifest.sig: {error}"
+            )));
+        }
+    };
 
     // Parse signature.
     if sig_bytes.len() != 64 {
@@ -204,13 +370,73 @@ pub fn verify_manifest_for_target(
     // Portable path namespace and collision guards run before any artifact is opened.
     validate_declared_paths(&manifest.artifacts)?;
 
-    // Verify each artifact.
-    verify_artifacts(adapter, package_dir, &manifest.artifacts)?;
+    // Verify each artifact through the held handle.
+    verify_artifacts(package.as_ref(), &manifest.artifacts)?;
 
-    // Ensure no unknown files in artifacts/ directory.
-    verify_no_unknown_files(adapter, package_dir, &manifest.artifacts)?;
+    // Ensure no unknown files in artifacts/ directory, with bounded traversal.
+    verify_no_unknown_files(package.as_ref(), &manifest.artifacts)?;
 
-    Ok(manifest)
+    package.verify_root().map_err(|error| {
+        AppError::bad_request(format!(
+            "package directory changed during verification: {error}"
+        ))
+    })?;
+
+    Ok(VerifiedManifest {
+        manifest,
+        target,
+        manifest_sha256: sha256_hex(&manifest_bytes),
+        verifying_key_sha256: sha256_hex(verifying_key_bytes),
+        package,
+    })
+}
+
+fn normalize_package_dir(package_dir: &Path) -> AppResult<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in package_dir.components() {
+        match component {
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir => {
+                return Err(AppError::bad_request(
+                    "package directory must not contain parent traversal",
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(AppError::bad_request(
+                    "package directory must not contain a platform prefix",
+                ));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(AppError::bad_request("package directory must not be empty"));
+    }
+    Ok(normalized)
+}
+
+fn map_package_open_error(error: PackageFsError) -> AppError {
+    if matches!(&error, PackageFsError::Symlink(_)) {
+        AppError::forbidden(format!("package directory must not be a symlink: {error}"))
+    } else {
+        AppError::bad_request(format!("cannot open package directory: {error}"))
+    }
+}
+
+/// Return only the parsed manifest for legacy callers that do not need the
+/// held handle or identity evidence. Verification is identical to
+/// [`verify_manifest_for_target_verified`] during the call, but this wrapper
+/// drops the pinned handle; privileged callers must use the verified API.
+pub fn verify_manifest_for_target(
+    adapter: &dyn CommandAdapter,
+    package_dir: &Path,
+    verifying_key_bytes: &[u8; 32],
+    target: InstallerTarget,
+) -> AppResult<PackageManifest> {
+    let verified =
+        verify_manifest_for_target_verified(adapter, package_dir, verifying_key_bytes, target)?;
+    Ok(verified.manifest)
 }
 
 /// Exact match to the caller-supplied target's frozen platform string.
@@ -358,43 +584,22 @@ fn validate_portable_segment(segment: &str, full_path: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Verify all artifacts: safe path, no symlinks, sha256, size.
-fn verify_artifacts(
-    adapter: &dyn CommandAdapter,
-    package_dir: &Path,
-    artifacts: &[ArtifactEntry],
-) -> AppResult<()> {
+/// Verify all artifacts through a pinned package handle: bounded regular-file
+/// reads, exact size, sha256, and no symlink traversal.
+fn verify_artifacts(package: &dyn PinnedPackage, artifacts: &[ArtifactEntry]) -> AppResult<()> {
     for artifact in artifacts {
-        // Reject symlinked parents inside the package (escape via a/b -> /etc).
-        reject_symlink_parents(adapter, package_dir, &artifact.path)?;
+        let file = package
+            .read_file(&artifact.path, PinnedReadPolicy::Exact(artifact.size_bytes))
+            .map_err(|error| map_artifact_read_error(&artifact.path, error))?;
 
-        // Check for symlinks.
-        let full_path = package_dir.join(&artifact.path);
-        let meta = adapter.symlink_metadata(&full_path).map_err(|e| {
-            AppError::bad_request(format!("cannot stat artifact '{}': {e}", artifact.path))
-        })?;
-
-        if meta.is_symlink {
-            return Err(AppError::forbidden(format!(
-                "artifact is a symlink (not allowed): {}",
+        if file.size != artifact.size_bytes || file.bytes.len() as u64 != artifact.size_bytes {
+            return Err(AppError::unprocessable(format!(
+                "artifact '{}' size changed during verification",
                 artifact.path
             )));
         }
 
-        // Verify size.
-        if meta.len != artifact.size_bytes {
-            return Err(AppError::unprocessable(format!(
-                "artifact '{}' size mismatch: expected {} got {}",
-                artifact.path, artifact.size_bytes, meta.len
-            )));
-        }
-
-        // Verify SHA-256.
-        let file_bytes = adapter.read_file(&full_path).map_err(|e| {
-            AppError::bad_request(format!("cannot read artifact '{}': {e}", artifact.path))
-        })?;
-
-        let actual_hash = sha256_hex(&file_bytes);
+        let actual_hash = sha256_hex(&file.bytes);
         if actual_hash != artifact.sha256 {
             return Err(AppError::forbidden(format!(
                 "artifact '{}' SHA-256 mismatch",
@@ -405,51 +610,91 @@ fn verify_artifacts(
     Ok(())
 }
 
+fn map_artifact_read_error(path: &str, error: PackageFsError) -> AppError {
+    match error {
+        PackageFsError::Symlink(_)
+        | PackageFsError::NotRegular(_)
+        | PackageFsError::NotDirectory(_)
+        | PackageFsError::InvalidPath(_) => {
+            AppError::forbidden(format!("artifact '{path}' is unsafe: {error}"))
+        }
+        PackageFsError::TooLarge { .. }
+        | PackageFsError::SizeMismatch { .. }
+        | PackageFsError::Changed(_) => {
+            AppError::unprocessable(format!("artifact '{path}' size mismatch: {error}"))
+        }
+        PackageFsError::Missing(_)
+        | PackageFsError::Uninspectable(_)
+        | PackageFsError::Unsupported(_)
+        | PackageFsError::Other(_) => {
+            AppError::bad_request(format!("cannot read artifact '{path}': {error}"))
+        }
+    }
+}
+
 /// Ensure no files exist in artifacts/ that are not listed in the manifest.
-/// Nested declared paths are allowed; unknown leaves under known prefixes refuse.
+/// Traversal is descriptor-relative, depth-bounded, and entry-bounded.
 fn verify_no_unknown_files(
-    adapter: &dyn CommandAdapter,
-    package_dir: &Path,
+    package: &dyn PinnedPackage,
     artifacts: &[ArtifactEntry],
 ) -> AppResult<()> {
-    let artifacts_dir = package_dir.join("artifacts");
-    if !adapter.path_exists(&artifacts_dir) {
-        return Ok(());
-    }
     let known: HashSet<&str> = artifacts.iter().map(|a| a.path.as_str()).collect();
-    check_dir_for_unknown(adapter, package_dir, "artifacts", &known)
+    let mut budget = MAX_TRAVERSAL_ENTRIES;
+    match package.list_dir("artifacts") {
+        Ok(entries) => {
+            check_entries_for_unknown(package, "artifacts", &entries, &known, 0, &mut budget)
+        }
+        Err(PackageFsError::Missing(_)) => Ok(()),
+        Err(error) => Err(map_package_list_error("artifacts", error)),
+    }
 }
 
 fn check_dir_for_unknown(
-    adapter: &dyn CommandAdapter,
-    package_dir: &Path,
+    package: &dyn PinnedPackage,
     relative_dir: &str,
     known: &HashSet<&str>,
+    depth: usize,
+    budget: &mut usize,
 ) -> AppResult<()> {
-    let dir_path = package_dir.join(relative_dir);
-    let entries = adapter
-        .list_dir(&dir_path)
-        .map_err(|e| AppError::bad_request(format!("cannot list artifacts directory: {e}")))?;
+    if depth > MAX_ARTIFACT_SEGMENTS {
+        return Err(AppError::forbidden(
+            "artifacts directory traversal exceeds the depth bound",
+        ));
+    }
+    let entries = package
+        .list_dir(relative_dir)
+        .map_err(|error| map_package_list_error(relative_dir, error))?;
+    check_entries_for_unknown(package, relative_dir, &entries, known, depth, budget)
+}
+
+fn check_entries_for_unknown(
+    package: &dyn PinnedPackage,
+    relative_dir: &str,
+    entries: &[super::package_fs::PinnedEntry],
+    known: &HashSet<&str>,
+    depth: usize,
+    budget: &mut usize,
+) -> AppResult<()> {
+    if entries.len() > *budget {
+        return Err(AppError::forbidden(
+            "artifacts directory traversal exceeds the entry bound",
+        ));
+    }
+    *budget -= entries.len();
 
     for entry in entries {
-        let entry_rel = format!("{relative_dir}/{entry}");
+        let entry_rel = format!("{relative_dir}/{}", entry.name);
         if known.contains(entry_rel.as_str()) {
             continue;
         }
         let prefix = format!("{entry_rel}/");
         if known.iter().any(|k| k.starts_with(prefix.as_str())) {
-            // Descend only through non-symlink directories; a symlinked
-            // parent would walk outside the package tree.
-            let entry_path = dir_path.join(&entry);
-            let meta = adapter.symlink_metadata(&entry_path).map_err(|e| {
-                AppError::bad_request(format!("cannot stat package path '{entry_rel}': {e}"))
-            })?;
-            if meta.is_symlink {
+            if entry.kind != PinnedEntryKind::Directory {
                 return Err(AppError::forbidden(format!(
-                    "package path component is a symlink: {entry_rel}"
+                    "package path component is not a directory: {entry_rel}"
                 )));
             }
-            check_dir_for_unknown(adapter, package_dir, &entry_rel, known)?;
+            check_dir_for_unknown(package, &entry_rel, known, depth + 1, budget)?;
             continue;
         }
         return Err(AppError::forbidden(format!(
@@ -459,39 +704,24 @@ fn check_dir_for_unknown(
     Ok(())
 }
 
-/// Reject a package-relative path whose parent chain inside the package
-/// contains a symlink. A symlinked parent would let a verified artifact be
-/// read from (or later written to) a location outside the package tree.
-fn reject_symlink_parents(
-    adapter: &dyn CommandAdapter,
-    package_dir: &Path,
-    relative: &str,
-) -> AppResult<()> {
-    let mut current = package_dir.to_path_buf();
-    let mut components: Vec<&str> = relative
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect();
-    // Drop the final file name; only parents are under review.
-    components.pop();
-    for component in components {
-        current.push(component);
-        if !adapter.path_exists(&current) {
-            continue;
+fn map_package_list_error(relative: &str, error: PackageFsError) -> AppError {
+    match error {
+        PackageFsError::Symlink(_)
+        | PackageFsError::NotRegular(_)
+        | PackageFsError::NotDirectory(_)
+        | PackageFsError::InvalidPath(_)
+        | PackageFsError::TooLarge { .. } => {
+            AppError::forbidden(format!("unsafe artifacts path '{relative}': {error}"))
         }
-        let meta = adapter.symlink_metadata(&current).map_err(|e| {
-            AppError::bad_request(format!(
-                "cannot stat package path '{}': {e}",
-                current.display()
-            ))
-        })?;
-        if meta.is_symlink {
-            return Err(AppError::forbidden(format!(
-                "package path component is a symlink: {relative}"
-            )));
+        PackageFsError::Missing(_)
+        | PackageFsError::Uninspectable(_)
+        | PackageFsError::SizeMismatch { .. }
+        | PackageFsError::Changed(_)
+        | PackageFsError::Unsupported(_)
+        | PackageFsError::Other(_) => {
+            AppError::bad_request(format!("cannot list artifacts path '{relative}': {error}"))
         }
     }
-    Ok(())
 }
 
 /// SHA-256 hex digest.

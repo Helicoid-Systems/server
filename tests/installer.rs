@@ -1407,9 +1407,14 @@ fn remove_v2_records_completion_and_preserves_data() {
         configuration: v2_deployment_configuration(true),
         confirm: true,
     };
-    assert!(machine::lifecycle_capabilities_v2()
-        .supported_actions
-        .contains(&lifecycle_v2::LifecycleAction::Remove));
+    // The test drives the Linux v2 contract through TestAdapter on every host;
+    // the library capability document is Linux-only for plan/apply/remove.
+    assert_eq!(
+        machine::lifecycle_capabilities_v2()
+            .supported_actions
+            .contains(&lifecycle_v2::LifecycleAction::Remove),
+        cfg!(target_os = "linux")
+    );
     let status = machine::remove_v2(&adapter, &input, &state_dir).unwrap();
     assert_eq!(status.state, lifecycle_v2::OperationState::Completed);
     assert_eq!(status.action, Some(lifecycle_v2::LifecycleAction::Remove));
@@ -1431,6 +1436,7 @@ fn remove_v2_records_completion_and_preserves_data() {
     assert_eq!(inspected.result.code, "removed");
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn lifecycle_capabilities_explain_each_unavailable_recovery_operation() {
     use hs_server::installer::lifecycle_v2::LifecycleAction;
@@ -1736,6 +1742,7 @@ fn v2_installs_with_reviewed_custom_storage_and_service_ownership() {
     )
     .unwrap();
     assert!(planned.ok, "{:?}", planned.error);
+    #[cfg(not(target_os = "macos"))]
     assert!(planned.capabilities.custom_storage_directories);
     let plan = planned.plan.unwrap();
     assert!(!plan

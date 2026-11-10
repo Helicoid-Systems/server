@@ -845,8 +845,11 @@ fn verify_private_file_fd(fd: i32, expected: &libc::stat, require_new_mode: bool
 }
 
 /// Outcome of an extended-ACL query on a held descriptor.
+///
+/// Crate-visible so read-only macOS host preflight can reuse the same native
+/// ACL inspection rather than parsing `ls` output or trusting mode bits.
 #[cfg(unix)]
-enum AclStatus {
+pub(crate) enum AclStatus {
     /// Explicit absence (Darwin: NULL + ENOENT). Mode bits alone apply.
     Absent,
     /// ACL has only DENY entries (restricts further; does not widen access).
@@ -862,7 +865,7 @@ enum AclStatus {
 /// ACL is returned, `acl_get_entry(acl, ACL_FIRST_ENTRY, &e)` returns **0**
 /// when an entry exists and **-1** when there are none (EINVAL at end).
 #[cfg(target_os = "macos")]
-fn query_extended_acl(fd: i32) -> AppResult<AclStatus> {
+pub(crate) fn query_extended_acl(fd: i32) -> AppResult<AclStatus> {
     const ACL_TYPE_EXTENDED: i32 = 0x0000_0100;
     const ACL_FIRST_ENTRY: i32 = 0;
     const ACL_NEXT_ENTRY: i32 = -1;
