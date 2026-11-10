@@ -446,13 +446,13 @@ pub fn apply_v2_with_adapter(
         },
     });
     write_record(adapter, &record_path, &record)?;
-    Ok(status_from_state(
+    status_from_state(
         adapter,
         state_dir,
         &input.configuration,
         Some(record),
         Some(journal),
-    )?)
+    )
 }
 
 #[cfg(not(unix))]
@@ -595,13 +595,7 @@ pub fn cancel_v2_with_adapter(
         adapter
             .remove_file(&journal_path)
             .map_err(|error| AppError::internal(format!("remove installer journal: {error}")))?;
-        Ok(status_from_state(
-            adapter,
-            state_dir,
-            &input.configuration,
-            Some(record),
-            None,
-        )?)
+        status_from_state(adapter, state_dir, &input.configuration, Some(record), None)
     } else {
         record.outcome = Some(v2::OperationOutcome {
             state: v2::OperationState::AttentionRequired,
@@ -613,13 +607,13 @@ pub fn cancel_v2_with_adapter(
             },
         });
         write_record(adapter, &record_path, &record)?;
-        Ok(status_from_state(
+        status_from_state(
             adapter,
             state_dir,
             &input.configuration,
             Some(record),
             Some(journal),
-        )?)
+        )
     }
 }
 
@@ -1273,7 +1267,7 @@ fn install_launchd(
 ) -> AppResult<()> {
     let plist = Path::new(super::macos_launchd::LAUNCHD_PLIST_PATH);
     let label = super::macos_launchd::LAUNCHD_LABEL;
-    if !resource_completed(journal, "launchd_plist", &label) {
+    if !resource_completed(journal, "launchd_plist", label) {
         let contents = launchd_plist();
         ensure_absent(adapter, plist, "launchd plist")?;
         record_intent(adapter, journal, journal_path, "launchd_plist", label)?;
@@ -1410,13 +1404,13 @@ fn finish_failed_apply(
         adapter
             .remove_file(journal_path)
             .map_err(|error| AppError::internal(format!("remove rolled-back journal: {error}")))?;
-        Ok(status_from_state(
+        status_from_state(
             adapter,
             state_dir,
             &record.configuration,
             Some((*record).clone()),
             None,
-        )?)
+        )
     } else {
         record.outcome = Some(v2::OperationOutcome {
             state: v2::OperationState::AttentionRequired,
@@ -1428,13 +1422,13 @@ fn finish_failed_apply(
             },
         });
         write_record(adapter, record_path, record)?;
-        Ok(status_from_state(
+        status_from_state(
             adapter,
             state_dir,
             &record.configuration,
             Some((*record).clone()),
             Some((*journal).clone()),
-        )?)
+        )
     }
 }
 
@@ -1693,9 +1687,7 @@ fn status_from_state(
             OperationState::InProgress => OperationState::InProgress,
             OperationState::NotInstalled => OperationState::NotInstalled,
         }
-    } else if completed {
-        OperationState::AttentionRequired
-    } else if failed {
+    } else if completed || failed {
         OperationState::AttentionRequired
     } else if record.is_some() {
         OperationState::InProgress
