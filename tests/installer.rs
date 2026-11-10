@@ -1415,6 +1415,10 @@ fn remove_v2_records_completion_and_preserves_data() {
             .contains(&lifecycle_v2::LifecycleAction::Remove),
         cfg!(target_os = "linux")
     );
+    assert_eq!(
+        machine::lifecycle_capabilities_v2().durable_operation_journal,
+        cfg!(target_os = "linux")
+    );
     let status = machine::remove_v2(&adapter, &input, &state_dir).unwrap();
     assert_eq!(status.state, lifecycle_v2::OperationState::Completed);
     assert_eq!(status.action, Some(lifecycle_v2::LifecycleAction::Remove));

@@ -59,20 +59,34 @@ pub struct VerifiedTufRelease {
     pub manifest: PackageManifest,
 }
 
+/// Inputs identifying the signed release repository to verify and stage.
+pub struct TufReleaseRequest<'a> {
+    pub trusted_root: &'a [u8],
+    pub metadata_base_url: Url,
+    pub targets_base_url: Url,
+    pub manifest_target: &'a str,
+    pub package_verifying_key: &'a [u8; 32],
+    pub target: InstallerTarget,
+    pub state_dir: &'a Path,
+}
+
 /// Verify repository metadata with an out-of-band trusted root, persist TUF's
 /// rollback datastore, download the signed package targets, and verify the
 /// existing package signature and artifact list before returning its staging
 /// directory. The caller chooses `target` from trusted host/preflight facts.
 pub async fn verify_and_stage_release(
     adapter: &dyn CommandAdapter,
-    trusted_root: &[u8],
-    metadata_base_url: Url,
-    targets_base_url: Url,
-    manifest_target: &str,
-    package_verifying_key: &[u8; 32],
-    target: InstallerTarget,
-    state_dir: &Path,
+    request: TufReleaseRequest<'_>,
 ) -> AppResult<VerifiedTufRelease> {
+    let TufReleaseRequest {
+        trusted_root,
+        metadata_base_url,
+        targets_base_url,
+        manifest_target,
+        package_verifying_key,
+        target,
+        state_dir,
+    } = request;
     if trusted_root.is_empty() || trusted_root.len() > MAX_ROOT_METADATA_BYTES {
         return Err(AppError::unprocessable(format!(
             "trusted TUF root metadata must be between 1 and {MAX_ROOT_METADATA_BYTES} bytes"

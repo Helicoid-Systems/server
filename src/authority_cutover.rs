@@ -529,7 +529,7 @@ mod tests {
         let service = Service::new(crate::db::open_in_memory().expect("open store"));
         let initiator = seeded_security_admin(&service, "initiator");
         let predecessor = service
-            .with_conn(|conn| crate::db::deployment_key(conn))
+            .with_conn(crate::db::deployment_key)
             .expect("read predecessor");
         let phrase = format!("drain authority {predecessor}");
         let draining = service

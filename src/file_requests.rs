@@ -579,7 +579,7 @@ impl Service {
                 ));
             }
             for computer_id in &computers {
-                require_operate_scope(conn, &auth.account_id, &computer_id)?;
+                require_operate_scope(conn, &auth.account_id, computer_id)?;
                 let enrolled: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM computers WHERE id = ?1
                      AND enrollment_state = 'enrolled'

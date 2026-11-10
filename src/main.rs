@@ -1213,14 +1213,22 @@ fn serve_blocking(addr: SocketAddr, service: Arc<Service>) -> AppResult<()> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn run_tuf_release_verification(
     adapter: &dyn hs_server::installer::CommandAdapter,
-    trusted_root: &std::path::Path,
-    metadata_url: &str,
-    targets_url: &str,
-    manifest_target: &str,
-    platform: &str,
-    verify_key: &str,
-    state_dir: &std::path::Path,
+    action: &InstallerAction,
 ) -> AppResult<()> {
+    let InstallerAction::VerifyTufRelease {
+        trusted_root,
+        metadata_url,
+        targets_url,
+        manifest_target,
+        platform,
+        verify_key,
+        state_dir,
+    } = action
+    else {
+        return Err(hs_server::AppError::internal(
+            "TUF release verification requires a VerifyTufRelease action",
+        ));
+    };
     let platform = match hs_server::installer::models::InstallerTarget::from_platform_str(platform)
     {
         Some(platform) => platform,
@@ -1257,13 +1265,15 @@ fn run_tuf_release_verification(
         .map_err(|error| hs_server::AppError::internal(format!("create TUF runtime: {error}")))?;
     let release = runtime.block_on(hs_server::installer::tuf_update::verify_and_stage_release(
         adapter,
-        &root_bytes,
-        metadata_url,
-        targets_url,
-        manifest_target,
-        &verifying_key,
-        platform,
-        state_dir,
+        hs_server::installer::tuf_update::TufReleaseRequest {
+            trusted_root: &root_bytes,
+            metadata_base_url: metadata_url,
+            targets_base_url: targets_url,
+            manifest_target,
+            package_verifying_key: &verifying_key,
+            target: platform,
+            state_dir,
+        },
     ))?;
     println!(
         "{}",
@@ -1299,26 +1309,8 @@ fn run_installer(action: InstallerAction) -> AppResult<()> {
         return Ok(());
     }
 
-    if let InstallerAction::VerifyTufRelease {
-        trusted_root,
-        metadata_url,
-        targets_url,
-        manifest_target,
-        platform,
-        verify_key,
-        state_dir,
-    } = &action
-    {
-        return run_tuf_release_verification(
-            &adapter,
-            trusted_root,
-            metadata_url,
-            targets_url,
-            manifest_target,
-            platform,
-            verify_key,
-            state_dir,
-        );
+    if matches!(&action, InstallerAction::VerifyTufRelease { .. }) {
+        return run_tuf_release_verification(&adapter, &action);
     }
 
     // Bounded versioned JSON: refuse unbounded stdin before parsing.

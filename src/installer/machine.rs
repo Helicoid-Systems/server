@@ -562,17 +562,24 @@ fn lifecycle_capabilities_v2_non_macos() -> v2::LifecycleCapabilities {
         } else {
             vec![NetworkScope::LoopbackDevelopment]
         },
-        supported_actions: vec![
-            LifecycleAction::Preflight,
-            LifecycleAction::Plan,
-            LifecycleAction::Install,
-            LifecycleAction::Resume,
-            LifecycleAction::Cancel,
-            LifecycleAction::Inspect,
-            LifecycleAction::Remove,
-        ],
+        supported_actions: if on_linux {
+            vec![
+                LifecycleAction::Preflight,
+                LifecycleAction::Plan,
+                LifecycleAction::Install,
+                LifecycleAction::Resume,
+                LifecycleAction::Cancel,
+                LifecycleAction::Inspect,
+                LifecycleAction::Remove,
+            ]
+        } else {
+            // Windows has no native service installer; it may only review a
+            // read-only plan. Do not advertise mutation actions the host
+            // cannot perform.
+            vec![LifecycleAction::Preflight, LifecycleAction::Plan]
+        },
         custom_storage_directories: true,
-        durable_operation_journal: true,
+        durable_operation_journal: on_linux,
         cancellation: on_linux,
         online_update: false,
         backup_and_restore: false,
@@ -4990,20 +4997,26 @@ fn storage_directory_specs(path: &str) -> Vec<DirectorySpec> {
         BACKUP_ROOT
     };
     let mut specs = Vec::new();
-    let mut current = PathBuf::from(root);
     let owner = SERVICE_USER.to_string();
-    let mut add = |directory: &Path| {
+    let mut add = |directory: &str| {
         specs.push(DirectorySpec {
-            path: directory.to_string_lossy().into_owned(),
+            path: directory.to_string(),
             owner: owner.clone(),
             mode: "0700".to_string(),
             create: true,
         });
     };
-    add(&current);
+    add(root);
     if let Ok(relative) = Path::new(path).strip_prefix(root) {
+        // The lifecycle contract is a Linux deployment plan even when the
+        // library renders it on another host (for review or tests). Build the
+        // canonical destination with '/' instead of the host separator: a
+        // Windows PathBuf push would emit '\' inside an otherwise absolute
+        // Linux path and fail product-path validation during apply.
+        let mut current = root.to_string();
         for component in relative.components() {
-            current.push(component);
+            current.push('/');
+            current.push_str(&component.as_os_str().to_string_lossy());
             add(&current);
         }
     }
