@@ -1407,8 +1407,10 @@ mod apply_lifecycle {
         }
     }
 
-    fn apply_input(observer: &FakeLaunchdObserver) -> (v2::ApplyInput, [u8; 32]) {
-        let (_temp, package, public_key) = temp_package("macos-arm64");
+    fn apply_input(
+        observer: &FakeLaunchdObserver,
+    ) -> (v2::ApplyInput, [u8; 32], tempfile::TempDir) {
+        let (temp, package, public_key) = temp_package("macos-arm64");
         let input = plan_input(observer, &package);
         let result = plan_v2_test(observer, &FakeIdentity::absent(), &input, &public_key)
             .expect("plan result");
@@ -1422,7 +1424,7 @@ mod apply_lifecycle {
             package_dir: package.to_string_lossy().into_owned(),
             verify_key: hex::encode(&public_key[..]),
         };
-        (apply, public_key)
+        (apply, public_key, temp)
     }
 
     fn state_dir() -> PathBuf {
@@ -1450,7 +1452,7 @@ mod apply_lifecycle {
             return;
         }
         let observer = FakeLaunchdObserver::with_valid_host("arm64");
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         let state_root = tempfile::tempdir().expect("tempdir");
         let state_dir = state_root
             .path()
@@ -1478,7 +1480,7 @@ mod apply_lifecycle {
         )
         .expect("preflight");
         let host = FakeApplyHost::new(preflight);
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let status = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply");
         assert_eq!(status.state, v2::OperationState::Completed);
@@ -1534,7 +1536,7 @@ mod apply_lifecycle {
         )
         .expect("preflight");
         let host = FakeApplyHost::new(preflight);
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply");
 
         assert!(
@@ -1557,7 +1559,7 @@ mod apply_lifecycle {
         )
         .expect("preflight");
         let host = FakeApplyHost::new(preflight);
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply");
         {
             let mut state = host.state();
@@ -1597,7 +1599,7 @@ mod apply_lifecycle {
             group_membership: Vec::new(),
         });
         drop(state);
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let error = apply_v2_with_adapter(&host, &input, &state_dir()).expect_err("must refuse");
         assert_eq!(error.code(), ErrorCode::Conflict);
@@ -1620,7 +1622,7 @@ mod apply_lifecycle {
         )
         .expect("preflight");
         let host = FakeApplyHost::new(preflight);
-        let (mut input, _key) = apply_input(&observer);
+        let (mut input, _key, _package) = apply_input(&observer);
         input.reviewed_plan_digest = "00".repeat(32);
 
         let error = apply_v2_with_adapter(&host, &input, &state_dir()).expect_err("must refuse");
@@ -1644,7 +1646,7 @@ mod apply_lifecycle {
         .expect("preflight");
         let mut host = FakeApplyHost::new(preflight);
         host.tls_ok = false;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let error = apply_v2_with_adapter(&host, &input, &state_dir()).expect_err("must refuse");
         assert_eq!(error.code(), ErrorCode::Forbidden);
@@ -1696,7 +1698,7 @@ mod apply_lifecycle {
                 },
             );
         }
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         let status = apply_v2_with_adapter(&host, &input, &state_dir).expect("apply");
         assert_eq!(status.state, v2::OperationState::Completed);
     }
@@ -1735,7 +1737,7 @@ mod apply_lifecycle {
         .expect("preflight");
         let mut host = FakeApplyHost::new(preflight);
         host.group_create_foreign_failure = true;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let status = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply result");
         assert_eq!(status.state, v2::OperationState::AttentionRequired);
@@ -1759,7 +1761,7 @@ mod apply_lifecycle {
         .expect("preflight");
         let mut host = FakeApplyHost::new(preflight);
         host.tls_source_changed = true;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let status = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply result");
         assert_eq!(status.state, v2::OperationState::AttentionRequired);
@@ -1783,7 +1785,7 @@ mod apply_lifecycle {
         .expect("preflight");
         let mut host = FakeApplyHost::new(preflight);
         host.health_ok = false;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let status = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply result");
         assert_eq!(status.state, v2::OperationState::AttentionRequired);
@@ -1808,7 +1810,7 @@ mod apply_lifecycle {
         )
         .expect("preflight");
         let host = FakeApplyHost::new(preflight);
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply");
 
         let record_path = state_dir().join("operation-v2.json");
@@ -1855,7 +1857,7 @@ mod apply_lifecycle {
         )
         .expect("preflight");
         let host = FakeApplyHost::new(preflight);
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply");
 
         let journal_path = state_dir().join("journal.json");
@@ -1903,7 +1905,7 @@ mod apply_lifecycle {
         let mut host = FakeApplyHost::new(preflight);
         host.health_ok = false;
         host.create_data_on_bootstrap = true;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let status = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply result");
         assert_eq!(status.state, v2::OperationState::AttentionRequired);
@@ -1946,7 +1948,7 @@ mod apply_lifecycle {
         let mut host = FakeApplyHost::new(preflight);
         host.health_ok = false;
         host.create_data_on_bootstrap = true;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         let failed = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply result");
         assert_eq!(failed.result.code, "rollback_incomplete");
         let operation_id = failed.operation_id.expect("operation id");
@@ -1996,7 +1998,7 @@ mod apply_lifecycle {
         )
         .expect("preflight");
         let host = FakeApplyHost::new(preflight);
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         let completed = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply");
         let operation_id = completed.operation_id.expect("operation id");
 
@@ -2045,7 +2047,7 @@ mod apply_lifecycle {
         )
         .expect("preflight");
         let host = FakeApplyHost::new(preflight);
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         let completed = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply");
         let operation_id = completed.operation_id.expect("operation id");
 
@@ -2103,7 +2105,7 @@ mod apply_lifecycle {
         let mut host = FakeApplyHost::new(preflight);
         host.health_ok = false;
         host.create_data_on_bootstrap = true;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         let failed = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply result");
         assert_eq!(failed.result.code, "rollback_incomplete");
         let operation_id = failed.operation_id.expect("operation id");
@@ -2128,7 +2130,7 @@ mod apply_lifecycle {
         let mut host = FakeApplyHost::new(preflight);
         host.health_ok = false;
         host.fail_terminal_record_write = true;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let error = apply_v2_with_adapter(&host, &input, &state_dir())
             .expect_err("terminal record failure must be returned");
@@ -2155,7 +2157,7 @@ mod apply_lifecycle {
         let mut host = FakeApplyHost::new(preflight);
         host.health_ok = false;
         host.create_data_on_bootstrap = true;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
         let failed = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply result");
         let operation_id = failed.operation_id.expect("operation id");
         let database_path = Path::new(DATA_PATH).join("hs-server.db");
@@ -2191,7 +2193,7 @@ mod apply_lifecycle {
         let mut host = FakeApplyHost::new(preflight);
         host.write_corrupt_receipt = true;
         host.bootout_leaves_loaded = true;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let status = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply result");
         assert_eq!(status.result.code, "rollback_incomplete");
@@ -2220,7 +2222,7 @@ mod apply_lifecycle {
         .expect("preflight");
         let mut host = FakeApplyHost::new(preflight);
         host.launchd_bootstrap_fails = true;
-        let (input, _key) = apply_input(&observer);
+        let (input, _key, _package) = apply_input(&observer);
 
         let status = apply_v2_with_adapter(&host, &input, &state_dir()).expect("apply result");
         assert_eq!(status.state, v2::OperationState::AttentionRequired);
