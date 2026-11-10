@@ -554,7 +554,7 @@ fn run(cli: Cli) -> AppResult<()> {
                             &passphrase,
                         )?;
                         println!("scheduled encrypted Compose database backup created");
-                        return Ok(());
+                        Ok(())
                     }
                     #[cfg(not(target_os = "linux"))]
                     Err(hs_server::AppError::not_implemented(
@@ -565,7 +565,7 @@ fn run(cli: Cli) -> AppResult<()> {
                     #[cfg(target_os = "linux")]
                     {
                         run_compose_backup_control_request()?;
-                        return Ok(());
+                        Ok(())
                     }
                     #[cfg(not(target_os = "linux"))]
                     Err(hs_server::AppError::not_implemented(
@@ -614,7 +614,7 @@ fn run(cli: Cli) -> AppResult<()> {
                         )?;
                         println!("daily encrypted database backup schedule enabled");
                         println!("the backup passphrase was stored as a host-encrypted systemd credential");
-                        return Ok(());
+                        Ok(())
                     }
                     #[cfg(not(target_os = "linux"))]
                     Err(hs_server::AppError::not_implemented(
@@ -645,7 +645,7 @@ fn run(cli: Cli) -> AppResult<()> {
                         )?;
                         println!("daily encrypted database backup schedule disabled");
                         println!("the encrypted credential and existing archives were retained");
-                        return Ok(());
+                        Ok(())
                     }
                     #[cfg(not(target_os = "linux"))]
                     Err(hs_server::AppError::not_implemented(

@@ -171,10 +171,11 @@ fn package_directory_symlink_and_uninspectable_metadata_are_refused() {
     assert_eq!(error.code(), ErrorCode::Forbidden);
 
     adapter.symlinks.lock().unwrap().clear();
-    adapter.force_failures.lock().unwrap().insert(
-        format!("symlink_metadata:{}", directory.display()),
-        "permission denied".into(),
-    );
+    adapter
+        .uninspectable_paths
+        .lock()
+        .unwrap()
+        .insert(directory.clone());
     let error = verify_manifest_for_target_verified(
         &adapter,
         &directory,

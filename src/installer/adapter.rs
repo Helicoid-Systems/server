@@ -293,6 +293,10 @@ pub struct TestAdapter {
     pub force_failures: Arc<Mutex<HashMap<String, String>>>,
     /// Paths that report as symlinks via `symlink_metadata`.
     pub symlinks: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Paths whose metadata cannot be inspected via `symlink_metadata`.
+    /// Keyed by `Path` so injected failures match platform path normalization
+    /// instead of a specific separator spelling.
+    pub uninspectable_paths: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     /// Held lifecycle locks, shared by clones of the same test fixture.
     pub operation_locks: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
 }
@@ -327,6 +331,7 @@ impl TestAdapter {
             storage_query_paths: Arc::new(Mutex::new(Vec::new())),
             force_failures: Arc::new(Mutex::new(HashMap::new())),
             symlinks: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            uninspectable_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
             operation_locks: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
@@ -556,6 +561,9 @@ impl CommandAdapter for TestAdapter {
 
     fn symlink_metadata(&self, path: &Path) -> Result<FileMetadata, String> {
         self.check_failure(&format!("symlink_metadata:{}", path.display()))?;
+        if self.uninspectable_paths.lock().unwrap().contains(path) {
+            return Err(format!("cannot inspect metadata: {}", path.display()));
+        }
         if self.symlinks.lock().unwrap().contains(path) {
             return Ok(FileMetadata {
                 len: 0,
