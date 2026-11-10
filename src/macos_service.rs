@@ -50,18 +50,15 @@
 //! `127.0.0.1:<authority_port>`; the configuration cannot select another
 //! address.
 //!
-//! # This build is not a usable service yet
+//! # Ownership gate
 //!
 //! [`authorize_service_identity`] reuses the existing
 //! [`crate::installer::macos_identity`] seam. That seam refuses every existing
-//! account because no independently verifiable product ownership evidence
-//! source exists, and this build adds no accepted decision. The gate therefore
-//! always fails closed before the configuration is read. A separate read-only
-//! installer plan may review an absent account for a fresh install, but that
-//! plan is not an accepted identity decision and cannot start this service. The
-//! configuration, path, port, and TLS code below is a prepared
-//! pre-authorization plan, not a working startup path. A successful plan is not
-//! authorization.
+//! account because it has no product-ownership evidence of its own. Startup
+//! therefore fails closed unless the reviewed macOS apply lifecycle wrote a
+//! root-owned install receipt and [`crate::installer::macos_apply`] verified it
+//! against the observed account/group. A plan alone is not authorization, and
+//! an absent or invalid receipt cannot start the service.
 //!
 //! # Runtime rules
 //!
@@ -114,7 +111,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::installer::lifecycle_v2::{DeploymentKind, NetworkScope};
-use crate::installer::macos_identity::ServiceIdentityDecision;
+use crate::installer::macos_identity::{IdentityRefusal, ServiceIdentityDecision};
 
 /// Product root owned by root and shared by the reviewed macOS paths.
 ///
@@ -355,13 +352,26 @@ fn plan_reviewed_configuration_for_uid(
 
 /// Startup identity/ownership gate.
 ///
-/// A matching `_helicoid` name is necessary but not sufficient. This gate also
-/// requires the existing trusted `macos_identity` seam to return an accepted,
-/// product-owned account decision. That seam refuses every existing account
-/// with `OwnershipNotVerified`, and this build defines no accepted variant, so
-/// the gate always fails closed. Adding an accepted variant must be a reviewed
-/// product decision, not a name check.
+/// A matching `_helicoid` name is necessary but not sufficient. Without
+/// explicit receipt evidence this gate fails closed for every existing account,
+/// because the read-only `macos_identity` seam always reports missing
+/// product-ownership evidence. [`authorize_service_identity_with_ownership`]
+/// is the only path that may accept an existing account, and only after the
+/// caller verifies the root-owned install receipt.
 pub fn authorize_service_identity(facts: &dyn MacosServiceFacts) -> AppResult<()> {
+    authorize_service_identity_with_ownership(facts, false)
+}
+
+/// Startup gate with explicit receipt-based ownership evidence.
+///
+/// `ownership_verified` may be true only after the caller has verified the
+/// root-owned install receipt against the observed account/group and package
+/// evidence. It accepts an existing account only when the identity seam reports
+/// no problem other than its own missing ownership variant.
+pub fn authorize_service_identity_with_ownership(
+    facts: &dyn MacosServiceFacts,
+    ownership_verified: bool,
+) -> AppResult<()> {
     let effective_uid = facts.effective_uid().map_err(|error| {
         AppError::security_state_unavailable(format!(
             "cannot determine the effective service identity: {}",
@@ -410,6 +420,11 @@ pub fn authorize_service_identity(facts: &dyn MacosServiceFacts) -> AppResult<()
     // accepted variant, this match fails to compile until the product decision
     // is reviewed here.
     match facts.service_identity_decision() {
+        ServiceIdentityDecision::ExistingAccountRefused { reasons }
+            if ownership_verified && reasons.len() == 1 && reasons[0] == IdentityRefusal::OwnershipNotVerified =>
+        {
+            Ok(())
+        }
         ServiceIdentityDecision::ExistingAccountRefused { reasons } => {
             let reasons = reasons
                 .iter()
@@ -904,16 +919,17 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
     }
 }
 
-/// Fixed macOS service entry. This build intentionally fails closed at the
-/// identity/ownership gate before reading configuration, opening the store, or
-/// binding a listener. The prepared path below is not reachable until a
-/// reviewed accepted identity decision exists.
+/// Fixed macOS service entry. It fails closed at the identity/ownership gate
+/// before reading configuration, opening the store, or binding a listener
+/// unless a verified root-owned install receipt proves this installer created
+/// the exact service identity.
 #[cfg(target_os = "macos")]
 pub fn run() -> AppResult<()> {
     let facts = MacosSystemServiceFacts::new();
-    // This gate has no accepting decision in this build. It stops before any
-    // configuration, TLS material, database, or listener effect.
-    authorize_service_identity(&facts)?;
+    // The durable receipt is the only accepted product-ownership evidence.
+    // Absence fails as before; a present but invalid receipt fails closed.
+    let ownership_verified = crate::installer::macos_apply::verify_runtime_receipt()?;
+    authorize_service_identity_with_ownership(&facts, ownership_verified)?;
     // Match the existing Linux service contract (`UMask=0077`) so the SQLite
     // database and WAL/SHM sidecars are private even if the eventual launchd
     // plist omits its own umask key.

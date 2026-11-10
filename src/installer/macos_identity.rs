@@ -666,6 +666,59 @@ pub fn parse_group_record_presence(observation: &IdentityObservation) -> Result<
     Ok(true)
 }
 
+/// Required facts parsed from one local group record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRecordFacts {
+    pub record_names: Vec<String>,
+    pub record_type: String,
+    pub primary_group_id: i64,
+    pub group_membership: Vec<String>,
+}
+
+/// Parse the fixed service-group record. `Ok(None)` means Directory Services
+/// returned the explicit record-not-found diagnostic. Unlike
+/// [`parse_group_record_presence`], this parses the fields the apply lifecycle
+/// needs to confirm that a newly created group has the reviewed identity.
+pub fn parse_group_record(
+    observation: &IdentityObservation,
+) -> Result<Option<GroupRecordFacts>, String> {
+    validate_observation(observation)?;
+    if record_not_found(observation) {
+        return Ok(None);
+    }
+    require_success(observation, "group record")?;
+    let attributes = parse_dscl_attributes(&observation.stdout)?;
+    let record_type = single_trimmed(&attributes, "RecordType")?;
+    let primary_group_id = parse_integer(
+        &single_trimmed(&attributes, "PrimaryGroupID")?,
+        "PrimaryGroupID",
+    )?;
+    let record_names = parse_record_names(&attributes)?;
+    let group_membership = attributes
+        .get("GroupMembership")
+        .map(|values| {
+            values
+                .iter()
+                .flat_map(|value| value.split_ascii_whitespace())
+                .map(|member| {
+                    if valid_record_token(member) {
+                        Ok(member.to_string())
+                    } else {
+                        Err("group member name was malformed".to_string())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Some(GroupRecordFacts {
+        record_names,
+        record_type,
+        primary_group_id,
+        group_membership,
+    }))
+}
+
 /// Parse the shaped output of `dscl . -search <node> <attribute> <value>`.
 /// The returned names are the matching record names; an empty vector means the
 /// search found no records, which is not proof of a clean identity.

@@ -1,21 +1,66 @@
-## macOS read-only CLI/service source candidate, 10 November 2026
+## macOS guarded apply source candidate, 10 November 2026
 
-Source-only slice on the read-only macOS planning branch. It wires the existing
-macOS v2 preflight and plan entry points to the CLI (`capabilities-v2`,
-`preflight-v2`, `plan-v2`), adds the fixed `macos-service` launchd entry, and
-adds bounded `SIGINT`/`SIGTERM` stop handling for the HTTP and TLS serve paths.
-The fixed service entry fails closed at the `_helicoid` identity/product-
-ownership gate before reading configuration, TLS material, the database, or
-binding a listener. macOS mutation commands remain unavailable. Portable
-service-policy and stop-signal tests are wired into the existing
-Linux/Windows `cargo test` jobs; macOS CLI checks are added to the existing
-macOS read-only plan test target, so no workflow file changed.
+Source-only guarded apply slice. The install capability is **gated off** in
+this tree: no independently trusted release root key and no installed-service
+acceptance exist, so `apply-v2` refuses before effects and capabilities
+advertise only preflight/plan. The source-present lifecycle includes: fresh `_helicoid`
+account/group creation with collision checks, fixed product directories, the
+pinned signed `hs-server` artifact, reviewed `service.json`, operator TLS staged
+from `/etc/helicoid/tls`, a root-owned install receipt, launchd plist writing
+and bootstrap, durable operation/journal records, bounded pinned-certificate TLS
+health verification, automatic reverse rollback on phase failure, and
+receipt-based service-runtime identity acceptance. Existing identities are
+never adopted or overwritten; the receipt must match the observed UID/GID,
+package evidence, TLS certificate/key digests, reviewed plan digest, operation,
+and launchd label.
 
-**Not Verified:** this slice has not been run in native macOS/Linux CI at the
-time of writing. No macOS installation, apply/install, service-account
-creation, launchd plist writing/loading, TLS/trust distribution,
-recovery/cutover, backup scheduling, removal, installed service identity, or
-readiness is claimed. No production data, host service, or VM was changed.
+Mutation serialization uses a fixed product-wide persistent nonblocking `flock`
+so SIGKILL cannot wedge recovery with a stale create-new marker and separate
+`--state-dir` values cannot race. Only the fixed state directory
+`/Library/Application Support/Helicoid-Installer` is accepted; other or
+case-aliased paths are refused. State files use exclusive temp write, file
+fsync, rename, and parent-directory fsync. Product files/directories are
+created relative to held parent descriptors with `fchmod`/`fchown` on the held
+object, avoiding path-based ownership changes inside service-owned TLS
+directories. TLS source bytes are bound to certificate/key digests captured
+before effects and rechecked at copy time; plan review binds the same digests. Rollback deletes only resources proven completed by the
+journal; unproven intent/failed entries are preserved and make rollback
+incomplete. The service is stopped before file removal, and a nonempty Data
+directory prevents account/group deletion.
+
+Identity selection checks the full resolver (NSS/Directory Services) for
+UID/GID/name collisions. Post-create and runtime receipt verification require
+both bounded enumeration and direct `getpwuid`/`getpwnam`/`getgrgid`/`getgrnam`
+matches to the exact UID/GID/name. Receipt verification binds the resolved
+account, group, and running effective UID. A failed dscl create is never adopted or
+deleted by recognition; uncertain records are preserved and recovery is
+reported incomplete. Adapter cleanup no longer deletes partially-created
+identities by name. Journal persistence failures are returned as errors, not
+reported as successful rollback. Terminal records are persisted before journal
+unlink, so a crash preserves recovery evidence. Cancel refuses a completed
+journal without a finalized operation record unless the caller explicitly
+acknowledges recovery, so a potentially healthy install is not destroyed
+implicitly; normal `cancellation_available` is false in that state. Completed
+launchd bootout must also confirm `is_loaded == false` before any file or
+identity deletion. The unused
+caller-selected backup directory is not created. Tests use an injected apply/identity adapter and disposable signed
+packages to prove fresh apply, receipt/resolver/euid validation, stale-lock
+recovery, concurrent-lock refusal, pre-mutation TLS/digest refusal, TLS
+source-change rollback, existing-identity refusal, health-gated success,
+nonempty-Data rollback preservation, cancel retry after operator remediation,
+unverified-completion cancel refusal, unproven-intent preservation, honest
+journal/terminal-record write failure, completed-bootout-not-stopped abort,
+malicious journal-path refusal, and full rollback when launchd bootstrap
+fails. Portable tests run in the existing Linux/Windows
+`cargo test` jobs; macOS CLI/apply checks are added to the existing macOS plan
+test target. No workflow file changed.
+
+**Not Verified:** this slice has not run in native macOS/Linux CI at the time of
+writing, and no privileged apply was executed on a real Mac. Service readiness,
+bootstrap completion, enrollment, update, backup, restore, removal, real
+Directory Services/launchd integration, installed-service acceptance, and
+TLS/CA trust distribution remain unverified or unavailable. No production data,
+host service, or VM was changed.
 
 ## Native conditional-MFA prerequisite acceptance, 16 October 2026
 

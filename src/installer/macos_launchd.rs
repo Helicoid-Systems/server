@@ -114,6 +114,12 @@ pub const TLS_DIRECTORY: &str = "/Library/Application Support/Helicoid/TLS";
 pub const TLS_CERTIFICATE_PATH: &str = "/Library/Application Support/Helicoid/TLS/fullchain.pem";
 /// Fixed private-key path reviewed by the service runtime.
 pub const TLS_PRIVATE_KEY_PATH: &str = "/Library/Application Support/Helicoid/TLS/private-key.pem";
+/// Operator-provided TLS source directory for macOS apply.
+pub const TLS_SOURCE_DIRECTORY: &str = "/etc/helicoid/tls";
+/// Operator-provided certificate-chain source for macOS apply.
+pub const TLS_SOURCE_CERTIFICATE_PATH: &str = "/etc/helicoid/tls/fullchain.pem";
+/// Operator-provided private-key source for macOS apply.
+pub const TLS_SOURCE_PRIVATE_KEY_PATH: &str = "/etc/helicoid/tls/private-key.pem";
 /// Manager default authority port. The actual port comes from the v2 request.
 pub const DEFAULT_AUTHORITY_PORT: u16 = 8920;
 
@@ -524,7 +530,9 @@ fn paths_overlap_case_insensitive(left: &Path, right: &Path) -> bool {
         .all(|(left, right)| component_eq_case_insensitive(left, right))
 }
 
-fn validate_macos_configuration(configuration: &v2::DeploymentConfiguration) -> AppResult<()> {
+pub(crate) fn validate_macos_configuration(
+    configuration: &v2::DeploymentConfiguration,
+) -> AppResult<()> {
     if configuration.deployment_kind != v2::DeploymentKind::MacosLaunchd {
         return Err(AppError::not_implemented(
             "this adapter observes only the macOS launchd deployment",
@@ -881,24 +889,22 @@ fn check_existing_install(paths: &PathsCheck, launchd_job_loaded: bool) -> Exist
 }
 
 /// Capability document derived from the existing v2 report, narrowed to what
-/// this read-only adapter actually provides. It never advertises an installable
-/// macOS deployment or an install/apply action.
+/// this adapter actually provides. Install is limited to a fresh fixed-path
+/// identity and never claims service readiness or enrollment.
 pub fn capabilities_v2() -> v2::LifecycleCapabilities {
     let mut reasons_unavailable = BTreeMap::new();
     reasons_unavailable.insert(
         "macos_launchd".to_string(),
-        "this package provides read-only macOS launchd preflight and plan generation; install, apply, service-account creation, launchd plist writing/loading, status, cancellation, backup, and removal are not wired"
+        "macOS install capability is gated off: no independently trusted release root and no installed-service acceptance exist; plan review remains available, and readiness, enrollment, updates, backup, restore, and removal are not implemented"
             .to_string(),
     );
     reasons_unavailable.insert(
         "enrollment_readiness".to_string(),
-        "loopback HTTP is development-only; passing host preflight or generating a review plan does not establish enrollment or deployment readiness"
+        "loopback HTTPS is development-only; apply bootstraps launchd but does not establish enrollment or deployment readiness"
             .to_string(),
     );
     v2::LifecycleCapabilities {
         contract_version: v2::CONTRACT_VERSION,
-        // The deployment kind is advertised only for the read-only preflight
-        // and plan actions below. No install/apply action is advertised.
         supported_deployment_kinds: vec![v2::DeploymentKind::MacosLaunchd],
         supported_network_scopes: vec![v2::NetworkScope::LoopbackDevelopment],
         supported_actions: vec![v2::LifecycleAction::Preflight, v2::LifecycleAction::Plan],

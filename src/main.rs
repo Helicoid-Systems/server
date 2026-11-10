@@ -190,17 +190,16 @@ enum Command {
         #[arg(long)]
         allow_network: bool,
     },
-    /// Fixed macOS launchd service entry. It is not a working installer or
-    /// enrollment path: the identity/product-ownership gate is unavailable in
-    /// this build, so startup fails closed. The loopback listener it prepares
-    /// uses the local development/bootstrap router, not the v2 network router.
-    /// The fixed product paths and protected configuration are the only
-    /// inputs; the global --data option is ignored.
+    /// Fixed macOS launchd service entry. It starts only when a verified
+    /// root-owned install receipt proves this installer created the exact
+    /// `_helicoid` identity; otherwise startup fails closed before config, TLS,
+    /// database, or listener effects. The loopback listener uses the local
+    /// development/bootstrap router, not the v2 network router.
     #[command(name = "macos-service")]
     MacosService,
     /// Guided installer backend. Reads bounded versioned JSON from stdin.
-    /// macOS currently accepts only the read-only capabilities, preflight, and
-    /// plan v2 commands.
+    /// macOS accepts capabilities, preflight, plan, apply, status, and cancel
+    /// v2 commands; unavailable mutation commands fail closed.
     Installer {
         #[command(subcommand)]
         action: InstallerAction,
@@ -278,6 +277,17 @@ enum BackupAction {
     },
 }
 
+fn default_installer_state_dir() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        hs_server::installer::macos_apply::INSTALL_STATE_DIRECTORY.to_string()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "/opt/helicoid/.installer".to_string()
+    }
+}
+
 #[derive(Subcommand)]
 enum InstallerAction {
     /// Report the exact lifecycle capabilities of this installer build.
@@ -298,7 +308,7 @@ enum InstallerAction {
     /// Execute the reviewed plan with phase journal.
     Apply {
         /// Path to the installer state directory.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
         /// Path to the extracted release package directory.
         #[arg(long)]
@@ -310,13 +320,13 @@ enum InstallerAction {
     /// Resume an interrupted apply.
     Resume {
         /// Path to the installer state directory.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
     },
     /// Read current installation state.
     Inspect {
         /// Path to the installer state directory.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
     },
     /// Generate a v2 reviewed plan bound to deployment, network, and storage configuration.
@@ -331,31 +341,31 @@ enum InstallerAction {
     /// Apply a v2 reviewed plan and return its durable operation identity and phase state.
     ApplyV2 {
         /// Path to the installer state directory.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
     },
     /// Resume the exact v2 reviewed plan recorded by the interrupted operation.
     ResumeV2 {
         /// Path to the installer state directory.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
     },
     /// Cancel the exact v2 install operation and remove only journal-owned resources.
     CancelV2 {
         /// Path to the installer state directory.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
     },
     /// Read v2 durable operation state without changing the host.
     StatusV2 {
         /// Path to the installer state directory.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
     },
     /// Read the configuration recorded by the current v2 installer operation.
     ConfigurationV2 {
         /// Path to the installer state directory.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
     },
     /// Verify and stage one TUF release package. This does not install it.
@@ -379,13 +389,13 @@ enum InstallerAction {
         #[arg(long)]
         verify_key: String,
         /// Persistent TUF datastore and verified package staging root.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: PathBuf,
     },
     /// Remove the installation and retain a durable v2 operation result.
     RemoveV2 {
         /// Path to the installer state directory.
-        #[arg(long, default_value = "/opt/helicoid/.installer")]
+        #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
     },
     /// Remove installation (data preserved by default).
@@ -1416,8 +1426,49 @@ fn run_installer(action: InstallerAction) -> AppResult<()> {
             println!("{json}");
             Ok(())
         }
+        InstallerAction::ApplyV2 { state_dir } => {
+            let stdin_buf = read_macos_installer_stdin()?;
+            let input: lifecycle_v2::ApplyInput =
+                serde_json::from_str(&stdin_buf).map_err(|err| {
+                    hs_server::AppError::bad_request(format!("invalid v2 apply input: {err}"))
+                })?;
+            let result = machine::apply_v2_macos(&input, std::path::Path::new(&state_dir))?;
+            let json = serde_json::to_string_pretty(&result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize v2 operation result: {err}"))
+            })?;
+            println!("{json}");
+            Ok(())
+        }
+        InstallerAction::StatusV2 { state_dir } => {
+            let stdin_buf = read_macos_installer_stdin()?;
+            let input: lifecycle_v2::StatusInput =
+                serde_json::from_str(&stdin_buf).map_err(|err| {
+                    hs_server::AppError::bad_request(format!("invalid v2 status input: {err}"))
+                })?;
+            let result = machine::status_v2_macos(&input, std::path::Path::new(&state_dir))?;
+            let json = serde_json::to_string_pretty(&result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize v2 operation status: {err}"))
+            })?;
+            println!("{json}");
+            Ok(())
+        }
+        InstallerAction::CancelV2 { state_dir } => {
+            let stdin_buf = read_macos_installer_stdin()?;
+            let input: lifecycle_v2::CancelInput =
+                serde_json::from_str(&stdin_buf).map_err(|err| {
+                    hs_server::AppError::bad_request(format!(
+                        "invalid v2 cancellation input: {err}"
+                    ))
+                })?;
+            let result = machine::cancel_v2_macos(&input, std::path::Path::new(&state_dir))?;
+            let json = serde_json::to_string_pretty(&result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize v2 cancellation result: {err}"))
+            })?;
+            println!("{json}");
+            Ok(())
+        }
         _ => Err(hs_server::AppError::not_implemented(
-            "only installer capabilities-v2, preflight-v2, and plan-v2 are available in the read-only macOS build",
+            "only installer capabilities-v2, preflight-v2, plan-v2, apply-v2, status-v2, and cancel-v2 are available in this macOS build",
         )),
     }
 }

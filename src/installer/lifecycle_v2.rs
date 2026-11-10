@@ -150,6 +150,9 @@ pub struct PlanResult {
     /// review digest binds. Absent for non-macOS plans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_evidence: Option<PackageEvidence>,
+    /// TLS source bytes bound into the macOS review digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_evidence: Option<TlsEvidence>,
     /// Service-identity observation bound into the macOS review digest.
     /// Absent for non-macOS plans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,6 +176,13 @@ pub struct PackageEvidence {
     pub artifact_path: String,
     pub artifact_sha256: String,
     pub artifact_size_bytes: u64,
+}
+
+/// TLS source evidence bound into a macOS reviewed plan digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsEvidence {
+    pub certificate_sha256: String,
+    pub private_key_sha256: String,
 }
 
 /// Service-identity observation bound into a macOS reviewed plan digest.
@@ -248,6 +258,11 @@ pub struct CancelInput {
     pub configuration: DeploymentConfiguration,
     pub operation_id: String,
     pub confirm: bool,
+    /// Explicit operator acknowledgement that a completed journal has no
+    /// finalized operation outcome and rollback may destroy a potentially
+    /// healthy install. False by default; normal cancel refuses this state.
+    #[serde(default)]
+    pub confirm_unverified_completion: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

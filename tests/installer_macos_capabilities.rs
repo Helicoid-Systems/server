@@ -1,4 +1,4 @@
-//! The macOS library capability report must match the read-only adapter.
+//! The macOS library capability report must match the install-capable adapter.
 //!
 //! This is a pure library assertion: no command, service, or system resource is
 //! touched.
@@ -9,7 +9,7 @@ use hs_server::installer::lifecycle_v2::{DeploymentKind, LifecycleAction, Networ
 use hs_server::installer::{machine, macos_launchd};
 
 #[test]
-fn macos_library_capabilities_are_read_only_preflight_and_plan() {
+fn macos_library_capabilities_keep_install_gated_off() {
     let capabilities = machine::lifecycle_capabilities_v2();
     let adapter = macos_launchd::capabilities_v2();
 
@@ -48,7 +48,7 @@ fn macos_library_capabilities_are_read_only_preflight_and_plan() {
     assert!(capabilities
         .reasons_unavailable
         .get("macos_launchd")
-        .is_some_and(|reason| reason.contains("read-only")));
+        .is_some_and(|reason| reason.contains("gated off")));
     assert!(capabilities
         .reasons_unavailable
         .get("enrollment_readiness")

@@ -1018,7 +1018,7 @@ pub fn read_file_capped(path: &str, max: usize) -> std::io::Result<String> {
 /// Creates missing directories (`mode 0o755`) when `create` is set.
 /// Refuses world-writable non-sticky directories.
 #[cfg(unix)]
-fn open_dir_nofollow(path: &Path, create: bool) -> Result<std::os::fd::OwnedFd, String> {
+pub(crate) fn open_dir_nofollow(path: &Path, create: bool) -> Result<std::os::fd::OwnedFd, String> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
 

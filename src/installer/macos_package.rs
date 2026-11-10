@@ -3,9 +3,9 @@
 //! This is library-only signed-manifest and artifact verification against a
 //! caller-supplied key. It is not authenticated trust, a working macOS
 //! installer, or launchd lifecycle authority. It does not observe a service
-//! identity, write a plist, load a daemon, or enable installation. The separate
-//! read-only `machine::plan_v2_macos` path uses this verifier to produce a
-//! review plan; apply/install remains unavailable.
+//! identity, write a plist, or load a daemon. The read-only
+//! `machine::plan_v2_macos` path uses this verifier to produce a review plan,
+//! and `macos_apply` re-verifies the same package before its guarded apply.
 
 use std::path::Path;
 

@@ -516,7 +516,7 @@ fn lifecycle_capabilities_v2_non_macos() -> v2::LifecycleCapabilities {
     let mut reasons_unavailable = BTreeMap::new();
     reasons_unavailable.insert(
         "macos_launchd".to_string(),
-        "the macOS read-only preflight and plan adapter exists, but apply/install, service-account creation, status, cancellation, and removal are not implemented in this server package"
+        "macOS install capability is gated off pending an independently trusted release root and installed-service acceptance; this non-macOS build can inspect the read-only plan contract"
             .to_string(),
     );
     reasons_unavailable.insert(
@@ -724,11 +724,21 @@ pub fn plan_v2_macos(
     input: &v2::PlanInput,
     verifying_key_bytes: &[u8; 32],
 ) -> AppResult<v2::PlanResult> {
+    if !super::macos_apply::resolver_identity_absent_real()? {
+        return Ok(refused_macos_plan(
+            &input.configuration,
+            "the fixed macOS service identity resolves through the full name-service stack; fresh-install planning is refused"
+                .to_string(),
+            Vec::new(),
+        ));
+    }
+    let tls = super::macos_apply::plan_tls_evidence(input.configuration.network.authority_port)?;
     plan_v2_macos_with_observers(
         &super::macos_launchd::MacosSystemObserver,
         &super::macos_identity::MacosSystemIdentityObserver,
         input,
         verifying_key_bytes,
+        &tls,
     )
 }
 
@@ -741,7 +751,15 @@ pub fn plan_v2_macos_with_observers(
     identity_observer: &dyn super::macos_identity::MacosIdentityObserver,
     input: &v2::PlanInput,
     verifying_key_bytes: &[u8; 32],
+    tls_evidence: &v2::TlsEvidence,
 ) -> AppResult<v2::PlanResult> {
+    if !is_sha256_hex(&tls_evidence.certificate_sha256)
+        || !is_sha256_hex(&tls_evidence.private_key_sha256)
+    {
+        return Err(AppError::bad_request(
+            "macOS TLS evidence must contain two 64-character SHA-256 digests",
+        ));
+    }
     use super::macos_identity::ServiceIdentityDecision;
 
     if input.contract_version != v2::CONTRACT_VERSION {
@@ -881,6 +899,7 @@ pub fn plan_v2_macos_with_observers(
         &fresh_preflight,
         &plan,
         &package_evidence,
+        tls_evidence,
         &identity_evidence,
     )?;
 
@@ -891,16 +910,46 @@ pub fn plan_v2_macos_with_observers(
         plan: Some(plan),
         reviewed_plan_digest: Some(reviewed_plan_digest),
         package_evidence: Some(package_evidence),
+        tls_evidence: Some(tls_evidence.clone()),
         identity_evidence: Some(identity_evidence),
         capabilities: super::macos_launchd::capabilities_v2(),
         warnings: vec![
-            "macOS plan-v2 is read-only: apply/install, service-account creation, launchd plist writing/loading, and readiness are not implemented"
+            "macOS install capability is gated off pending an independently trusted release root; this plan is review-only and service readiness, bootstrap, and enrollment remain unverified"
+                .to_string(),
+            "operator TLS material must already exist at /etc/helicoid/tls/fullchain.pem and /etc/helicoid/tls/private-key.pem and is revalidated during apply"
                 .to_string(),
             "the caller-supplied package verifying key is bound only by its SHA-256 in reviewed_plan_digest and package_evidence; distribute and verify that key out of band"
                 .to_string(),
         ],
         error: None,
     })
+}
+
+/// Apply the reviewed macOS install through the real host adapter.
+#[cfg(target_os = "macos")]
+pub fn apply_v2_macos(input: &v2::ApplyInput, state_dir: &Path) -> AppResult<v2::OperationStatus> {
+    let adapter = super::macos_apply::MacosSystemApplyAdapter::new();
+    super::macos_apply::apply_v2_with_adapter(&adapter, input, state_dir)
+}
+
+/// Read-only macOS operation status through the real host adapter.
+#[cfg(target_os = "macos")]
+pub fn status_v2_macos(
+    input: &v2::StatusInput,
+    state_dir: &Path,
+) -> AppResult<v2::OperationStatus> {
+    let adapter = super::macos_apply::MacosSystemApplyAdapter::new();
+    super::macos_apply::status_v2_with_adapter(&adapter, input, state_dir)
+}
+
+/// Roll back an incomplete macOS install through the real host adapter.
+#[cfg(target_os = "macos")]
+pub fn cancel_v2_macos(
+    input: &v2::CancelInput,
+    state_dir: &Path,
+) -> AppResult<v2::OperationStatus> {
+    let adapter = super::macos_apply::MacosSystemApplyAdapter::new();
+    super::macos_apply::cancel_v2_with_adapter(&adapter, input, state_dir)
 }
 
 #[cfg(unix)]
@@ -916,6 +965,7 @@ fn refused_macos_plan(
         plan: None,
         reviewed_plan_digest: None,
         package_evidence: None,
+        tls_evidence: None,
         identity_evidence: None,
         capabilities: super::macos_launchd::capabilities_v2(),
         warnings,
@@ -930,7 +980,9 @@ fn refused_macos_plan(
 /// storage or port availability crosses the reviewed boundary, so omitting the
 /// volatile detail does not hide a material host change.
 #[cfg(unix)]
-fn macos_preflight_review_value(preflight: &v2::PreflightResult) -> AppResult<serde_json::Value> {
+pub(crate) fn macos_preflight_review_value(
+    preflight: &v2::PreflightResult,
+) -> AppResult<serde_json::Value> {
     #[derive(serde::Serialize)]
     struct StableReview<'a> {
         contract_version: u32,
@@ -974,11 +1026,12 @@ fn macos_preflight_review_value(preflight: &v2::PreflightResult) -> AppResult<se
 /// canonical resource plan. This is a review digest, not a signature or an
 /// authorization token.
 #[cfg(unix)]
-fn compute_macos_reviewed_plan_digest(
+pub(crate) fn compute_macos_reviewed_plan_digest(
     configuration: &v2::DeploymentConfiguration,
     stable_preflight: &serde_json::Value,
     plan: &InstallPlan,
     package: &v2::PackageEvidence,
+    tls: &v2::TlsEvidence,
     identity: &v2::IdentityEvidence,
 ) -> AppResult<String> {
     #[derive(serde::Serialize)]
@@ -987,6 +1040,7 @@ fn compute_macos_reviewed_plan_digest(
         configuration: &'a v2::DeploymentConfiguration,
         stable_host_preflight: &'a serde_json::Value,
         package: &'a v2::PackageEvidence,
+        tls: &'a v2::TlsEvidence,
         identity: &'a v2::IdentityEvidence,
         installer_plan_digest: &'a str,
     }
@@ -996,6 +1050,7 @@ fn compute_macos_reviewed_plan_digest(
         configuration,
         stable_host_preflight: stable_preflight,
         package,
+        tls,
         identity,
         installer_plan_digest: &plan.review_digest,
     };
@@ -1005,7 +1060,14 @@ fn compute_macos_reviewed_plan_digest(
 }
 
 #[cfg(unix)]
-fn macos_package_target_for_architecture(architecture: &str) -> AppResult<InstallerTarget> {
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(unix)]
+pub(crate) fn macos_package_target_for_architecture(
+    architecture: &str,
+) -> AppResult<InstallerTarget> {
     match architecture {
         "arm64" => Ok(InstallerTarget::MacosArm64),
         "x86_64" => Ok(InstallerTarget::MacosX86_64),
@@ -1016,7 +1078,7 @@ fn macos_package_target_for_architecture(architecture: &str) -> AppResult<Instal
 }
 
 #[cfg(unix)]
-fn generate_canonical_macos_plan(
+pub(crate) fn generate_canonical_macos_plan(
     product: &str,
     version: &str,
     configuration: &v2::DeploymentConfiguration,
@@ -1028,9 +1090,10 @@ fn generate_canonical_macos_plan(
         version: version.to_string(),
         service_user: ServiceUserSpec {
             name: service_account.to_string(),
-            // The reviewed plan names the dedicated fresh-install account, but
-            // this read-only slice performs no creation.
-            create: false,
+            // Apply creates only a fresh account after re-observing that both
+            // the fixed account and group are absent. An existing identity is
+            // never adopted or overwritten by this plan.
+            create: true,
         },
         directories: vec![
             DirectorySpec {
@@ -1063,18 +1126,24 @@ fn generate_canonical_macos_plan(
                 mode: "0700".to_string(),
                 create: true,
             },
-            DirectorySpec {
-                path: configuration.storage.backup_directory.clone(),
-                owner: service_account.to_string(),
-                mode: "0700".to_string(),
-                create: true,
+        ],
+        files: vec![
+            FileSpec {
+                source: super::macos_package::MACOS_ARTIFACT_PATH.to_string(),
+                destination: super::macos_launchd::EXECUTABLE_PATH.to_string(),
+                mode: "0755".to_string(),
+            },
+            FileSpec {
+                source: super::macos_launchd::TLS_SOURCE_CERTIFICATE_PATH.to_string(),
+                destination: super::macos_launchd::TLS_CERTIFICATE_PATH.to_string(),
+                mode: "0600".to_string(),
+            },
+            FileSpec {
+                source: super::macos_launchd::TLS_SOURCE_PRIVATE_KEY_PATH.to_string(),
+                destination: super::macos_launchd::TLS_PRIVATE_KEY_PATH.to_string(),
+                mode: "0600".to_string(),
             },
         ],
-        files: vec![FileSpec {
-            source: super::macos_package::MACOS_ARTIFACT_PATH.to_string(),
-            destination: super::macos_launchd::EXECUTABLE_PATH.to_string(),
-            mode: "0755".to_string(),
-        }],
         units: vec![UnitSpec {
             name: super::macos_launchd::LAUNCHD_LABEL.to_string(),
             action: "install".to_string(),
@@ -1086,7 +1155,7 @@ fn generate_canonical_macos_plan(
             port: configuration.network.authority_port,
             protocol: "tcp".to_string(),
             description: format!(
-                "literal loopback HTTPS at 127.0.0.1:{}; v2 routes only after a future reviewed apply",
+                "literal loopback HTTPS at 127.0.0.1:{}; server readiness and enrollment are not verified by apply",
                 configuration.network.authority_port
             ),
         }],
@@ -1095,12 +1164,8 @@ fn generate_canonical_macos_plan(
             backup_required: true,
         },
         not_implemented: vec![
-            "Apply/install is not implemented for macOS".to_string(),
-            "Creating the dedicated _helicoid service account and group is not implemented".to_string(),
-            "Writing the reviewed service configuration is not implemented".to_string(),
-            "Writing the launchd plist, loading the service, and enabling startup are not implemented".to_string(),
-            "Installing operator-provided TLS certificate and private-key material is not implemented".to_string(),
-            "Status, readiness, enrollment, cancellation, online update, backup, restore, and removal are not implemented".to_string(),
+            "Service readiness, bootstrap, enrollment, and health verification are not implemented".to_string(),
+            "Online update, backup, restore, and removal are not implemented".to_string(),
         ],
     }
 }
@@ -1611,6 +1676,7 @@ pub fn plan_v2(
         plan: configured_plan,
         reviewed_plan_digest: digest,
         package_evidence: None,
+        tls_evidence: None,
         identity_evidence: None,
         capabilities: lifecycle_capabilities_v2(),
         warnings,
@@ -7806,6 +7872,13 @@ mod macos_plan_digest_tests {
         }
     }
 
+    fn tls() -> v2::TlsEvidence {
+        v2::TlsEvidence {
+            certificate_sha256: "d".repeat(64),
+            private_key_sha256: "e".repeat(64),
+        }
+    }
+
     fn identity(decision: &str) -> v2::IdentityEvidence {
         v2::IdentityEvidence {
             service_account: "_helicoid".to_string(),
@@ -7821,16 +7894,28 @@ mod macos_plan_digest_tests {
         let stable = serde_json::json!({"paths": {"ok": true}, "storage_ok": true});
         let changed_stable = serde_json::json!({"paths": {"ok": false}, "storage_ok": true});
         let package = package();
+        let tls = tls();
+        let changed_tls = v2::TlsEvidence {
+            certificate_sha256: "f".repeat(64),
+            private_key_sha256: tls.private_key_sha256.clone(),
+        };
         let absent = identity("account_absent_group_absent");
 
-        let base =
-            compute_macos_reviewed_plan_digest(&configuration, &stable, &plan, &package, &absent)
-                .expect("base digest");
+        let base = compute_macos_reviewed_plan_digest(
+            &configuration,
+            &stable,
+            &plan,
+            &package,
+            &tls,
+            &absent,
+        )
+        .expect("base digest");
         let changed_identity = compute_macos_reviewed_plan_digest(
             &configuration,
             &stable,
             &plan,
             &package,
+            &tls,
             &identity("existing_account_verified"),
         )
         .expect("identity digest");
@@ -7839,12 +7924,23 @@ mod macos_plan_digest_tests {
             &changed_stable,
             &plan,
             &package,
+            &tls,
             &absent,
         )
         .expect("preflight digest");
+        let changed_tls_digest = compute_macos_reviewed_plan_digest(
+            &configuration,
+            &stable,
+            &plan,
+            &package,
+            &changed_tls,
+            &absent,
+        )
+        .expect("TLS digest");
 
         assert_ne!(base, changed_identity);
         assert_ne!(base, changed_preflight);
+        assert_ne!(base, changed_tls_digest);
     }
 }
 

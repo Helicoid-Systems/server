@@ -62,8 +62,8 @@ Existing SQLite store files accept only currentUser/SYSTEM/Administrators owners
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
 | Installer package targets | Typed trusted target (`linux-x86_64`, `windows-x86_64`, `macos-arm64`, `macos-x86_64`), exact `hs-server` product binding, strict release `major.minor.patch`, nonempty bounded artifact list, and portable artifact paths in [contracts/installer-package-targets-v1.md](contracts/installer-package-targets-v1.md); verification only — Windows/macOS installation remains unavailable |
-| macOS read-only planning | CLI `capabilities-v2`, `preflight-v2`, and `plan-v2`; re-observed host facts, package verification, and fresh-identity refusal. The prepared `macos-service` entry fails closed at the identity/ownership gate; it does not install, load launchd, or start a working service |
-| Windows/macOS host installation | Unavailable in this server build |
+| macOS installer | **Install capability gated off**: no independently trusted release root or installed acceptance exists. `capabilities-v2`/`preflight-v2`/`plan-v2` remain; guarded `apply-v2`, `status-v2`, and `cancel-v2` source exists but apply fails closed before effects. Readiness/enrollment, update, backup, restore, and removal remain unavailable |
+| Windows/macOS host installation | Windows unavailable; macOS apply is source-implemented but not installed-acceptance verified in CI |
 | Windows persistent v2 MFA | **Verified prerequisite**: real native bootstrap/MFA/reopen, strict current-user directories/material, trusted SQLite file owners and private child inheritance. Installed service identity and security review remain Not Verified |
 
 Legacy v1 Manager `public_identity` values are **not** cryptographic production identities.
@@ -307,14 +307,23 @@ Its version-1 wire shape remains unchanged. The v2 manager routes add
 device-bound sessions, bootstrap, account lifecycle, access, MFA recovery, and
 MFA policy operations in [contracts/http-v2.md](contracts/http-v2.md).
 
-## macOS read-only planning and prepared service entry
+## macOS apply lifecycle (install capability gated off)
 
-The macOS build exposes only the read-only installer v2 commands:
+**The real install capability is gated off in this source tree.** There is no
+independently trusted release root key and no installed-service acceptance, so
+`apply-v2` refuses before any identity or filesystem effect. The reviewed
+lifecycle below exists and is exercised through an injected test authority, but
+it is not advertised by `capabilities-v2` and must not be enabled until a
+trusted release root and installed acceptance exist.
+
+The macOS build exposes the installer v2 commands:
 
 ```sh
 hs-server installer capabilities-v2
 hs-server installer preflight-v2   # bounded v2 preflight JSON on stdin
 hs-server installer plan-v2 --package-dir /path/to/package --verify-key <hex>
+# These commands are gated until a trusted release root exists.
+hs-server installer apply-v2 --state-dir "/Library/Application Support/Helicoid-Installer"
 ```
 
 `plan-v2` re-runs local preflight, refuses a submitted preflight that no longer
@@ -323,26 +332,64 @@ matches stable observed host facts, derives the frozen `macos-arm64` or
 `_helicoid` service account and group, and only then verifies the exact signed
 macOS package shape against the caller-supplied key. A fresh-install review plan
 requires both the account and group to be absent. An absent account with an
-existing group, every existing account (no independently verified Helicoid-owned
-receipt exists yet), and unavailable Directory Services facts fail closed. The
+existing group, every existing account without an independently verified
+Helicoid receipt, and unavailable Directory Services facts fail closed. The
 caller-supplied verifying key is bound only by fingerprint in the reviewed
 digest and must be distributed out of band.
 
-`hs-server macos-service` is the prepared fixed launchd entry. It reads no
-command-line options, uses only the reviewed root-owned configuration at
-`/Library/Application Support/Helicoid/Configuration/service.json`, and prepares
-a literal `127.0.0.1` TLS listener whose certificate must cover `127.0.0.1`.
-The fixed `_helicoid` identity/product-ownership gate always refuses startup in
-this build, before configuration, TLS material, database, or listener effects.
-The service command is therefore **not an installer and does not start a
-working hosted service**.
+`plan-v2` requires operator-owned certificate and matching private key at
+`/etc/helicoid/tls/fullchain.pem` and `/etc/helicoid/tls/private-key.pem` and
+binds both SHA-256 digests into the reviewed plan digest. The certificate must cover literal
+`127.0.0.1`. Apply revalidates that material and re-verifies the signed package
+before any identity or filesystem mutation. It requires `confirm: true`, root,
+a fresh absent `_helicoid` account and group, the fixed state directory
+`/Library/Application Support/Helicoid-Installer`, a trusted release root, and a
+reviewed digest that still matches the fresh host, package, TLS sources, and
+identity. It does not adopt or overwrite a preexisting account/group. Other or
+case-aliased state directories are refused. A fixed product-wide `flock` at
+`/Library/Application Support/Helicoid-Installer.lock` serializes all installer
+state directories. The caller-selected backup directory is retained in config
+review but is not created or used by this slice. The TLS source directory must
+be root-owned and private (`0700`-class), with `0600`-class regular files.
 
-Apply/install, `_helicoid` account creation, launchd plist writing/loading, TLS
-material and trust distribution, recovery/cutover, backup scheduling, status,
-cancellation, and removal remain unavailable on macOS. The Linux-only TUI and
-Linux installer are not part of this path. A valid plan, package, or command
-name grants no installation authority and does not claim an installed or
-readiness state.
+A successful apply creates the fresh service identity, product directories, the
+verified `hs-server` executable, `/Library/Application Support/Helicoid/Configuration/service.json`,
+the fixed TLS files, a root-owned install receipt at
+`/Library/Application Support/Helicoid/Configuration/install-receipt.json`, and
+`/Library/LaunchDaemons/com.helicoid.server.plist`, then bootstraps the daemon.
+The receipt binds the UID/GID, package evidence, TLS certificate/key digests,
+reviewed plan digest, operation ID, and launchd label. The service runtime
+accepts an existing `_helicoid` identity only when that receipt verifies against
+the observed account and group; absent or invalid receipt evidence fails closed.
+
+Apply uses a nonblocking `flock` on a persistent lock file, so a SIGKILL cannot
+leave a create-new marker that wedges recovery. The daemon is not considered
+installed until a pinned-certificate TLS `/health` request returns a real
+health document with `status` `ok` or `degraded` and a schema version. Launchd
+presence alone is never treated as readiness.
+
+Any failed phase rolls back only resources recorded as completed by this
+operation, in reverse order. Unproven intent/failed entries are never deleted:
+if such an object or identity exists, rollback records `rollback_incomplete`
+and preserves the journal. A nonempty service Data directory therefore keeps
+the owning `_helicoid` account/group instead of orphaning files. The service is
+stopped before file removal; if it cannot be stopped, rollback aborts without
+deleting files or identity. If rollback cannot remove every completed resource,
+the operation remains `attention_required` and `cancel-v2` can retry rollback.
+`status-v2` is read-only and only reports `service_installed` when the durable
+receipt also verifies. Apply still does not claim bootstrap completion,
+enrollment, or public availability.
+
+Safe remediation for `rollback_incomplete`: stop and inspect `status-v2` and the
+journal. The installer deliberately does not delete uncertain accounts, files,
+or user data. If Data or backups are nonempty, preserve them and the owning
+account/group; remove or recover those files only through an explicit operator
+decision outside the installer, then retry `cancel-v2`. If a completed journal
+has no finalized operation record, `cancel-v2` refuses by default because the
+service may be healthy. Verify the service independently first; only then may
+an operator send `confirm_unverified_completion: true` in the cancel request to
+approve an explicit destructive recovery. No automated purge is provided. Windows installation, macOS
+removal/update, backup, restore, and installed acceptance remain unavailable.
 
 ## Linux server TUI
 

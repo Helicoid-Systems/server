@@ -433,7 +433,7 @@ fn clean_preflight_emits_the_existing_v2_contract() {
     assert_eq!(
         result.capabilities.supported_deployment_kinds,
         vec![v2::DeploymentKind::MacosLaunchd],
-        "the read-only adapter may advertise only the plan/preflight deployment kind"
+        "the macOS adapter advertises only the launchd deployment kind"
     );
     assert_eq!(
         result.capabilities.supported_actions,
@@ -449,7 +449,7 @@ fn clean_preflight_emits_the_existing_v2_contract() {
         .capabilities
         .reasons_unavailable
         .get("macos_launchd")
-        .is_some_and(|reason| reason.contains("read-only")));
+        .is_some_and(|reason| reason.contains("gated off")));
     assert!(result
         .capabilities
         .reasons_unavailable

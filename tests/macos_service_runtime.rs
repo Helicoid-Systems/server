@@ -10,11 +10,12 @@ use std::path::{Path, PathBuf};
 use hs_server::error::ErrorCode;
 use hs_server::installer::macos_identity::{IdentityRefusal, ServiceIdentityDecision};
 use hs_server::macos_service::{
-    authorize_service_identity, plan_reviewed_configuration, MacosServiceFacts,
-    ServicePathMetadata, DEFAULT_AUTHORITY_PORT, MAX_AUTHORITY_PORT, MAX_SERVICE_CONFIG_BYTES,
-    MIN_UNPRIVILEGED_AUTHORITY_PORT, PRODUCT_ROOT_PATH, SERVICE_ACCOUNT, SERVICE_CONFIG_DIRECTORY,
-    SERVICE_CONFIG_PATH, SERVICE_DATABASE_PATH, SERVICE_DATA_DIRECTORY,
-    SERVICE_TLS_CERTIFICATE_PATH, SERVICE_TLS_DIRECTORY, SERVICE_TLS_PRIVATE_KEY_PATH,
+    authorize_service_identity, authorize_service_identity_with_ownership,
+    plan_reviewed_configuration, MacosServiceFacts, ServicePathMetadata, DEFAULT_AUTHORITY_PORT,
+    MAX_AUTHORITY_PORT, MAX_SERVICE_CONFIG_BYTES, MIN_UNPRIVILEGED_AUTHORITY_PORT,
+    PRODUCT_ROOT_PATH, SERVICE_ACCOUNT, SERVICE_CONFIG_DIRECTORY, SERVICE_CONFIG_PATH,
+    SERVICE_DATABASE_PATH, SERVICE_DATA_DIRECTORY, SERVICE_TLS_CERTIFICATE_PATH,
+    SERVICE_TLS_DIRECTORY, SERVICE_TLS_PRIVATE_KEY_PATH,
 };
 use serde_json::{json, Value};
 
@@ -409,6 +410,36 @@ fn approved_name_alone_does_not_authorize_startup() {
         message.contains("ownership") || message.contains("not verified"),
         "the refusal must name the missing ownership evidence: {message}"
     );
+}
+
+#[test]
+fn verified_receipt_ownership_accepts_only_a_shape_valid_existing_identity() {
+    let host = FakeHost::valid();
+    authorize_service_identity_with_ownership(&host, true)
+        .expect("the verified receipt gate may accept the reviewed identity shape");
+
+    let mut host = FakeHost::valid();
+    host.identity_decision = ServiceIdentityDecision::ExistingAccountRefused {
+        reasons: vec![
+            IdentityRefusal::OwnershipNotVerified,
+            IdentityRefusal::InteractiveShell {
+                observed: "/bin/zsh".to_string(),
+            },
+        ],
+    };
+    let error = authorize_service_identity_with_ownership(&host, true)
+        .expect_err("additional identity defects must still refuse");
+    assert_eq!(error.code(), ErrorCode::SecurityStateUnavailable);
+
+    let mut host = FakeHost::valid();
+    host.identity_decision = ServiceIdentityDecision::AccountAbsentObservation;
+    let error = authorize_service_identity_with_ownership(&host, true)
+        .expect_err("an absent identity must not be accepted by a receipt flag");
+    assert_eq!(error.code(), ErrorCode::SecurityStateUnavailable);
+
+    let host = FakeHost::valid();
+    let error = authorize_service_identity(&host).expect_err("without receipt evidence it refuses");
+    assert_eq!(error.code(), ErrorCode::SecurityStateUnavailable);
 }
 
 #[test]

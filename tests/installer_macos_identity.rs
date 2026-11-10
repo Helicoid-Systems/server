@@ -11,10 +11,10 @@ use std::sync::Mutex;
 #[cfg(target_os = "macos")]
 use hs_server::installer::macos_identity::observe_local_service_identity;
 use hs_server::installer::macos_identity::{
-    observe_service_identity, parse_group_membership_list, parse_group_record_presence,
-    parse_identity_search, parse_user_record, IdentityObservation, IdentityQuery, IdentityRefusal,
-    MacosIdentityObserver, ServiceIdentityDecision, NON_LOGIN_SHELLS, PRODUCT_SERVICE_ACCOUNT,
-    PRODUCT_SERVICE_GROUP,
+    observe_service_identity, parse_group_membership_list, parse_group_record,
+    parse_group_record_presence, parse_identity_search, parse_user_record, IdentityObservation,
+    IdentityQuery, IdentityRefusal, MacosIdentityObserver, ServiceIdentityDecision,
+    NON_LOGIN_SHELLS, PRODUCT_SERVICE_ACCOUNT, PRODUCT_SERVICE_GROUP,
 };
 
 const CLEAN_UID: u32 = 4242;
@@ -961,6 +961,26 @@ fn macos_identity_reviewed_commands_are_fixed_absolute_argv_without_shell() {
     assert!(NON_LOGIN_SHELLS.contains(&"/sbin/nologin"));
     assert!(!NON_LOGIN_SHELLS.contains(&"/usr/sbin/nologin"));
     assert!(!NON_LOGIN_SHELLS.contains(&"/bin/zsh"));
+}
+
+#[test]
+fn group_record_parser_reads_the_receipt_identity_fields() {
+    let observation = IdentityObservation::success(
+        "RecordName: _helicoid\nRecordType: dsRecTypeStandard:Groups\nPrimaryGroupID: 400\nGroupMembership: _helicoid\n",
+    );
+    let record = parse_group_record(&observation)
+        .expect("group record")
+        .expect("present group");
+    assert_eq!(record.record_names, vec!["_helicoid".to_string()]);
+    assert_eq!(record.record_type, "dsRecTypeStandard:Groups");
+    assert_eq!(record.primary_group_id, 400);
+    assert_eq!(record.group_membership, vec!["_helicoid".to_string()]);
+
+    let absent = IdentityObservation::failure(100, "eDSRecordNotFound: record not found\n");
+    assert_eq!(
+        parse_group_record(&absent).expect("not-found is an observation"),
+        None
+    );
 }
 
 #[cfg(target_os = "macos")]

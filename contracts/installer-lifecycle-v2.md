@@ -2,16 +2,17 @@
 
 Owner: `modules/server`. Status: Linux systemd and Docker Compose support
 loopback development, a certificate-backed private LAN listener, and a
-certificate-backed private-DNS listener. macOS supports read-only loopback
-launchd preflight and plan review plus a prepared service entry that fails
-closed. Other deployment modes and operations remain capability-gated.
+certificate-backed private-DNS listener. macOS exposes read-only loopback
+launchd plan review. A guarded apply/status/cancel lifecycle source exists but
+the install capability is gated off pending an independently trusted release
+root and installed-service acceptance. Other deployment modes and operations
+remain capability-gated.
 
 A macOS build reports the `macos_launchd` deployment kind, the
 `loopback_development` network scope, and only the `preflight` and `plan`
-actions. It does not advertise `install`, `resume`, `cancel`, `inspect`, or
-`remove`. The macOS plan is a read-only review artifact: it verifies the signed
-package and fixed paths, but no apply/install, account creation, launchd plist
-writing or loading, readiness, backup, or removal implementation exists.
+actions. The install capability is gated off because no independently trusted
+release root or installed acceptance exists. It does not advertise `install`,
+`cancel`, `inspect`, `resume`, `remove`, `update`, `backup`, or `restore`.
 
 This local JSON contract is shared by installers, the SSH TUI, and desktop
 hosting adapters. It does not itself create an HTTP route. The installed
@@ -171,7 +172,7 @@ configuration. Resume instead
 requires the existing v2 operation record and journal, and re-verifies the
 package, canonical plan, TLS certificate name, and certificate-chain digest.
 
-## macOS read-only plan and prepared service entry
+## macOS apply lifecycle
 
 macOS accepts only `macos_launchd`, `loopback_development`, an unprivileged
 authority port, the Manager-owned data path
@@ -183,6 +184,7 @@ matching the default macOS filesystem. The reviewed paths are fixed:
 - executable: `/Library/Application Support/Helicoid/bin/hs-server`
 - configuration: `/Library/Application Support/Helicoid/Configuration/service.json`
 - TLS directory: `/Library/Application Support/Helicoid/TLS`
+- install receipt: `/Library/Application Support/Helicoid/Configuration/install-receipt.json`
 - launchd label and plist: `com.helicoid.server` and
   `/Library/LaunchDaemons/com.helicoid.server.plist`
 
@@ -193,43 +195,82 @@ commonly symlinks to `/private/tmp` and `/private/var`, and those targets are
 also group/world-writable. Use another reviewed, root-owned directory rather
 than weakening the symlink or write-permission checks.
 
-`plan-v2` runs only on the target Mac. It re-runs the read-only macOS
-preflight, refuses a submitted preflight that no longer matches the stable
-observed host facts, and rejects inconsistent `preflight.ok` /
-`host_checks.ok` values. It derives the frozen `macos-arm64` or
-`macos-x86_64` package target from the observed architecture. It then observes
-the fixed `_helicoid` service account and group. A fresh-install review plan is
-allowed only when both the account and group are absent. An absent account with
-an existing `_helicoid` group is not a fresh identity and is refused. Every
-existing account is refused unless an independent Helicoid-owned receipt can be
-verified. No receipt verifier exists in this build, so every existing account is
-refused. Unavailable Directory Services facts fail closed. Only after the
-identity observation permits a fresh review does the command verify the exact
-signed macOS package shape against the caller-supplied key.
+`plan-v2` runs only on the target Mac. It re-runs the read-only macOS preflight,
+refuses a submitted preflight that no longer matches stable observed host facts,
+and derives the frozen `macos-arm64` or `macos-x86_64` package target from the
+observed architecture. It then observes the fixed `_helicoid` service account
+and group. A fresh-install plan is allowed only when both are absent. An
+existing account or an absent account with an existing group is refused.
+Unavailable Directory Services facts fail closed. Only after the identity
+observation permits a fresh review does the command verify the exact signed
+macOS package shape.
 
-The macOS plan contains the fixed directories, the verified executable, the
-launchd unit, the loopback listener, the current schema migration, and explicit
-`not_implemented` entries for apply/install, `_helicoid` account creation,
-configuration/plist writing/loading, TLS material installation, readiness,
-updates, backup, restore, and removal. It never claims the service is installed
-or ready. `reviewed_plan_digest` binds the contract version, deployment
-configuration, stable preflight projection, canonical plan digest, exact
-signature-verified manifest bytes, caller-supplied verifying-key fingerprint,
-frozen target, artifact path/hash/size, and the service-account/group decision.
-`package_evidence` and `identity_evidence` expose those audit facts; the key is
-caller-supplied and must be distributed and verified out of band. macOS
-`apply-v2`, `resume-v2`, `status-v2`, `cancel-v2`, `remove-v2`, and the legacy
-mutation commands remain unavailable.
+Operator TLS material must exist before `plan-v2` and apply at
+`/etc/helicoid/tls/fullchain.pem` and `/etc/helicoid/tls/private-key.pem`.
+The source directory must be root-owned and private (`0700`-class), and the
+files root-owned `0600`-class regular files. Plan review validates the
+certificate/key pair, requires the leaf to cover literal `127.0.0.1`, and binds
+both SHA-256 digests into the reviewed plan digest. Apply revalidates them,
+rechecks the digests when copying, and copies to the fixed service paths with
+service ownership and `0600` mode. No TLS/trust distribution, CA acceptance, or public-name routing is
+provided by this contract.
 
-`hs-server macos-service` is a separate prepared fixed launchd entry, not an
-installer. It reads no options and uses only the fixed root-owned configuration
-and fixed product paths. It requires equal nonzero real/effective IDs resolving
-to `_helicoid`, a product-owned identity decision, owner-private data/TLS
-material, a TLS leaf covering literal `127.0.0.1`, and a literal loopback bind.
-The product-ownership seam has no accepting decision in this build, so startup
-fails closed before configuration bytes, TLS material, the database, or the
-listener are touched. This command does not create an account, write or load a
-plist, install TLS/trust material, or establish readiness.
+`apply-v2` is source-present but gated off by the trusted-release-root check;
+without an independently trusted root key it refuses before any effect. When
+that gate is enabled, it requires root, `confirm: true`, the fixed state
+directory `/Library/Application Support/Helicoid-Installer`, a fresh absent
+identity, an unchanged reviewed digest, and a freshly re-verified signed
+package. The caller-supplied verify key is never trusted by itself. It creates only the fresh account/group,
+product directories, verified executable, `service.json`, fixed TLS files, a
+root-owned install receipt, and the launchd plist, then bootstraps
+`system/com.helicoid.server`. It never adopts or overwrites a preexisting
+identity and refuses an already-completed installation. Every effect is
+preceded by a durable operation record and per-resource journal entry. State
+files are published with an exclusive private temp file, fsync, rename, and
+parent-directory fsync. A fixed product-wide persistent `flock` at
+`/Library/Application Support/Helicoid-Installer.lock` serializes mutations
+across all state directories; the lock file is never a create-new recovery
+marker. Other or case-aliased state directories are refused. The unused
+caller-selected backup directory is not created.
+
+Installation is not completed until a pinned-certificate TLS `/health` request
+returns `status` `ok` or `degraded` and a schema version. `launchctl print`
+alone is not readiness evidence.
+
+Any phase failure rolls back completed resources only, in reverse order.
+Intent or failed resources are never deleted; if they exist, rollback records
+`rollback_incomplete` and preserves the journal. The service is stopped before
+file removal. If it cannot be stopped, rollback aborts without deleting files
+or identity. A nonempty Data directory therefore preserves the owning
+account/group. A clean rollback removes the journal and records
+`attention_required` with code `rolled_back`; an incomplete rollback leaves the
+journal and code `rollback_incomplete`. `cancel-v2` retries rollback for an
+incomplete install. `status-v2` is read-only, requires a valid receipt to claim
+`service_installed`, and never claims bootstrap completion or enrollment.
+`resume-v2` and `remove-v2` remain unavailable.
+
+If rollback is incomplete, the safe operator action is to inspect `status-v2`
+and the journal and preserve uncertain identities, files, Data, and backups.
+The installer never purges nonempty Data or user data. After an explicit
+external decision, `cancel-v2` may be retried. If the journal records a
+completed install but the final operation record is missing, `cancel-v2`
+refuses by default because the service may be healthy; the caller must verify
+the service and then set `confirm_unverified_completion: true` to authorize an
+explicit recovery rollback. Journal persistence failures are returned as
+errors, never reported as successful rollback.
+
+The macOS install receipt binds the service account/group IDs, package manifest
+and artifact digests, verifying-key fingerprint, TLS certificate/key digests,
+reviewed plan digest, operation ID, and launchd label. Identity selection and
+receipt verification use the full resolver (NSS/Directory Services), not only
+local `dscl`, and the service runtime binds the receipt to its effective UID.
+The installed `macos-service` runtime accepts an existing `_helicoid` account
+only when that root-owned receipt verifies against the observed account/group
+shape and resolver facts; absence or invalid evidence fails closed before
+configuration, TLS material, database, or listener effects. A failed dscl
+create is never adopted or deleted; rollback preserves the uncertain record and
+reports an incomplete recovery. The receipt is ownership evidence, not a signature or release
+trust root.
 
 ## Durable operations
 
@@ -304,5 +345,6 @@ hs-server installer remove-v2 --state-dir DIR
 The v2 request schemas are Rust-owned in
 `src/installer/lifecycle_v2.rs`. Do not hand-construct a plan or infer support
 from a command's existence; discover capabilities and honor explicit refusal.
-On macOS, only `capabilities-v2`, `preflight-v2`, and `plan-v2` are available;
-every mutation command fails closed.
+On macOS, `capabilities-v2`, `preflight-v2`, `plan-v2`, `apply-v2`,
+`status-v2`, and `cancel-v2` are available. `resume-v2`, `remove-v2`, and the
+legacy mutation commands fail closed.
