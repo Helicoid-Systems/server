@@ -51,6 +51,7 @@ jobs:
         working-directory: server
     steps:
       - name: Require trusted repository and GitHub-hosted runner
+        working-directory: .
         shell: bash
         run: |
           set -euo pipefail
@@ -144,6 +145,7 @@ jobs:
 
       - name: Fallback cleanup after interruption
         if: always()
+        working-directory: .
         run: |
           set +e
           rm -f "$RUNNER_TEMP/helicoid-dev-signing-key.pem" "$RUNNER_TEMP/helicoid-dev-pub.der"
