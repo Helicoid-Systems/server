@@ -40,9 +40,11 @@
 //! A read-only review plan may be generated from this preflight and a verified
 //! package by [`super::machine::plan_v2_macos`]. That plan is a review artifact
 //! only: it does not create the `_helicoid` account or group, write a plist, or
-//! make an apply/install path available. A fresh-install plan requires both the
-//! account and group to be absent; an existing group with an absent account is
-//! not a fresh identity.
+//! apply changes. The separate [`super::macos_apply`] module owns the guarded
+//! apply; the development-only `macos-dev-install` feature enables its
+//! build-pinned install path and capability advertisement. A fresh-install
+//! plan requires both the account and group to be absent; an existing group
+//! with an absent account is not a fresh identity.
 //!
 //! Every existing ancestor of every reviewed path must be a non-symlink
 //! directory owned by uid 0 with no group- or world-write permission and no
@@ -893,24 +895,36 @@ fn check_existing_install(paths: &PathsCheck, launchd_job_loaded: bool) -> Exist
 /// identity and never claims service readiness or enrollment.
 pub fn capabilities_v2() -> v2::LifecycleCapabilities {
     let mut reasons_unavailable = BTreeMap::new();
-    reasons_unavailable.insert(
-        "macos_launchd".to_string(),
-        "macOS install capability is gated off: no independently trusted release root and no installed-service acceptance exist; plan review remains available, and readiness, enrollment, updates, backup, restore, and removal are not implemented"
-            .to_string(),
-    );
+    #[cfg(feature = "macos-dev-install")]
+    let macos_reason = "macOS install is enabled only by the development-only macos-dev-install compile feature with a build-pinned CI key; production signing/notarization, installed production acceptance, updates, backup, restore, and removal remain unavailable";
+    #[cfg(not(feature = "macos-dev-install"))]
+    let macos_reason = "macOS install capability is gated off: no independently trusted release root and no installed-service acceptance exist; plan review remains available, and readiness, enrollment, updates, backup, restore, and removal are not implemented";
+    reasons_unavailable.insert("macos_launchd".to_string(), macos_reason.to_string());
     reasons_unavailable.insert(
         "enrollment_readiness".to_string(),
-        "loopback HTTPS is development-only; apply bootstraps launchd but does not establish enrollment or deployment readiness"
+        "loopback HTTPS is development-only; apply bootstraps launchd and verifies loopback TLS health but does not establish enrollment or deployment readiness"
             .to_string(),
     );
+
+    #[cfg(feature = "macos-dev-install")]
+    let supported_actions = vec![
+        v2::LifecycleAction::Preflight,
+        v2::LifecycleAction::Plan,
+        v2::LifecycleAction::Install,
+        v2::LifecycleAction::Cancel,
+        v2::LifecycleAction::Inspect,
+    ];
+    #[cfg(not(feature = "macos-dev-install"))]
+    let supported_actions = vec![v2::LifecycleAction::Preflight, v2::LifecycleAction::Plan];
+
     v2::LifecycleCapabilities {
         contract_version: v2::CONTRACT_VERSION,
         supported_deployment_kinds: vec![v2::DeploymentKind::MacosLaunchd],
         supported_network_scopes: vec![v2::NetworkScope::LoopbackDevelopment],
-        supported_actions: vec![v2::LifecycleAction::Preflight, v2::LifecycleAction::Plan],
+        supported_actions,
         custom_storage_directories: false,
-        durable_operation_journal: false,
-        cancellation: false,
+        durable_operation_journal: cfg!(feature = "macos-dev-install"),
+        cancellation: cfg!(feature = "macos-dev-install"),
         online_update: false,
         backup_and_restore: false,
         public_edge_integration: false,

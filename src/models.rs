@@ -17,6 +17,12 @@ pub const WIRE_CONTRACT_V1_VERSION: i64 = 1;
 pub struct HealthResponse {
     pub status: &'static str,
     pub accepting_authorized_operations: bool,
+    /// True only when the durable trust record is valid and the process has not
+    /// latched Security State Unavailable. This distinguishes a legitimate
+    /// pre-bootstrap service from a latched one even when both report
+    /// `degraded` with `bootstrap_completed = false`. It is a response-time
+    /// snapshot, not a lock against a concurrent post-read latch.
+    pub security_state_ok: bool,
     /// v1 wire contract version (frozen at 1). Not the storage schema version.
     pub schema_version: i64,
     /// Database storage schema version (`db::SCHEMA_VERSION`).

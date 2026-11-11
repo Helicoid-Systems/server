@@ -71,6 +71,7 @@ Unauthenticated liveness + authority readiness.
 {
   "status": "ok",
   "accepting_authorized_operations": true,
+  "security_state_ok": true,
   "schema_version": 1,
   "storage_schema_version": 18,
   "bootstrap_completed": true,
@@ -100,14 +101,21 @@ Storage upgrades are independent and never alter the wire contract version.
 
 Health semantics (fail closed):
 
-| Condition | `status` | `accepting_authorized_operations` | `bootstrap_completed` |
-| --- | --- | --- | --- |
-| Trust healthy **and** bootstrap completed | `ok` | `true` | `true` |
-| Bootstrap not completed (trust healthy) | `degraded` | `false` | `false` |
-| Restored deployment awaiting fresh local bootstrap | `degraded` | `false` | stored bootstrap value (false until bootstrap) |
-| Security State Unavailable (memory or durable) | `degraded` | `false` | real value if readable, else `false` |
-| Deployment row missing / trust record unreadable / invalid | `degraded` | `false` | `false` unless a prior readable value is retained |
+| Condition | `status` | `accepting_authorized_operations` | `security_state_ok` | `bootstrap_completed` |
+| --- | --- | --- | --- | --- |
+| Trust healthy **and** bootstrap completed | `ok` | `true` | `true` | `true` |
+| Bootstrap not completed (trust healthy) | `degraded` | `false` | `true` | `false` |
+| Restored deployment awaiting fresh local bootstrap | `degraded` | `false` | `true` | stored bootstrap value (false until bootstrap) |
+| Security State Unavailable (memory or durable) | `degraded` | `false` | `false` | real value if readable, else `false` |
+| Deployment row missing / trust record unreadable / invalid | `degraded` | `false` | `false` | `false` unless a prior readable value is retained |
 
+- `security_state_ok` is an additive v1 health field added after the original
+  wire shape. It is `true` only when the durable trust record is valid and the
+  process has not latched Security State Unavailable. `schema_version` remains
+  frozen at `1`; clients that do not know the field can ignore it. The macOS
+  installer requires it to be present and `true`, so a latched service is never
+  accepted as legitimate bootstrap-pending merely because `bootstrap_completed`
+  is false.
 - `accepting_authorized_operations` is **never** `true` before bootstrap completes.
 - `recovery_quarantined` stays true after restore through fresh bootstrap and
   MFA. Only an explicit, reviewed local recovery release clears the deployment

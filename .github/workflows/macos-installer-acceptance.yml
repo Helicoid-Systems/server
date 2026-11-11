@@ -1,0 +1,225 @@
+name: macos-installer-acceptance
+
+# Real-host acceptance for the development-only macOS launchd installer.
+#
+# This workflow requires a disposable GitHub-hosted macOS runner where
+# passwordless sudo, account creation, and system-domain launchd bootstrap are
+# available. It never runs on a developer machine and it removes only the fixed
+# resources it first verified absent.
+# A new workflow file is not dispatchable from the default branch until it is
+# merged. The narrow trusted-branch push trigger makes the first acceptance run
+# possible without widening acceptance to other branches; workflow_dispatch
+# remains available after this file reaches the default branch.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/macos-server-plan-ci
+    paths:
+      - '.github/workflows/macos-installer-acceptance.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'src/**'
+      - 'tests/installer_macos_capabilities.rs'
+      - 'tests/installer_macos_launchd.rs'
+      - 'tests/installer_macos_plan.rs'
+      - 'tests/installer_macos_dev_install.rs'
+      - 'scripts/package-macos-development.sh'
+      - 'scripts/run-macos-development-install-acceptance.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-installer-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: macOS development installer (${{ matrix.mode }})
+    # Never schedule this privileged acceptance from a fork or another repo.
+    if: github.repository == 'Helicoid-Systems/server'
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [install, rollback]
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Require trusted repository and GitHub-hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = "Helicoid-Systems/server" ]
+          [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: server
+          persist-credentials: false
+
+      - name: Checkout pinned core
+        uses: actions/checkout@v4
+        with:
+          repository: Helicoid-Systems/core
+          ref: 5d3f98eaad86330010e1bdaf4731189b286e0dbe
+          path: core
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Assert disposable runner privileges
+        run: |
+          set -euo pipefail
+          uname -a
+          sw_vers
+          id
+          sudo -n true
+          sudo -n /bin/launchctl print system >/dev/null
+
+      - name: Install OpenSSL 3
+        run: |
+          set -euo pipefail
+          brew install openssl@3
+          openssl_prefix="$(brew --prefix openssl@3)"
+          test -x "$openssl_prefix/bin/openssl"
+          "$openssl_prefix/bin/openssl" version
+          "$openssl_prefix/bin/openssl" pkeyutl -help 2>&1 | grep -q -- '-rawin'
+          echo "HELICOID_OPENSSL=$openssl_prefix/bin/openssl" >> "$GITHUB_ENV"
+
+      - name: Generate CI-pinned development Ed25519 key
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/helicoid-dev-signing-key.pem"
+          der="$RUNNER_TEMP/helicoid-dev-pub.der"
+          "$HELICOID_OPENSSL" genpkey -algorithm ED25519 -out "$key"
+          chmod 0600 "$key"
+          "$HELICOID_OPENSSL" pkey -in "$key" -pubout -outform DER -out "$der"
+          test "$(wc -c < "$der" | tr -d ' ')" = 44
+          key_hex="$(python3 - "$der" <<'PY'
+          import sys
+          from pathlib import Path
+          raw = Path(sys.argv[1]).read_bytes()
+          if len(raw) != 44 or raw[:12] != bytes.fromhex("302a300506032b6570032100"):
+              raise SystemExit("unexpected Ed25519 SubjectPublicKeyInfo")
+          print(raw[-32:].hex())
+          PY
+          )"
+          [[ "$key_hex" =~ ^[0-9a-f]{64}$ ]]
+          echo "HELICOID_MACOS_DEV_SIGNING_KEY=$key" >> "$GITHUB_ENV"
+          echo "HELICOID_MACOS_DEV_TRUST_KEY=$key_hex" >> "$GITHUB_ENV"
+
+      - name: Validate shell scripts
+        run: |
+          bash -n scripts/package-macos-development.sh
+          bash -n scripts/run-macos-development-install-acceptance.sh
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Test development feature
+        run: >-
+          cargo test --locked
+          --features macos-dev-install
+          --lib
+          --test installer_macos_plan
+          --test installer_macos_capabilities
+          --test installer_macos_launchd
+          --test installer_macos_dev_install
+
+      - name: Clippy development feature
+        run: cargo clippy --locked --all-targets --features macos-dev-install -- -D warnings
+
+      - name: Run privileged real-host acceptance
+        run: ./scripts/run-macos-development-install-acceptance.sh "${{ matrix.mode }}"
+
+      - name: Fallback cleanup after interruption
+        if: always()
+        run: |
+          set +e
+          rm -f "$RUNNER_TEMP/helicoid-dev-signing-key.pem" "$RUNNER_TEMP/helicoid-dev-pub.der"
+          marker="$RUNNER_TEMP/helicoid-acceptance-clean-state-confirmed"
+          if [ ! -f "$marker" ]; then
+            echo "No clean-state marker; no fixed host resource was created by this job."
+            exit 0
+          fi
+          sudo -n /usr/bin/chflags nouchg /Library/LaunchDaemons >/dev/null 2>&1
+          sudo -n /bin/launchctl bootout system/com.helicoid.server >/dev/null 2>&1
+          for _ in {1..20}; do
+            sudo -n /bin/launchctl print system/com.helicoid.server >/dev/null 2>&1 || break
+            sleep 0.5
+          done
+          sudo -n rm -f /Library/LaunchDaemons/com.helicoid.server.plist
+          sudo -n rm -rf "/Library/Application Support/Helicoid"
+          sudo -n rm -rf "/Library/Application Support/Helicoid-Installer"
+          sudo -n rm -f "/Library/Application Support/Helicoid-Installer.lock"
+          sudo -n rm -rf /etc/helicoid
+          non_identity_leftover=0
+          for path in \
+            "/Library/LaunchDaemons/com.helicoid.server.plist" \
+            "/Library/Application Support/Helicoid" \
+            "/Library/Application Support/Helicoid-Installer" \
+            "/Library/Application Support/Helicoid-Installer.lock" \
+            "/Library/Application Support/Helicoid-Backups" \
+            /etc/helicoid; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              non_identity_leftover=1
+            fi
+          done
+          if sudo -n /bin/launchctl print system/com.helicoid.server >/dev/null 2>&1; then
+            non_identity_leftover=1
+          fi
+          if [ "$non_identity_leftover" -ne 0 ]; then
+            echo "::error::fallback cleanup preserved _helicoid because non-identity resources remain"
+            exit 1
+          fi
+          if /usr/bin/dscl . -read /Users/_helicoid >/dev/null 2>&1; then
+            sudo -n /usr/bin/dscl . -delete /Users/_helicoid
+          fi
+          if /usr/bin/dscl . -read /Users/_helicoid >/dev/null 2>&1; then
+            echo "::error::fallback cleanup could not delete _helicoid user; preserving group and marker"
+            exit 1
+          fi
+          if /usr/bin/dscl . -read /Groups/_helicoid >/dev/null 2>&1; then
+            sudo -n /usr/bin/dscl . -delete /Groups/_helicoid
+          fi
+          if /usr/bin/dscl . -read /Groups/_helicoid >/dev/null 2>&1; then
+            echo "::error::fallback cleanup could not delete _helicoid group"
+            exit 1
+          fi
+          sudo -n /usr/bin/dscacheutil -flushcache >/dev/null 2>&1
+          leftover=0
+          for path in \
+            "/Library/LaunchDaemons/com.helicoid.server.plist" \
+            "/Library/Application Support/Helicoid" \
+            "/Library/Application Support/Helicoid-Installer" \
+            "/Library/Application Support/Helicoid-Installer.lock" \
+            "/Library/Application Support/Helicoid-Backups" \
+            /etc/helicoid; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              leftover=1
+            fi
+          done
+          if sudo -n /bin/launchctl print system/com.helicoid.server >/dev/null 2>&1; then
+            leftover=1
+          fi
+          if /usr/bin/dscl . -read /Users/_helicoid >/dev/null 2>&1; then
+            leftover=1
+          fi
+          if /usr/bin/dscl . -read /Groups/_helicoid >/dev/null 2>&1; then
+            leftover=1
+          fi
+          if [ "$leftover" -ne 0 ]; then
+            echo "::error::fallback cleanup left a test-created macOS installer resource behind"
+            exit 1
+          fi
+          rm -f "$marker"

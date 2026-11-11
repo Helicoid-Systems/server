@@ -1049,6 +1049,7 @@ func (m model) overview() string {
 	} else {
 		lines = append(lines,
 			fmt.Sprintf("HTTP state: %s", m.health.Status),
+			fmt.Sprintf("Security state OK: %t", healthSecurityStateOK(*m.health)),
 			fmt.Sprintf("Accepting authorized operations: %t", m.health.AcceptingAuthorizedOperations),
 			fmt.Sprintf("Bootstrap completed: %t", m.health.BootstrapCompleted),
 			fmt.Sprintf("Recovery quarantine: %t", m.health.RecoveryQuarantined),

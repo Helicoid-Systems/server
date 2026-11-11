@@ -169,6 +169,9 @@ func runBootstrapCommand(args []string) error {
 	if health.Status != "ok" && health.Status != "degraded" {
 		return errors.New("local Helicoid server health is not ready for bootstrap")
 	}
+	if !healthSecurityStateOK(health) {
+		return errors.New("local server security state is latched, unavailable, or missing")
+	}
 	if !health.Features.MFA || !health.Features.ManagerEnrollment {
 		return errors.New("local server does not advertise MFA and manager enrollment")
 	}

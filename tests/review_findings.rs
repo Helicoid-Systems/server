@@ -284,11 +284,26 @@ fn health_reports_real_bootstrap_completed_when_latched() {
     service.latch_security_state_unavailable("post_bootstrap_latch");
     let health = service.health().expect("health");
     assert!(!health.accepting_authorized_operations);
+    assert!(!health.security_state_ok);
     assert_eq!(health.status, "degraded");
     assert!(
         health.bootstrap_completed,
         "readable durable bootstrap_completed must not be fabricated false"
     );
+}
+
+#[test]
+fn health_security_state_signal_rejects_memory_latch_before_bootstrap() {
+    let db = db::open_in_memory().expect("open");
+    let service = Service::new(db);
+    service.latch_security_state_unavailable("pre_bootstrap_latch");
+    let health = service.health().expect("health");
+    assert!(!health.bootstrap_completed);
+    assert!(!health.accepting_authorized_operations);
+    assert!(!health.security_state_ok);
+    assert_eq!(health.status, "degraded");
+    assert!(!health.recovery_quarantined);
+    assert_eq!(health.authority_state, "active");
 }
 
 #[test]
@@ -298,6 +313,7 @@ fn health_unbootstracked_is_not_accepting() {
     let health = service.health().expect("health");
     assert!(!health.bootstrap_completed);
     assert!(!health.accepting_authorized_operations);
+    assert!(health.security_state_ok);
     assert_eq!(health.status, "degraded");
     // Bootstrap remains allowed while security state is healthy.
     let token = service.create_bootstrap_token().expect("token");

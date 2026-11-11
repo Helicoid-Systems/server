@@ -1417,7 +1417,7 @@ fn remove_v2_records_completion_and_preserves_data() {
     );
     assert_eq!(
         machine::lifecycle_capabilities_v2().durable_operation_journal,
-        cfg!(target_os = "linux")
+        cfg!(target_os = "linux") || cfg!(all(target_os = "macos", feature = "macos-dev-install"))
     );
     let status = machine::remove_v2(&adapter, &input, &state_dir).unwrap();
     assert_eq!(status.state, lifecycle_v2::OperationState::Completed);

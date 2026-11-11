@@ -457,6 +457,7 @@ async fn health_reports_foundation_features() {
     let (status, body) = send(&app, "GET", "/health", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "degraded");
+    assert_eq!(body["security_state_ok"], true);
     assert_eq!(body["bootstrap_completed"], false);
     assert_eq!(body["accepting_authorized_operations"], false);
     assert_eq!(body["features"]["local_accounts"], true);
@@ -464,6 +465,30 @@ async fn health_reports_foundation_features() {
     assert_eq!(body["features"]["file_jobs"], true);
     assert_eq!(body["features"]["security_recovery"], false);
     assert_eq!(body["features"]["remote_control"], false);
+}
+
+#[tokio::test]
+async fn health_security_state_signal_rejects_latch_before_bootstrap() {
+    let db = db::open_in_memory().expect("in-memory db");
+    {
+        let conn = db.lock().expect("lock");
+        // Nonzero-but-not-1 must latch, not hydrate as healthy.
+        conn.execute(
+            "UPDATE deployment SET security_state_ok = 2 WHERE id = 1",
+            [],
+        )
+        .expect("update");
+    }
+    let service = std::sync::Arc::new(Service::new(db));
+    let app = hs_server::app(service);
+    let (status, body) = send(&app, "GET", "/health", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["security_state_ok"], false);
+    assert_eq!(body["bootstrap_completed"], false);
+    assert_eq!(body["accepting_authorized_operations"], false);
+    assert_eq!(body["recovery_quarantined"], false);
+    assert_eq!(body["authority_state"], "active");
 }
 
 #[tokio::test]
@@ -488,6 +513,7 @@ async fn health_accepts_only_after_bootstrap() {
     let (status, body) = send(&app, "GET", "/health", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
+    assert_eq!(body["security_state_ok"], true);
     assert_eq!(body["bootstrap_completed"], true);
     assert_eq!(body["accepting_authorized_operations"], true);
 }

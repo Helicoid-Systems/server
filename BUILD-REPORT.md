@@ -1,3 +1,90 @@
+## macOS development installer acceptance path, 11 November 2026
+
+Added the smallest end-to-end development install path without weakening the
+production gate. A normal build still advertises only preflight/plan and apply
+still refuses before effects. `--features macos-dev-install` is an explicitly
+named development-only compile feature: `build.rs` requires
+`HELICOID_MACOS_DEV_TRUST_KEY` (64 hex characters, 32 bytes) and embeds that
+exact Ed25519 release verifying key. Apply accepts a caller-supplied key only
+when it matches the build-pinned key; a foreign key is refused before any
+identity, filesystem, TLS, or launchd effect. The feature is not a production
+trust root and does not add a runtime key override.
+
+The enabled development path reuses the existing guarded lifecycle:
+preflight/plan, target-bound signed package verification, fresh `_helicoid`
+identity creation, fixed product/configuration/TLS paths, root-owned install
+receipt, launchd bootstrap, pinned-certificate TLS `/health` verification before
+success, durable operation/journal records, receipt-based service startup, and
+reverse rollback of journaled resources. Capabilities advertise
+preflight/plan/install/cancel/inspect plus the durable journal and cancellation
+only in the development feature build; updates, backup/restore, removal,
+enrollment readiness, and production acceptance stay unavailable. The real
+adapter now allows a bounded 10-second readiness window instead of treating
+launchd presence as readiness; tests keep the shorter default. Its `/health`
+gate now requires the exact wire and storage schemas, an active authority,
+generation greater than zero, no recovery quarantine, and either a fully
+healthy accepting service or a legitimate bootstrap-pending service
+(`degraded`, not accepting, bootstrap incomplete). Quarantined, latched,
+inactive/non-active-authority, unknown-status, missing-field, and schema-drift
+responses are rejected. `/health` now carries an additive `security_state_ok`
+field: it is true only when the durable trust record is valid and the process
+has not latched Security State Unavailable, so a latch before bootstrap is
+distinguishable from legitimate bootstrap-pending. `schema_version` remains
+frozen at 1; existing clients may ignore the new field, while the installer
+requires it to be present and true. Normal-build plan text now states that apply
+is gated off instead of implying it performs health verification. The local
+CLI readiness probe also treats `security_state_ok` as an optional field for
+older servers but requires `Some(true)` before reporting bootstrap or
+enrollment readiness, so a latched-before-bootstrap response is not ready.
+Health snapshots the memory latch at the decision point after the durable read
+and its required latch; the field is documented as a response-time snapshot,
+not a lock against a concurrent post-read latch. The shared TUI health report
+likewise treats the field as optional for older servers but requires true for
+bootstrap/doctor readiness and includes it in the redacted support bundle.
+
+Added a dev-only packager and a macOS 15 acceptance workflow. The workflow
+generates the key, builds with the feature, tests the feature build, then runs
+two isolated real-host modes: a successful install verified through launchd,
+identity, receipt, TLS ownership, strict pinned `/health`, and `status-v2`, and
+a rollback mode that makes `/Library/LaunchDaemons` immutable after review so
+the launchd phase fails after prior effects and journaled rollback must remove
+files, receipt, TLS, and identity. Both assert the fixed resources are absent
+before starting and clean up only those verified-absent resources. Cleanup
+preserves `_helicoid` unless every non-identity resource and the launchd job are
+proven gone, deletes the group only after the user is confirmed absent, and
+cleanup failures now make the job fail and retain the marker. The configured
+backup directory is never created by the macOS installer; acceptance refuses to
+start if it already exists and never deletes it, while an unexpected creation is
+detected as a leftover without deleting that path. The workflow runs on a
+narrow push to `codex/macos-server-plan-ci` because a new workflow file cannot
+be dispatched from the default branch before merge; `workflow_dispatch` remains
+available. The acceptance job is additionally gated to exact repository
+`Helicoid-Systems/server` and fails unless `RUNNER_ENVIRONMENT` is
+`github-hosted`; permissions remain `contents: read` and no secrets are used.
+Privileged acceptance is never run locally.
+
+**Files:** `Cargo.toml`, `build.rs`, `src/models.rs`, `src/service.rs`,
+`src/main.rs`, `src/installer/macos_apply.rs`, `src/installer/macos_launchd.rs`,
+`src/installer/machine.rs`, `tests/http_api.rs`, `tests/review_findings.rs`,
+`tests/installer.rs`, `tests/installer_macos_capabilities.rs`,
+`tests/installer_macos_launchd.rs`, `tests/installer_macos_plan.rs`,
+`tests/installer_macos_dev_install.rs`,
+`scripts/package-macos-development.sh`,
+`scripts/run-macos-development-install-acceptance.sh`, `tui/backend.go`,
+`tui/bootstrap.go`, `tui/support.go`, `tui/tui.go`, `deploy/compose/Dockerfile`,
+`.github/workflows/ci.yml`,
+`.github/workflows/macos-installer-acceptance.yml`,
+`contracts/http-v1.md`, `contracts/installer-lifecycle-v2.md`, `README.md`,
+this file.
+
+**Not Verified:** the acceptance workflow was not executed in this no-push
+worktree. Production release-root pinning, platform signing/notarization,
+installed production acceptance, service updates, backup/restore, removal,
+enrollment readiness, and non-loopback macOS networking remain unavailable.
+GitHub-hosted runner privileges for account creation and system launchd
+bootstrap must be confirmed by the first trusted-branch push or manual workflow
+run; the job fails closed rather than skipping if they are absent.
+
 ## macOS guarded apply source candidate, 10 November 2026
 
 Source-only guarded apply slice. The install capability is **gated off** in

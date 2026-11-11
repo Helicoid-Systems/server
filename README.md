@@ -62,7 +62,7 @@ Existing SQLite store files accept only currentUser/SYSTEM/Administrators owners
 | Login throttle | v1 development map remains bounded/in-memory; v2 challenge throttles are durable and capacity-capped |
 | Linux installer candidate | Signed-manifest verification, ownership-bounded journal and native adapter hardening; installed Linux acceptance still required |
 | Installer package targets | Typed trusted target (`linux-x86_64`, `windows-x86_64`, `macos-arm64`, `macos-x86_64`), exact `hs-server` product binding, strict release `major.minor.patch`, nonempty bounded artifact list, and portable artifact paths in [contracts/installer-package-targets-v1.md](contracts/installer-package-targets-v1.md); verification only — Windows/macOS installation remains unavailable |
-| macOS installer | **Install capability gated off**: no independently trusted release root or installed acceptance exists. `capabilities-v2`/`preflight-v2`/`plan-v2` remain; guarded `apply-v2`, `status-v2`, and `cancel-v2` source exists but apply fails closed before effects. Readiness/enrollment, update, backup, restore, and removal remain unavailable |
+| macOS installer | **Production install capability gated off**: no production release root, notarization, or installed production acceptance exists. `capabilities-v2`/`preflight-v2`/`plan-v2` remain; guarded `apply-v2`, `status-v2`, and `cancel-v2` source exists but normal apply fails closed before effects. The clearly dev-only `macos-dev-install` compile feature pins a CI-generated package key at build time for real disposable-runner acceptance. Production readiness/enrollment, update, backup, restore, and removal remain unavailable |
 | Windows/macOS host installation | Windows unavailable; macOS apply is source-implemented but not installed-acceptance verified in CI |
 | Windows persistent v2 MFA | **Verified prerequisite**: real native bootstrap/MFA/reopen, strict current-user directories/material, trusted SQLite file owners and private child inheritance. Installed service identity and security review remain Not Verified |
 
@@ -307,22 +307,50 @@ Its version-1 wire shape remains unchanged. The v2 manager routes add
 device-bound sessions, bootstrap, account lifecycle, access, MFA recovery, and
 MFA policy operations in [contracts/http-v2.md](contracts/http-v2.md).
 
-## macOS apply lifecycle (install capability gated off)
+## macOS apply lifecycle
 
-**The real install capability is gated off in this source tree.** There is no
-independently trusted release root key and no installed-service acceptance, so
-`apply-v2` refuses before any identity or filesystem effect. The reviewed
-lifecycle below exists and is exercised through an injected test authority, but
-it is not advertised by `capabilities-v2` and must not be enabled until a
-trusted release root and installed acceptance exist.
+**The production install capability remains gated off in a normal build.**
+There is no production release root key, notarization, or installed production
+acceptance, so a normal `apply-v2` refuses before any identity or filesystem
+effect. The reviewed lifecycle below is also available through an explicitly
+named development-only compile feature for disposable CI acceptance; that
+feature is not a production trust root.
 
-The macOS build exposes the installer v2 commands:
+### Development-only CI acceptance
+
+`--features macos-dev-install` builds a development acceptance binary. The
+build refuses to compile unless `HELICOID_MACOS_DEV_TRUST_KEY` contains the
+32-byte Ed25519 package verifying key as 64 hex characters. `build.rs` embeds
+those exact bytes into the binary, and apply accepts the caller-supplied
+`--verify-key` only when it byte-for-byte equals that build-pinned key.
+There is no runtime flag, environment variable, or package-local key that can
+replace the pin; a foreign key is refused before any effect. The CI workflow
+generates the key, compiles the binary with it, signs a real package, and then
+runs the real install and rollback paths on a disposable macOS runner. This is
+development evidence only: no production release root, platform signing,
+notarization, updates, backup/restore, removal, enrollment readiness, or
+production acceptance is established.
+
+The real-host acceptance is
+[`macos-installer-acceptance.yml`](.github/workflows/macos-installer-acceptance.yml).
+It runs both a successful launchd install and a forced post-effect launchd
+failure on isolated `macos-15` runners. Because a new workflow file cannot be
+dispatched from the default branch before merge, it runs on a narrow push to
+`codex/macos-server-plan-ci`; `gh workflow run macos-installer-acceptance.yml`
+remains available once the file is on the default branch. It requires
+passwordless sudo and system-domain launchd support, asserts the fixed
+paths/identity are absent first, preserves `_helicoid` until all non-identity
+resources are gone, and fails if cleanup is incomplete. Never run the
+acceptance script on a developer machine.
+
+The normal macOS build still exposes the installer v2 commands:
 
 ```sh
 hs-server installer capabilities-v2
 hs-server installer preflight-v2   # bounded v2 preflight JSON on stdin
 hs-server installer plan-v2 --package-dir /path/to/package --verify-key <hex>
-# These commands are gated until a trusted release root exists.
+# A normal build refuses apply until a production trust root exists. The
+# dev-only build uses --features macos-dev-install with a build-pinned key.
 hs-server installer apply-v2 --state-dir "/Library/Application Support/Helicoid-Installer"
 ```
 
@@ -487,7 +515,9 @@ signed release artifact or host.
   lock-poison/internal failures latch and deny new authority; memory latch stays
   authoritative if the durable note cannot be written; **never auto-recovers**.
 - Health is fail-closed: `accepting_authorized_operations` is true only after
-  bootstrap completes and trust state is healthy. Missing deployment row latches.
+  bootstrap completes and trust state is healthy. The additive
+  `security_state_ok` field distinguishes a healthy pre-bootstrap service from
+  a latched one; missing deployment rows latch and report `false`.
 - Plain HTTP non-loopback binds are refused. Nonloopback HTTPS binds require
   `--allow-network` and serve only the network v2 routes. Bootstrap and MFA
   recovery stay on literal-loopback APIs or the local CLI.

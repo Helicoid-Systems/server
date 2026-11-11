@@ -90,6 +90,58 @@ jobs:
           --test macos_service_runtime
           --test shutdown_signals
 
+  macos-dev-install-contract:
+    name: macOS development installer contract (no privileged effects)
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: server
+
+      - name: Checkout pinned core
+        uses: actions/checkout@v4
+        with:
+          repository: Helicoid-Systems/core
+          ref: 5d3f98eaad86330010e1bdaf4731189b286e0dbe
+          path: core
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Pin a compile-only development key
+        run: |
+          set -euo pipefail
+          # Deterministic compile-only pin with no corresponding signing key.
+          # It only satisfies the build-time check for unprivileged contract
+          # tests. The real acceptance workflow generates a fresh signing key
+          # and a matching release package.
+          key_hex="$(python3 -c 'import hashlib; print(hashlib.sha256(b"helicoid macos development contract key").hexdigest())')"
+          [[ "$key_hex" =~ ^[0-9a-f]{64}$ ]]
+          echo "HELICOID_MACOS_DEV_TRUST_KEY=$key_hex" >> "$GITHUB_ENV"
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Test development feature contract
+        run: >-
+          cargo test --locked
+          --features macos-dev-install
+          --lib
+          --test installer_macos_plan
+          --test installer_macos_capabilities
+          --test installer_macos_dev_install
+
+      - name: Clippy development feature
+        run: cargo clippy --locked --all-targets --features macos-dev-install -- -D warnings
+
   windows:
     name: windows-latest test / build
     runs-on: windows-latest

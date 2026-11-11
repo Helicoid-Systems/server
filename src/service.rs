@@ -407,9 +407,12 @@ impl Service {
     /// while later logins could still issue authority). When the durable record
     /// is readable, `bootstrap_completed` is reported as stored — never
     /// fabricated. Never auto-recovers a latch.
+    ///
+    /// `security_state_ok` is a best-effort decision-point snapshot, not a
+    /// lock: a concurrent latch after this read can still change authority
+    /// after the response is returned. The field distinguishes a legitimate
+    /// pre-bootstrap service from a latched one at the moment of response.
     pub fn health(&self) -> AppResult<HealthResponse> {
-        let memory_latched = self.security_state() != SecurityState::Ok;
-
         let result = self.with_conn(|conn| {
             let row: Option<(i64, i64, i64, String, i64)> = conn
                 .query_row(
@@ -434,9 +437,11 @@ impl Service {
         let degraded = |bootstrap_completed: bool,
                         recovery_quarantined: bool,
                         authority_state: String,
-                        authority_generation: i64| HealthResponse {
+                        authority_generation: i64,
+                        security_ok: bool| HealthResponse {
             status: "degraded",
             accepting_authorized_operations: false,
+            security_state_ok: security_ok,
             schema_version: crate::models::WIRE_CONTRACT_V1_VERSION,
             storage_schema_version: crate::db::SCHEMA_VERSION,
             bootstrap_completed,
@@ -449,7 +454,7 @@ impl Service {
         match result {
             Ok(Some((
                 bootstrap_completed,
-                security_state_ok,
+                durable_security_state_ok,
                 recovery_quarantined,
                 authority_state,
                 authority_generation,
@@ -457,7 +462,7 @@ impl Service {
                 let boot = bootstrap_completed != 0;
                 let recovery = recovery_quarantined == 1;
                 // Exact 0/1 required; any other value is invalid trust state.
-                let durable_ok = security_state_ok == 1
+                let durable_ok = durable_security_state_ok == 1
                     && matches!(recovery_quarantined, 0 | 1)
                     && matches!(
                         authority_state.as_str(),
@@ -467,16 +472,19 @@ impl Service {
                 if !durable_ok {
                     self.latch_security_state_unavailable("durable_record_latched_or_invalid");
                 }
+                // Snapshot at the decision point, after the durable read and
+                // any latch it required. A concurrent latch can still race the
+                // response; this is not a lock over future authority.
+                let memory_latched = self.security_state() != SecurityState::Ok;
                 // Memory latch is authoritative even if a stale durable row reads ok.
-                let accepting = durable_ok
-                    && !memory_latched
-                    && boot
-                    && !recovery
-                    && authority_state == "active";
+                let security_state_ok = durable_ok && !memory_latched;
+                let accepting =
+                    security_state_ok && boot && !recovery && authority_state == "active";
                 if accepting {
                     Ok(HealthResponse {
                         status: "ok",
                         accepting_authorized_operations: true,
+                        security_state_ok: true,
                         schema_version: crate::models::WIRE_CONTRACT_V1_VERSION,
                         storage_schema_version: crate::db::SCHEMA_VERSION,
                         bootstrap_completed: true,
@@ -491,6 +499,7 @@ impl Service {
                         recovery,
                         authority_state,
                         authority_generation,
+                        security_state_ok,
                     ))
                 }
             }
@@ -498,12 +507,12 @@ impl Service {
                 // Missing deployment row is uncertainty — latch, do not only
                 // return degraded while memory stays Ok.
                 self.latch_security_state_unavailable("deployment_row_missing");
-                Ok(degraded(false, false, "needs_review".to_string(), 0))
+                Ok(degraded(false, false, "needs_review".to_string(), 0, false))
             }
             Err(_) => {
                 // Unreadable health fails closed (finish_storage already latched
                 // Storage/Internal uncertainty).
-                Ok(degraded(false, false, "needs_review".to_string(), 0))
+                Ok(degraded(false, false, "needs_review".to_string(), 0, false))
             }
         }
     }

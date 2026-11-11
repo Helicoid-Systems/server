@@ -5,7 +5,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cmake perl pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/modules/server
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY --from=hs-core Cargo.toml ../core/Cargo.toml
 COPY --from=hs-core src/ ../core/src/
 COPY src ./src

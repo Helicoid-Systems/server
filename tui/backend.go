@@ -131,9 +131,16 @@ type healthReport struct {
 	StorageSchemaVersion          uint32         `json:"storage_schema_version"`
 	Status                        string         `json:"status"`
 	AcceptingAuthorizedOperations bool           `json:"accepting_authorized_operations"`
+	SecurityStateOK               *bool          `json:"security_state_ok"`
 	BootstrapCompleted            bool           `json:"bootstrap_completed"`
 	RecoveryQuarantined           bool           `json:"recovery_quarantined"`
 	Features                      healthFeatures `json:"features"`
+}
+
+// healthSecurityStateOK requires the additive security-state signal. A
+// missing field (older server) or false (latched) is never ready.
+func healthSecurityStateOK(health healthReport) bool {
+	return health.SecurityStateOK != nil && *health.SecurityStateOK
 }
 
 func defaultConfiguration() deploymentConfiguration {
@@ -336,6 +343,9 @@ func runDoctor(ctx context.Context) doctorReport {
 		report.Errors = append(report.Errors, err.Error())
 	} else {
 		report.Health = &health
+		if !healthSecurityStateOK(health) {
+			report.Errors = append(report.Errors, "server security state is latched, unavailable, or missing")
+		}
 		if !health.AcceptingAuthorizedOperations {
 			report.Errors = append(report.Errors, "server is not accepting authorized operations")
 		}

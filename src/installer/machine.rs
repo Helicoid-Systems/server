@@ -914,12 +914,27 @@ pub fn plan_v2_macos_with_observers(
         identity_evidence: Some(identity_evidence),
         capabilities: super::macos_launchd::capabilities_v2(),
         warnings: vec![
-            "macOS install capability is gated off pending an independently trusted release root; this plan is review-only and service readiness, bootstrap, and enrollment remain unverified"
-                .to_string(),
-            "operator TLS material must already exist at /etc/helicoid/tls/fullchain.pem and /etc/helicoid/tls/private-key.pem and is revalidated during apply"
-                .to_string(),
-            "the caller-supplied package verifying key is bound only by its SHA-256 in reviewed_plan_digest and package_evidence; distribute and verify that key out of band"
-                .to_string(),
+            if cfg!(feature = "macos-dev-install") {
+                "macOS install is enabled only by the development-only macos-dev-install compile feature with a build-pinned CI key; production signing, notarization, installed acceptance, enrollment readiness, and updates remain unavailable; apply verifies launchd startup through the pinned TLS /health endpoint"
+                    .to_string()
+            } else {
+                "macOS install capability is gated off pending an independently trusted release root; this plan is review-only and service readiness, bootstrap, and enrollment remain unverified"
+                    .to_string()
+            },
+            if cfg!(feature = "macos-dev-install") {
+                "operator TLS material must already exist at /etc/helicoid/tls/fullchain.pem and /etc/helicoid/tls/private-key.pem and is revalidated during apply"
+                    .to_string()
+            } else {
+                "operator TLS material must already exist at /etc/helicoid/tls/fullchain.pem and /etc/helicoid/tls/private-key.pem and is validated for this review; apply is gated off in this build"
+                    .to_string()
+            },
+            if cfg!(feature = "macos-dev-install") {
+                "the caller-supplied package verifying key is bound only by its SHA-256 in reviewed_plan_digest and package_evidence; apply accepts it only when it matches the build-pinned trust root, so distribute and verify that key out of band"
+                    .to_string()
+            } else {
+                "the caller-supplied package verifying key is bound only by its SHA-256 in reviewed_plan_digest and package_evidence; apply remains gated off in this build, so this plan cannot authorize an install and the key must be verified out of band"
+                    .to_string()
+            },
         ],
         error: None,
     })
@@ -1084,6 +1099,29 @@ pub(crate) fn generate_canonical_macos_plan(
     configuration: &v2::DeploymentConfiguration,
 ) -> InstallPlan {
     let service_account = super::macos_identity::PRODUCT_SERVICE_ACCOUNT;
+    let dev_install = cfg!(feature = "macos-dev-install");
+    let listener_description = if dev_install {
+        format!(
+            "literal loopback HTTPS at 127.0.0.1:{}; apply verifies launchd startup and pinned TLS health, but server enrollment readiness is not verified",
+            configuration.network.authority_port
+        )
+    } else {
+        format!(
+            "literal loopback HTTPS at 127.0.0.1:{}; apply is gated off in this build, so service readiness and enrollment are not established",
+            configuration.network.authority_port
+        )
+    };
+    let not_implemented = if dev_install {
+        vec![
+            "Production readiness, bootstrap completion, and enrollment are not implemented; apply does verify launchd startup and pinned TLS loopback health".to_string(),
+            "Online update, backup, restore, and removal are not implemented".to_string(),
+        ]
+    } else {
+        vec![
+            "Production readiness, bootstrap completion, and enrollment are not implemented; apply remains gated off until a production trust root and installed acceptance exist".to_string(),
+            "Online update, backup, restore, and removal are not implemented".to_string(),
+        ]
+    };
     InstallPlan {
         review_digest: String::new(),
         product: product.to_string(),
@@ -1154,19 +1192,13 @@ pub(crate) fn generate_canonical_macos_plan(
         listeners: vec![ListenerSpec {
             port: configuration.network.authority_port,
             protocol: "tcp".to_string(),
-            description: format!(
-                "literal loopback HTTPS at 127.0.0.1:{}; server readiness and enrollment are not verified by apply",
-                configuration.network.authority_port
-            ),
+            description: listener_description,
         }],
         migrations: MigrationSpec {
             schema_version: crate::db::SCHEMA_VERSION,
             backup_required: true,
         },
-        not_implemented: vec![
-            "Service readiness, bootstrap, enrollment, and health verification are not implemented".to_string(),
-            "Online update, backup, restore, and removal are not implemented".to_string(),
-        ],
+        not_implemented,
     }
 }
 

@@ -972,6 +972,9 @@ struct LocalReadiness {
 struct LocalHealthBody {
     status: String,
     accepting_authorized_operations: bool,
+    /// Missing on older servers; readiness requires `Some(true)`.
+    #[serde(default)]
+    security_state_ok: Option<bool>,
     bootstrap_completed: bool,
     features: LocalHealthFeatures,
 }
@@ -1127,6 +1130,12 @@ fn query_local_readiness(address: &str) -> AppResult<LocalReadiness> {
     Ok(classify_local_readiness(&health, deployment_id))
 }
 
+/// Local readiness requires the additive security-state signal. Old servers
+/// that omit it, and any latched server, are never treated as ready.
+fn local_security_state_ok(health: &LocalHealthBody) -> bool {
+    health.security_state_ok == Some(true)
+}
+
 fn readiness_probe_supported(health: &LocalHealthBody) -> bool {
     let bootstrap_pending = health.status == "degraded"
         && !health.accepting_authorized_operations
@@ -1134,7 +1143,8 @@ fn readiness_probe_supported(health: &LocalHealthBody) -> bool {
     let enrollment_ready = health.status == "ok"
         && health.accepting_authorized_operations
         && health.bootstrap_completed;
-    matches!(health.status.as_str(), "ok" | "degraded")
+    local_security_state_ok(health)
+        && matches!(health.status.as_str(), "ok" | "degraded")
         && health.features.mfa
         && health.features.manager_enrollment
         && (bootstrap_pending || enrollment_ready)
@@ -1142,14 +1152,17 @@ fn readiness_probe_supported(health: &LocalHealthBody) -> bool {
 
 fn classify_local_readiness(health: &LocalHealthBody, deployment_id: &str) -> LocalReadiness {
     let valid_deployment_identity = !deployment_id.is_empty() && deployment_id.len() <= 128;
+    let security_state_ok = local_security_state_ok(health);
     LocalReadiness {
-        bootstrap_ready: health.status == "degraded"
+        bootstrap_ready: security_state_ok
+            && health.status == "degraded"
             && !health.accepting_authorized_operations
             && !health.bootstrap_completed
             && health.features.mfa
             && health.features.manager_enrollment
             && valid_deployment_identity,
-        server_ready_for_enrollment: health.status == "ok"
+        server_ready_for_enrollment: security_state_ok
+            && health.status == "ok"
             && health.accepting_authorized_operations
             && health.bootstrap_completed
             && health.features.mfa
@@ -2241,6 +2254,7 @@ mod tests {
         LocalHealthBody {
             status: status.to_string(),
             accepting_authorized_operations,
+            security_state_ok: Some(true),
             bootstrap_completed,
             features: LocalHealthFeatures {
                 mfa,
@@ -2308,6 +2322,60 @@ mod tests {
                 server_ready_for_enrollment: false,
             }
         );
+    }
+
+    #[test]
+    fn local_health_security_state_is_optional_but_readiness_requires_true() {
+        let older: LocalHealthBody = serde_json::from_value(serde_json::json!({
+            "status": "degraded",
+            "accepting_authorized_operations": false,
+            "bootstrap_completed": false,
+            "features": {"mfa": true, "manager_enrollment": true}
+        }))
+        .expect("older health body");
+        assert_eq!(older.security_state_ok, None);
+        assert!(!readiness_probe_supported(&older));
+
+        let current: LocalHealthBody = serde_json::from_value(serde_json::json!({
+            "status": "degraded",
+            "accepting_authorized_operations": false,
+            "security_state_ok": true,
+            "bootstrap_completed": false,
+            "features": {"mfa": true, "manager_enrollment": true}
+        }))
+        .expect("current health body");
+        assert_eq!(current.security_state_ok, Some(true));
+        assert!(readiness_probe_supported(&current));
+    }
+
+    #[test]
+    fn installer_readiness_requires_explicit_security_state_ok() {
+        for (status, accepting, bootstrap_completed) in
+            [("degraded", false, false), ("ok", true, true)]
+        {
+            let mut latched = readiness_health(status, accepting, bootstrap_completed, true, true);
+            latched.security_state_ok = Some(false);
+            assert!(!readiness_probe_supported(&latched));
+            assert_eq!(
+                classify_local_readiness(&latched, "deployment-123"),
+                LocalReadiness {
+                    bootstrap_ready: false,
+                    server_ready_for_enrollment: false,
+                }
+            );
+
+            let mut older_server =
+                readiness_health(status, accepting, bootstrap_completed, true, true);
+            older_server.security_state_ok = None;
+            assert!(!readiness_probe_supported(&older_server));
+            assert_eq!(
+                classify_local_readiness(&older_server, "deployment-123"),
+                LocalReadiness {
+                    bootstrap_ready: false,
+                    server_ready_for_enrollment: false,
+                }
+            );
+        }
     }
 
     #[test]

@@ -394,7 +394,51 @@ fn absent_identity_plans_a_fresh_install() {
         .warnings
         .iter()
         .any(|warning| warning.contains("readiness")));
+    #[cfg(not(feature = "macos-dev-install"))]
+    {
+        assert!(
+            !plan
+                .not_implemented
+                .iter()
+                .any(|item| item.contains("apply does verify")),
+            "a gated normal build must not claim apply performs health verification"
+        );
+        assert!(
+            plan.listeners[0].description.contains("apply is gated off"),
+            "the plan must describe apply as gated off in a normal build"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("apply is gated off")
+                    || warning.contains("apply remains gated off")),
+            "normal-build warnings must not imply apply is enabled"
+        );
+    }
+    #[cfg(feature = "macos-dev-install")]
+    {
+        assert!(
+            plan.not_implemented
+                .iter()
+                .any(|item| item.contains("apply does verify")),
+            "the development feature must describe the verified startup path"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("build-pinned")),
+            "the development feature must describe the build-pinned trust root"
+        );
+    }
+    #[cfg(not(feature = "macos-dev-install"))]
     assert!(!result
+        .capabilities
+        .supported_actions
+        .contains(&v2::LifecycleAction::Install));
+    #[cfg(feature = "macos-dev-install")]
+    assert!(result
         .capabilities
         .supported_actions
         .contains(&v2::LifecycleAction::Install));
@@ -801,12 +845,30 @@ mod cli {
             value["supported_deployment_kinds"],
             serde_json::json!(["macos_launchd"])
         );
-        assert_eq!(
-            value["supported_actions"],
-            serde_json::json!(["preflight", "plan"])
-        );
-        assert_eq!(value["cancellation"], serde_json::json!(false));
-        assert_eq!(value["durable_operation_journal"], serde_json::json!(false));
+        #[cfg(not(feature = "macos-dev-install"))]
+        {
+            assert_eq!(
+                value["supported_actions"],
+                serde_json::json!(["preflight", "plan"])
+            );
+            assert_eq!(value["cancellation"], serde_json::json!(false));
+            assert_eq!(value["durable_operation_journal"], serde_json::json!(false));
+            assert!(value["reasons_unavailable"]["macos_launchd"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("gated off")));
+        }
+        #[cfg(feature = "macos-dev-install")]
+        {
+            assert_eq!(
+                value["supported_actions"],
+                serde_json::json!(["preflight", "plan", "install", "cancel", "inspect"])
+            );
+            assert_eq!(value["cancellation"], serde_json::json!(true));
+            assert_eq!(value["durable_operation_journal"], serde_json::json!(true));
+            assert!(value["reasons_unavailable"]["macos_launchd"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("development-only")));
+        }
         assert!(value["reasons_unavailable"]["enrollment_readiness"]
             .as_str()
             .is_some_and(|reason| reason.contains("development-only")));
@@ -846,9 +908,15 @@ mod cli {
             value["capabilities"]["supported_deployment_kinds"],
             serde_json::json!(["macos_launchd"])
         );
+        #[cfg(not(feature = "macos-dev-install"))]
         assert_eq!(
             value["capabilities"]["supported_actions"],
             serde_json::json!(["preflight", "plan"])
+        );
+        #[cfg(feature = "macos-dev-install")]
+        assert_eq!(
+            value["capabilities"]["supported_actions"],
+            serde_json::json!(["preflight", "plan", "install", "cancel", "inspect"])
         );
         assert!(value.get("service_installed").is_none());
         assert!(value.get("bootstrap_ready").is_none());
@@ -1431,7 +1499,7 @@ mod apply_lifecycle {
         PathBuf::from(INSTALL_STATE_DIRECTORY)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "macos-dev-install")))]
     #[test]
     fn real_macos_adapter_has_no_trusted_release_root() {
         let adapter = hs_server::installer::macos_apply::MacosSystemApplyAdapter::new();
@@ -1439,6 +1507,26 @@ mod apply_lifecycle {
             .authorize_package_key(&"00".repeat(32))
             .expect_err("no trusted release root is configured");
         assert!(error.contains("gated off"), "unexpected error: {error}");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "macos-dev-install"))]
+    #[test]
+    fn real_macos_adapter_refuses_non_pinned_development_keys() {
+        let adapter = hs_server::installer::macos_apply::MacosSystemApplyAdapter::new();
+        let error = adapter
+            .authorize_package_key(&"ab".repeat(32))
+            .expect_err("an arbitrary key must not replace the build-pinned key");
+        assert!(
+            error.contains("build-pinned development release key")
+                && error.contains("arbitrary trust keys"),
+            "unexpected error: {error}"
+        );
+
+        if let Ok(pinned) = std::env::var("HELICOID_MACOS_DEV_TRUST_KEY") {
+            adapter
+                .authorize_package_key(&pinned)
+                .expect("the build-pinned key must authorize");
+        }
     }
 
     #[cfg(target_os = "macos")]

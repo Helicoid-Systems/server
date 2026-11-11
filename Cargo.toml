@@ -5,6 +5,13 @@ edition = "2021"
 description = "HS coordination server foundation (local accounts, manager enrollment, scoped inventory)"
 license = "LicenseRef-TBD"
 publish = false
+build = "build.rs"
+
+[features]
+# Development-only macOS launchd installer acceptance. Requires
+# HELICOID_MACOS_DEV_TRUST_KEY to pin one Ed25519 release verifying key at
+# build time. It is not a production trust root or release configuration.
+macos-dev-install = []
 
 [dependencies]
 argon2 = "0.6"

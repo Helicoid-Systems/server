@@ -435,21 +435,44 @@ fn clean_preflight_emits_the_existing_v2_contract() {
         vec![v2::DeploymentKind::MacosLaunchd],
         "the macOS adapter advertises only the launchd deployment kind"
     );
-    assert_eq!(
-        result.capabilities.supported_actions,
-        vec![v2::LifecycleAction::Preflight, v2::LifecycleAction::Plan]
-    );
-    assert!(!result
-        .capabilities
-        .supported_actions
-        .contains(&v2::LifecycleAction::Install));
-    assert!(!result.capabilities.cancellation);
-    assert!(!result.capabilities.durable_operation_journal);
-    assert!(result
-        .capabilities
-        .reasons_unavailable
-        .get("macos_launchd")
-        .is_some_and(|reason| reason.contains("gated off")));
+    #[cfg(not(feature = "macos-dev-install"))]
+    {
+        assert_eq!(
+            result.capabilities.supported_actions,
+            vec![v2::LifecycleAction::Preflight, v2::LifecycleAction::Plan]
+        );
+        assert!(!result
+            .capabilities
+            .supported_actions
+            .contains(&v2::LifecycleAction::Install));
+        assert!(!result.capabilities.cancellation);
+        assert!(!result.capabilities.durable_operation_journal);
+        assert!(result
+            .capabilities
+            .reasons_unavailable
+            .get("macos_launchd")
+            .is_some_and(|reason| reason.contains("gated off")));
+    }
+    #[cfg(feature = "macos-dev-install")]
+    {
+        assert_eq!(
+            result.capabilities.supported_actions,
+            vec![
+                v2::LifecycleAction::Preflight,
+                v2::LifecycleAction::Plan,
+                v2::LifecycleAction::Install,
+                v2::LifecycleAction::Cancel,
+                v2::LifecycleAction::Inspect,
+            ]
+        );
+        assert!(result.capabilities.cancellation);
+        assert!(result.capabilities.durable_operation_journal);
+        assert!(result
+            .capabilities
+            .reasons_unavailable
+            .get("macos_launchd")
+            .is_some_and(|reason| reason.contains("development-only")));
+    }
     assert!(result
         .capabilities
         .reasons_unavailable

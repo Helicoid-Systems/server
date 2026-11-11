@@ -20,6 +20,7 @@ type supportHealth struct {
 	Status                        string         `json:"status"`
 	StorageSchemaVersion          uint32         `json:"storage_schema_version"`
 	AcceptingAuthorizedOperations bool           `json:"accepting_authorized_operations"`
+	SecurityStateOK               *bool          `json:"security_state_ok,omitempty"`
 	BootstrapCompleted            bool           `json:"bootstrap_completed"`
 	RecoveryQuarantined           bool           `json:"recovery_quarantined"`
 	Features                      healthFeatures `json:"features"`
@@ -151,6 +152,7 @@ func buildSupportBundle(doctor doctorReport, status operationStatus, statusAvail
 			Status:                        allowlisted(doctor.Health.Status, "ok", "degraded", "unavailable"),
 			StorageSchemaVersion:          doctor.Health.StorageSchemaVersion,
 			AcceptingAuthorizedOperations: doctor.Health.AcceptingAuthorizedOperations,
+			SecurityStateOK:               doctor.Health.SecurityStateOK,
 			BootstrapCompleted:            doctor.Health.BootstrapCompleted,
 			RecoveryQuarantined:           doctor.Health.RecoveryQuarantined,
 			Features:                      doctor.Health.Features,

@@ -8,11 +8,20 @@ the install capability is gated off pending an independently trusted release
 root and installed-service acceptance. Other deployment modes and operations
 remain capability-gated.
 
-A macOS build reports the `macos_launchd` deployment kind, the
+A normal macOS build reports the `macos_launchd` deployment kind, the
 `loopback_development` network scope, and only the `preflight` and `plan`
-actions. The install capability is gated off because no independently trusted
-release root or installed acceptance exists. It does not advertise `install`,
-`cancel`, `inspect`, `resume`, `remove`, `update`, `backup`, or `restore`.
+actions. The production install capability is gated off because no production
+release root, notarization, or installed production acceptance exists. It does
+not advertise `install`, `cancel`, `inspect`, `resume`, `remove`, `update`,
+`backup`, or `restore`.
+
+The explicitly named development-only `macos-dev-install` compile feature
+advertises `preflight`, `plan`, `install`, `cancel`, and `inspect` with the
+durable journal and cancellation enabled. `build.rs` requires one
+`HELICOID_MACOS_DEV_TRUST_KEY` Ed25519 verifying key at build time and embeds
+it; apply accepts only that build-pinned key. This feature is disposable-runner
+acceptance evidence, not a production trust root. It does not add `resume`,
+`remove`, `update`, `backup`, or `restore`.
 
 This local JSON contract is shared by installers, the SSH TUI, and desktop
 hosting adapters. It does not itself create an HTTP route. The installed
@@ -234,8 +243,12 @@ marker. Other or case-aliased state directories are refused. The unused
 caller-selected backup directory is not created.
 
 Installation is not completed until a pinned-certificate TLS `/health` request
-returns `status` `ok` or `degraded` and a schema version. `launchctl print`
-alone is not readiness evidence.
+returns a schema-valid response with `security_state_ok: true`, no recovery
+quarantine, active authority, positive authority generation, and either a
+fully healthy accepting service or a legitimate bootstrap-pending service
+(`degraded`, not accepting, bootstrap incomplete). Quarantined, latched,
+inactive-authority, missing-field, unknown-status, and schema-drift responses
+are rejected. `launchctl print` alone is not readiness evidence.
 
 Any phase failure rolls back completed resources only, in reverse order.
 Intent or failed resources are never deleted; if they exist, rollback records
