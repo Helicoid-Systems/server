@@ -4289,7 +4289,7 @@ mod macos_state_dir_fake_tests {
 
     impl StateDirFacts for FakeFacts {
         fn path_metadata(&self, path: &Path) -> Result<Option<MacosApplyPathMetadata>, String> {
-            self.entries.get(path).cloned().unwrap_or_else(|| Ok(None))
+            self.entries.get(path).cloned().unwrap_or(Ok(None))
         }
 
         fn extended_acl_is_safe(&self, path: &Path) -> Result<bool, String> {

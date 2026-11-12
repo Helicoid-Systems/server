@@ -1221,7 +1221,8 @@ mod tests {
 
     #[test]
     fn marker_recovery_refuses_untrusted_parents_before_any_read() {
-        let cases: Vec<(&str, fn(&mut Fixture))> = vec![
+        type FixtureMutation = fn(&mut Fixture);
+        let cases: Vec<(&str, FixtureMutation)> = vec![
             ("non-private TLS directory", |fixture| {
                 fixture.facts.set(TLS_DIR, directory(0, 0o755));
             }),
