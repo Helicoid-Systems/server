@@ -4,9 +4,10 @@
 #
 # NEVER run this on a machine that matters. It creates a fixed `_helicoid`
 # account/group, product directories, a LaunchDaemon, and root-owned installer
-# state, then removes only the resources it verified absent at startup. It
-# requires passwordless sudo and a disposable GitHub Actions macOS runner (or a
-# throwaway VM). It must be run as the normal runner user, not root.
+# state, then attempts cleanup. MANUAL ONLY pending authoritative
+# absence/identity cleanup hardening; push-triggered acceptance is disabled.
+# It requires passwordless sudo and a disposable GitHub Actions macOS runner
+# (or a throwaway VM). It must be run as the normal runner user, not root.
 #
 # Usage:
 #   run-macos-development-install-acceptance.sh install

@@ -1841,6 +1841,12 @@ fn prepare_state_dir(adapter: &dyn MacosApplyAdapter, state_dir: &Path) -> AppRe
                         current.display()
                     )));
                 }
+                if current.as_path() == state_dir && metadata.mode & 0o077 != 0 {
+                    return Err(AppError::security_state_unavailable(format!(
+                        "state directory '{}' is not owner-private",
+                        current.display()
+                    )));
+                }
                 if !adapter
                     .extended_acl_is_safe(&current)
                     .map_err(unavailable)?
@@ -1869,6 +1875,130 @@ fn prepare_state_dir(adapter: &dyn MacosApplyAdapter, state_dir: &Path) -> AppRe
         }
     }
     Ok(())
+}
+
+/// Minimal facts needed to validate an existing installer state directory.
+/// Implemented by the real macOS apply adapter and by test fakes.
+#[cfg(target_os = "macos")]
+trait StateDirFacts {
+    fn path_metadata(&self, path: &Path) -> Result<Option<MacosApplyPathMetadata>, String>;
+    fn extended_acl_is_safe(&self, path: &Path) -> Result<bool, String>;
+}
+
+#[cfg(target_os = "macos")]
+impl<T: MacosApplyAdapter + ?Sized> StateDirFacts for T {
+    fn path_metadata(&self, path: &Path) -> Result<Option<MacosApplyPathMetadata>, String> {
+        MacosApplyAdapter::path_metadata(self, path)
+    }
+
+    fn extended_acl_is_safe(&self, path: &Path) -> Result<bool, String> {
+        MacosApplyAdapter::extended_acl_is_safe(self, path)
+    }
+}
+
+/// Read-only companion to `prepare_state_dir` used by `configuration-v2`.
+/// Returns `Ok(false)` only for an authoritatively absent state directory.
+#[cfg(target_os = "macos")]
+fn validate_existing_state_dir<F: StateDirFacts + ?Sized>(
+    facts: &F,
+    state_dir: &Path,
+) -> AppResult<bool> {
+    let mut current = PathBuf::new();
+    for component in state_dir.components() {
+        current.push(component);
+        let metadata = facts.path_metadata(&current).map_err(unavailable)?;
+        match metadata {
+            Some(metadata) => {
+                if metadata.is_symlink {
+                    return Err(AppError::security_state_unavailable(format!(
+                        "state path '{}' is a symlink",
+                        current.display()
+                    )));
+                }
+                if !metadata.is_directory {
+                    return Err(AppError::security_state_unavailable(format!(
+                        "state path '{}' is not a directory",
+                        current.display()
+                    )));
+                }
+                if metadata.uid != 0 || metadata.mode & 0o022 != 0 {
+                    return Err(AppError::security_state_unavailable(format!(
+                        "state path '{}' is not root-owned or is group/world-writable",
+                        current.display()
+                    )));
+                }
+                if current.as_path() == state_dir && metadata.mode & 0o077 != 0 {
+                    return Err(AppError::security_state_unavailable(format!(
+                        "state directory '{}' is not owner-private",
+                        current.display()
+                    )));
+                }
+                if !facts.extended_acl_is_safe(&current).map_err(unavailable)? {
+                    return Err(AppError::security_state_unavailable(format!(
+                        "state path '{}' carries an extended ACL with an ALLOW entry",
+                        current.display()
+                    )));
+                }
+            }
+            None if current.as_path() == state_dir => return Ok(false),
+            None => {
+                return Err(AppError::security_state_unavailable(format!(
+                    "state path parent '{}' is absent",
+                    current.display()
+                )))
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_stored_configuration(
+    configuration: &v2::DeploymentConfiguration,
+) -> AppResult<()> {
+    if configuration.deployment_kind != v2::DeploymentKind::MacosLaunchd {
+        return Err(AppError::not_implemented(
+            "macOS configuration-v2 requires a macos_launchd operation record",
+        ));
+    }
+    super::macos_launchd::validate_macos_configuration(configuration)
+}
+
+/// Recover the durable configuration from the fixed macOS state directory.
+///
+/// This entry accepts only `INSTALL_STATE_DIRECTORY` and only a
+/// `macos_launchd` record. It reuses the same root-owned state-file validation
+/// and bounded reader as the guarded macOS apply lifecycle, distinguishes an
+/// absent state directory from permission/type errors, and rejects symlinked
+/// parents, unsafe ownership/mode, extended ACL ALLOW entries, and empty or
+/// oversized records.
+///
+/// Lock behavior is explicit: this read-only recovery deliberately does not
+/// acquire the installer operation lock and never creates it. The operation
+/// record is atomically written and revalidated on read; a read can observe
+/// the pre- or post-operation record but never a partial write. Callers that
+/// need a consistency decision across the whole operation use `status-v2`,
+/// which owns the operation/std state protocol.
+#[cfg(target_os = "macos")]
+pub fn stored_configuration_v2_for_state_dir(
+    state_dir: &Path,
+) -> AppResult<Option<v2::DeploymentConfiguration>> {
+    if state_dir != Path::new(INSTALL_STATE_DIRECTORY) {
+        return Err(AppError::not_implemented(format!(
+            "configuration-v2 is limited to the fixed macOS state directory {INSTALL_STATE_DIRECTORY}"
+        )));
+    }
+    let adapter = MacosSystemApplyAdapter::new();
+    if !validate_existing_state_dir(&adapter, state_dir)? {
+        return Ok(None);
+    }
+    let record_path = state_dir.join(OPERATION_RECORD);
+    let record = read_operation_record(&adapter, &record_path)?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    validate_macos_stored_configuration(&record.configuration)?;
+    Ok(Some(record.configuration))
 }
 
 #[cfg(unix)]
@@ -1977,15 +2107,40 @@ fn write_record(
 }
 
 #[cfg(unix)]
+trait RecordReader {
+    fn path_metadata(&self, path: &Path) -> Result<Option<MacosApplyPathMetadata>, String>;
+    fn read_bounded_file(&self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, String>;
+}
+
+#[cfg(unix)]
+impl<T: MacosApplyAdapter + ?Sized> RecordReader for T {
+    fn path_metadata(&self, path: &Path) -> Result<Option<MacosApplyPathMetadata>, String> {
+        MacosApplyAdapter::path_metadata(self, path)
+    }
+
+    fn read_bounded_file(&self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+        MacosApplyAdapter::read_bounded_file(self, path, max_bytes)
+    }
+}
+
+#[cfg(unix)]
 fn read_operation_record(
     adapter: &dyn MacosApplyAdapter,
     path: &Path,
 ) -> AppResult<Option<v2::OperationRecord>> {
-    match adapter.path_metadata(path) {
+    read_operation_record_with(adapter, path)
+}
+
+#[cfg(unix)]
+fn read_operation_record_with<R: RecordReader + ?Sized>(
+    reader: &R,
+    path: &Path,
+) -> AppResult<Option<v2::OperationRecord>> {
+    match reader.path_metadata(path) {
         Ok(None) => Ok(None),
         Ok(Some(metadata)) => {
             validate_state_file(&metadata, path)?;
-            let bytes = adapter
+            let bytes = reader
                 .read_bounded_file(path, MAX_STATE_BYTES)
                 .map_err(unavailable)?;
             let record: v2::OperationRecord = serde_json::from_slice(&bytes).map_err(|error| {
@@ -4014,5 +4169,286 @@ mod health_response_tests {
         health["bootstrap_completed"] = json!(true);
         health["accepting_authorized_operations"] = json!(false);
         assert!(!macos_health_response_is_ready(&health));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod stored_configuration_v2_tests {
+    use super::{stored_configuration_v2_for_state_dir, validate_macos_stored_configuration};
+    use crate::installer::lifecycle_v2 as v2;
+    use std::path::Path;
+
+    fn macos_configuration() -> v2::DeploymentConfiguration {
+        v2::DeploymentConfiguration {
+            deployment_kind: v2::DeploymentKind::MacosLaunchd,
+            network: v2::NetworkConfiguration {
+                scope: v2::NetworkScope::LoopbackDevelopment,
+                authority_port: 8920,
+                bind_address: None,
+                client_hostname: None,
+            },
+            storage: v2::StorageConfiguration {
+                data_directory: "/Library/Application Support/Helicoid/Data".to_string(),
+                backup_directory: "/Library/Application Support/Helicoid-Backups".to_string(),
+                preserve_data_on_remove: true,
+            },
+        }
+    }
+
+    #[test]
+    fn macos_entry_rejects_non_fixed_state_directory() {
+        let error = stored_configuration_v2_for_state_dir(Path::new(
+            "/tmp/helicoid-arbitrary-installer-state",
+        ))
+        .expect_err("arbitrary state directory");
+        assert!(
+            error
+                .to_string()
+                .contains("configuration-v2 is limited to the fixed macOS state directory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn macos_entry_rejects_linux_configuration() {
+        let mut linux = macos_configuration();
+        linux.deployment_kind = v2::DeploymentKind::LinuxSystemd;
+        let error =
+            validate_macos_stored_configuration(&linux).expect_err("Linux record must be refused");
+        assert!(
+            error.to_string().contains("requires a macos_launchd"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn macos_entry_accepts_macos_launchd_configuration() {
+        validate_macos_stored_configuration(&macos_configuration())
+            .expect("fixed macOS launchd configuration");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_state_dir_fake_tests {
+    use super::{
+        read_operation_record_with, validate_existing_state_dir, MacosApplyPathMetadata,
+        RecordReader, StateDirFacts,
+    };
+    use crate::installer::lifecycle_v2 as v2;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    const STATE_DIR: &str = "/Library/Application Support/Helicoid-Installer";
+
+    fn directory(uid: u32, mode: u32) -> MacosApplyPathMetadata {
+        MacosApplyPathMetadata {
+            is_symlink: false,
+            is_directory: true,
+            is_regular_file: false,
+            uid,
+            gid: 0,
+            mode,
+            nlink: 1,
+            len: 0,
+        }
+    }
+
+    fn regular_file(len: u64, uid: u32, mode: u32, nlink: u64) -> MacosApplyPathMetadata {
+        MacosApplyPathMetadata {
+            is_symlink: false,
+            is_directory: false,
+            is_regular_file: true,
+            uid,
+            gid: 0,
+            mode,
+            nlink,
+            len,
+        }
+    }
+
+    fn base_facts(final_metadata: Result<Option<MacosApplyPathMetadata>, String>) -> FakeFacts {
+        let mut entries = BTreeMap::new();
+        for path in ["/", "/Library", "/Library/Application Support"] {
+            entries.insert(PathBuf::from(path), Ok(Some(directory(0, 0o755))));
+        }
+        entries.insert(PathBuf::from(STATE_DIR), final_metadata);
+        FakeFacts {
+            entries,
+            unsafe_acl: BTreeMap::new(),
+        }
+    }
+
+    struct FakeFacts {
+        entries: BTreeMap<PathBuf, Result<Option<MacosApplyPathMetadata>, String>>,
+        unsafe_acl: BTreeMap<PathBuf, bool>,
+    }
+
+    impl StateDirFacts for FakeFacts {
+        fn path_metadata(&self, path: &Path) -> Result<Option<MacosApplyPathMetadata>, String> {
+            self.entries.get(path).cloned().unwrap_or_else(|| Ok(None))
+        }
+
+        fn extended_acl_is_safe(&self, path: &Path) -> Result<bool, String> {
+            Ok(!self.unsafe_acl.get(path).copied().unwrap_or(false))
+        }
+    }
+
+    #[test]
+    fn state_dir_absent_is_authoritative() {
+        let facts = base_facts(Ok(None));
+        assert!(!validate_existing_state_dir(&facts, Path::new(STATE_DIR)).unwrap());
+    }
+
+    #[test]
+    fn state_dir_metadata_error_is_not_absence() {
+        let facts = base_facts(Err("permission denied".to_string()));
+        assert!(validate_existing_state_dir(&facts, Path::new(STATE_DIR)).is_err());
+    }
+
+    #[test]
+    fn state_dir_rejects_non_root_owner() {
+        let facts = base_facts(Ok(Some(directory(501, 0o700))));
+        assert!(validate_existing_state_dir(&facts, Path::new(STATE_DIR)).is_err());
+    }
+
+    #[test]
+    fn state_dir_rejects_non_owner_private_mode() {
+        let facts = base_facts(Ok(Some(directory(0, 0o755))));
+        assert!(validate_existing_state_dir(&facts, Path::new(STATE_DIR)).is_err());
+    }
+
+    #[test]
+    fn state_dir_rejects_allowing_acl() {
+        let mut facts = base_facts(Ok(Some(directory(0, 0o700))));
+        facts.unsafe_acl.insert(PathBuf::from(STATE_DIR), true);
+        assert!(validate_existing_state_dir(&facts, Path::new(STATE_DIR)).is_err());
+    }
+
+    #[test]
+    fn state_dir_accepts_safe_root_private_directory() {
+        let facts = base_facts(Ok(Some(directory(0, 0o700))));
+        assert!(validate_existing_state_dir(&facts, Path::new(STATE_DIR)).unwrap());
+    }
+
+    struct FakeRecord {
+        metadata: Result<Option<MacosApplyPathMetadata>, String>,
+        bytes: Vec<u8>,
+    }
+
+    impl RecordReader for FakeRecord {
+        fn path_metadata(&self, _path: &Path) -> Result<Option<MacosApplyPathMetadata>, String> {
+            self.metadata.clone()
+        }
+
+        fn read_bounded_file(&self, _path: &Path, _max_bytes: usize) -> Result<Vec<u8>, String> {
+            Ok(self.bytes.clone())
+        }
+    }
+
+    fn operation_record_bytes() -> Vec<u8> {
+        let configuration = v2::DeploymentConfiguration {
+            deployment_kind: v2::DeploymentKind::MacosLaunchd,
+            network: v2::NetworkConfiguration {
+                scope: v2::NetworkScope::LoopbackDevelopment,
+                authority_port: 8920,
+                bind_address: None,
+                client_hostname: None,
+            },
+            storage: v2::StorageConfiguration {
+                data_directory: "/Library/Application Support/Helicoid/Data".to_string(),
+                backup_directory: "/Library/Application Support/Helicoid-Backups".to_string(),
+                preserve_data_on_remove: true,
+            },
+        };
+        serde_json::to_vec(&v2::OperationRecord {
+            contract_version: v2::CONTRACT_VERSION,
+            operation_id: "00000000-0000-4000-8000-000000000000".to_string(),
+            action: v2::LifecycleAction::Install,
+            resource_operation_id: None,
+            reviewed_plan_digest: "a".repeat(64),
+            configuration,
+            created_at: "2026-11-12T00:00:00Z".to_string(),
+            outcome: None,
+        })
+        .expect("operation record JSON")
+    }
+
+    #[test]
+    fn operation_record_absent_is_none() {
+        let reader = FakeRecord {
+            metadata: Ok(None),
+            bytes: Vec::new(),
+        };
+        assert!(
+            read_operation_record_with(&reader, Path::new("/state/operation-v2.json"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn operation_record_metadata_error_propagates() {
+        let reader = FakeRecord {
+            metadata: Err("permission denied".to_string()),
+            bytes: operation_record_bytes(),
+        };
+        assert!(
+            read_operation_record_with(&reader, Path::new("/state/operation-v2.json")).is_err()
+        );
+    }
+
+    #[test]
+    fn operation_record_rejects_symlink_and_empty_file() {
+        let mut symlink = regular_file(1, 0, 0o600, 1);
+        symlink.is_symlink = true;
+        symlink.is_regular_file = false;
+        let reader = FakeRecord {
+            metadata: Ok(Some(symlink)),
+            bytes: operation_record_bytes(),
+        };
+        assert!(
+            read_operation_record_with(&reader, Path::new("/state/operation-v2.json")).is_err()
+        );
+
+        let reader = FakeRecord {
+            metadata: Ok(Some(regular_file(0, 0, 0o600, 1))),
+            bytes: Vec::new(),
+        };
+        assert!(
+            read_operation_record_with(&reader, Path::new("/state/operation-v2.json")).is_err()
+        );
+    }
+
+    #[test]
+    fn operation_record_rejects_unsafe_owner_mode_and_links() {
+        for metadata in [
+            regular_file(32, 501, 0o600, 1),
+            regular_file(32, 0, 0o666, 1),
+            regular_file(32, 0, 0o600, 2),
+        ] {
+            let reader = FakeRecord {
+                metadata: Ok(Some(metadata)),
+                bytes: operation_record_bytes(),
+            };
+            assert!(
+                read_operation_record_with(&reader, Path::new("/state/operation-v2.json")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn operation_record_accepts_safe_record() {
+        let bytes = operation_record_bytes();
+        let reader = FakeRecord {
+            metadata: Ok(Some(regular_file(bytes.len() as u64, 0, 0o600, 1))),
+            bytes,
+        };
+        let record = read_operation_record_with(&reader, Path::new("/state/operation-v2.json"))
+            .expect("safe record")
+            .expect("present record");
+        assert_eq!(
+            record.configuration.deployment_kind,
+            v2::DeploymentKind::MacosLaunchd
+        );
     }
 }

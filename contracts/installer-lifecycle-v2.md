@@ -72,7 +72,17 @@ unverified. Systemd and Compose installs accept custom data paths under
 `configuration-v2 --state-dir DIR` returns the durable operation configuration
 or JSON `null` when the state directory has no v2 operation record. It is a
 read-only query used by management clients to preserve configured storage paths
-for status and removal.
+for status and removal. Only fixed product state directories are accepted:
+`/opt/helicoid/.installer` on Linux and
+`/Library/Application Support/Helicoid-Installer` on macOS. Arbitrary and
+case-aliased state paths are refused. The macOS entry accepts only the exact
+macOS state directory and only a `macos_launchd` operation record, validated
+with the fixed macOS launchd configuration policy. Its read is deliberately
+lock-free: it neither creates nor takes the installer operation lock, reads the
+atomically written record with revalidation, and does not promise a snapshot
+across the full operation; callers needing operation-state consistency use
+`status-v2`. The Linux entry retains the existing Linux validation and
+state-directory behavior.
 
 The selected WebRTC public edge is a separate organization-owned deployment.
 Legacy RustDesk ports 21115–21117 are not reserved, opened, or installed by the
@@ -359,5 +369,5 @@ The v2 request schemas are Rust-owned in
 `src/installer/lifecycle_v2.rs`. Do not hand-construct a plan or infer support
 from a command's existence; discover capabilities and honor explicit refusal.
 On macOS, `capabilities-v2`, `preflight-v2`, `plan-v2`, `apply-v2`,
-`status-v2`, and `cancel-v2` are available. `resume-v2`, `remove-v2`, and the
-legacy mutation commands fail closed.
+`status-v2`, `cancel-v2`, and the read-only `configuration-v2` are available.
+`resume-v2`, `remove-v2`, and the legacy mutation commands fail closed.

@@ -1484,8 +1484,18 @@ fn run_installer(action: InstallerAction) -> AppResult<()> {
             println!("{json}");
             Ok(())
         }
+        InstallerAction::ConfigurationV2 { state_dir } => {
+            let result = hs_server::installer::macos_apply::stored_configuration_v2_for_state_dir(
+                std::path::Path::new(&state_dir),
+            )?;
+            let json = serde_json::to_string_pretty(&result).map_err(|err| {
+                hs_server::AppError::internal(format!("serialize stored v2 configuration: {err}"))
+            })?;
+            println!("{json}");
+            Ok(())
+        }
         _ => Err(hs_server::AppError::not_implemented(
-            "only installer capabilities-v2, preflight-v2, plan-v2, apply-v2, status-v2, and cancel-v2 are available in this macOS build",
+            "only installer capabilities-v2, preflight-v2, plan-v2, apply-v2, status-v2, cancel-v2, and configuration-v2 are available in this macOS build",
         )),
     }
 }

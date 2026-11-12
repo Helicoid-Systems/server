@@ -334,14 +334,17 @@ production acceptance is established.
 The real-host acceptance is
 [`macos-installer-acceptance.yml`](.github/workflows/macos-installer-acceptance.yml).
 It runs both a successful launchd install and a forced post-effect launchd
-failure on isolated `macos-15` runners. Because a new workflow file cannot be
-dispatched from the default branch before merge, it runs on a narrow push to
-`codex/macos-server-plan-ci`; `gh workflow run macos-installer-acceptance.yml`
-remains available once the file is on the default branch. It requires
-passwordless sudo and system-domain launchd support, asserts the fixed
-paths/identity are absent first, preserves `_helicoid` until all non-identity
-resources are gone, and fails if cleanup is incomplete. Never run the
-acceptance script on a developer machine.
+failure on isolated `macos-15` runners. Push-triggered privileged acceptance is
+intentionally disabled pending cleanup-authorization hardening; manual
+`workflow_dispatch` is allowed only on the default branch of the exact
+`Helicoid-Systems/server` repository with a GitHub-hosted runner. Historical
+evidence remains recorded in `BUILD-REPORT.md`:
+[run 43099835549](https://github.com/Helicoid-Systems/server/actions/runs/43099835549)
+passed install and rollback at `520d1b00`; it applies to that historical SHA,
+not to these newer recovery/cleanup-hardening changes. Cleanup safeguards
+review remains pending. It requires
+passwordless sudo and system-domain launchd support. Never run the acceptance
+script on a developer machine.
 
 The normal macOS build still exposes the installer v2 commands:
 
@@ -352,7 +355,17 @@ hs-server installer plan-v2 --package-dir /path/to/package --verify-key <hex>
 # A normal build refuses apply until a production trust root exists. The
 # dev-only build uses --features macos-dev-install with a build-pinned key.
 hs-server installer apply-v2 --state-dir "/Library/Application Support/Helicoid-Installer"
+hs-server installer configuration-v2 --state-dir "/Library/Application Support/Helicoid-Installer"
 ```
+
+`configuration-v2` is read-only. The macOS entry accepts only
+`/Library/Application Support/Helicoid-Installer` and only a `macos_launchd`
+operation record; the Linux entry retains `/opt/helicoid/.installer` and the
+existing Linux validation. macOS recovery requires a root-owned owner-private
+state directory with no ACL ALLOW entry, and a root-owned single-link regular
+operation record read without following links. The recovery read is lock-free
+and never creates the installer lock; use `status-v2` for operation-state
+consistency.
 
 `plan-v2` re-runs local preflight, refuses a submitted preflight that no longer
 matches stable observed host facts, derives the frozen `macos-arm64` or

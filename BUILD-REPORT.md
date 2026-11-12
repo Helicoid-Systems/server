@@ -18,8 +18,20 @@ success, durable operation/journal records, receipt-based service startup, and
 reverse rollback of journaled resources. Capabilities advertise
 preflight/plan/install/cancel/inspect plus the durable journal and cancellation
 only in the development feature build; updates, backup/restore, removal,
-enrollment readiness, and production acceptance stay unavailable. The real
-adapter now allows a bounded 10-second readiness window instead of treating
+enrollment readiness, and production acceptance stay unavailable. The macOS
+build now exposes the read-only `configuration-v2` command. The macOS entry
+accepts only the exact `/Library/Application Support/Helicoid-Installer`
+directory and only a `macos_launchd` operation record. It requires a
+root-owned owner-private state directory with no ACL ALLOW entry, rejects
+symlinked parents, and reads a root-owned single-link regular nonempty bounded
+record through the guarded macOS apply state verifier with no-follow reads.
+Absent state is distinguished from permission, type, and I/O errors. Recovery
+is deliberately lock-free and never creates the installer lock; operation
+state consistency remains `status-v2`'s responsibility. Apply's state-directory
+preparation now also requires the final directory to be owner-private, matching
+recovery validation. The Linux entry and Linux test-adapter state/config
+behavior remain unchanged. The real adapter now allows a bounded 10-second
+readiness window instead of treating
 launchd presence as readiness; tests keep the shorter default. Its `/health`
 gate now requires the exact wire and storage schemas, an active authority,
 generation greater than zero, no recovery quarantine, and either a fully
@@ -55,13 +67,16 @@ proven gone, deletes the group only after the user is confirmed absent, and
 cleanup failures now make the job fail and retain the marker. The configured
 backup directory is never created by the macOS installer; acceptance refuses to
 start if it already exists and never deletes it, while an unexpected creation is
-detected as a leftover without deleting that path. The workflow runs on a
-narrow push to `codex/macos-server-plan-ci` because a new workflow file cannot
-be dispatched from the default branch before merge; `workflow_dispatch` remains
-available. The acceptance job is additionally gated to exact repository
+detected as a leftover without deleting that path. Push-triggered privileged
+acceptance is intentionally disabled pending cleanup-authorization hardening;
+`workflow_dispatch` is allowed only on the default branch of exact repository
 `Helicoid-Systems/server` and fails unless `RUNNER_ENVIRONMENT` is
-`github-hosted`; permissions remain `contents: read` and no secrets are used.
-Privileged acceptance is never run locally.
+`github-hosted`. Permissions remain `contents: read` and no secrets are used.
+Historical evidence is retained: [run 43099835549](https://github.com/Helicoid-Systems/server/actions/runs/43099835549)
+passed the install and rollback acceptance at `520d1b00`. That run applies only
+to that historical SHA, not to these newer recovery and cleanup-hardening
+changes; cleanup safeguards review remains pending. Privileged acceptance is
+never run locally.
 
 **Files:** `Cargo.toml`, `build.rs`, `src/models.rs`, `src/service.rs`,
 `src/main.rs`, `src/installer/macos_apply.rs`, `src/installer/macos_launchd.rs`,

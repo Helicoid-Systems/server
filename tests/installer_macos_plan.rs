@@ -948,6 +948,24 @@ mod cli {
     }
 
     #[test]
+    fn cli_configuration_v2_is_read_only_and_refuses_arbitrary_state_dirs() {
+        let output = run_installer(
+            &[
+                "configuration-v2",
+                "--state-dir",
+                "/tmp/helicoid-arbitrary-installer-state",
+            ],
+            "",
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("configuration-v2 is limited to the fixed macOS state directory"),
+            "configuration-v2 must reject an arbitrary state directory, stderr: {stderr}"
+        );
+    }
+
+    #[test]
     fn cli_plan_v2_is_wired_without_enabling_install() {
         let output = run_installer(
             &[
@@ -1554,6 +1572,37 @@ mod apply_lifecycle {
             !state_dir.exists(),
             "root refusal must precede state effects"
         );
+    }
+
+    #[test]
+    fn apply_rejects_non_owner_private_existing_state_dir() {
+        let observer = FakeLaunchdObserver::with_valid_host("arm64");
+        let preflight = hs_server::installer::macos_launchd::preflight_v2(
+            &observer,
+            &v2::PreflightInput {
+                contract_version: v2::CONTRACT_VERSION,
+                configuration: configuration(),
+            },
+        )
+        .expect("preflight");
+        let host = FakeApplyHost::new(preflight);
+        host.state().paths.insert(
+            PathBuf::from(INSTALL_STATE_DIRECTORY),
+            MacosApplyPathMetadata {
+                is_symlink: false,
+                is_directory: true,
+                is_regular_file: false,
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
+                nlink: 1,
+                len: 0,
+            },
+        );
+        let (input, _key, _package) = apply_input(&observer);
+        let error = apply_v2_with_adapter(&host, &input, &state_dir())
+            .expect_err("non-private installer state directory must fail");
+        assert_eq!(error.code(), ErrorCode::SecurityStateUnavailable);
     }
 
     #[test]

@@ -4,29 +4,14 @@ name: macos-installer-acceptance
 #
 # This workflow requires a disposable GitHub-hosted macOS runner where
 # passwordless sudo, account creation, and system-domain launchd bootstrap are
-# available. It never runs on a developer machine and it removes only the fixed
-# resources it first verified absent.
-# A new workflow file is not dispatchable from the default branch until it is
-# merged. The narrow trusted-branch push trigger makes the first acceptance run
-# possible without widening acceptance to other branches; workflow_dispatch
-# remains available after this file reaches the default branch.
+# available. It never runs on a developer machine.
+# Push-triggered privileged acceptance is intentionally disabled pending
+# authoritative cleanup-authorization hardening of the acceptance script.
+# Manual dispatch is allowed only on the default branch of the exact trusted
+# repository, with a GitHub-hosted runner. Historical successful CI evidence is
+# retained; see BUILD-REPORT.md.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - codex/macos-server-plan-ci
-    paths:
-      - '.github/workflows/macos-installer-acceptance.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'build.rs'
-      - 'src/**'
-      - 'tests/installer_macos_capabilities.rs'
-      - 'tests/installer_macos_launchd.rs'
-      - 'tests/installer_macos_plan.rs'
-      - 'tests/installer_macos_dev_install.rs'
-      - 'scripts/package-macos-development.sh'
-      - 'scripts/run-macos-development-install-acceptance.sh'
 
 permissions:
   contents: read
@@ -38,8 +23,11 @@ concurrency:
 jobs:
   acceptance:
     name: macOS development installer (${{ matrix.mode }})
-    # Never schedule this privileged acceptance from a fork or another repo.
-    if: github.repository == 'Helicoid-Systems/server'
+    # Never schedule this privileged acceptance from a fork, another repo,
+    # or a branch other than the default branch.
+    if: >-
+      github.repository == 'Helicoid-Systems/server' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: macos-15
     timeout-minutes: 60
     strategy:
@@ -56,6 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           [ "$GITHUB_REPOSITORY" = "Helicoid-Systems/server" ]
+          [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]
           [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]
 
       - name: Checkout
