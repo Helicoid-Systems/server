@@ -11,7 +11,7 @@ build = "build.rs"
 # Development-only macOS launchd installer acceptance. Requires
 # HELICOID_MACOS_DEV_TRUST_KEY to pin one Ed25519 release verifying key at
 # build time. It is not a production trust root or release configuration.
-macos-dev-install = []
+macos-dev-install = ["dep:rcgen"]
 
 [dependencies]
 argon2 = "0.6"
@@ -20,6 +20,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 rand = "0.10"
+rcgen = { version = "0.13", optional = true }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs", "logging"] }
 rustls-webpki = { version = "0.103.15", default-features = false, features = ["std"] }

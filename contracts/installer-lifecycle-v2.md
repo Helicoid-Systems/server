@@ -84,6 +84,71 @@ across the full operation; callers needing operation-state consistency use
 `status-v2`. The Linux entry retains the existing Linux validation and
 state-directory behavior.
 
+### Development-only macOS TLS source provisioning
+
+A macOS build compiled with `--features macos-dev-install` additionally accepts:
+
+```text
+hs-server installer provision-macos-tls
+```
+
+It takes no caller-selected paths or arguments, must run as root, and writes
+only the fixed `/etc/helicoid/tls/fullchain.pem` and
+`/etc/helicoid/tls/private-key.pem` sources. It serializes with the existing
+persistent installer `flock`, validates `/etc/helicoid` and `/etc/helicoid/tls`
+through the existing root-owned/private-directory ACL policy, writes a
+self-signed ECDSA certificate covering literal `127.0.0.1` and its private key
+into a private stage, and installs each with `renamex_np(RENAME_EXCL)`.
+Existing certificate/key paths are never replaced. A hidden publish marker
+contains only the intended public SHA-256 digests; it is written into the
+private stage and installed atomically with no-replace rename, and its
+directory is fsynced before the first published file rename. These fsyncs are
+not macOS `F_FULLFSYNC`, so this covers process crashes, not power loss or
+kernel crashes: after those the marker and files may be absent or
+inconsistent. If a process crash occurs between the two no-replace renames,
+retry either completes the matching published pair or removes only
+marker-matching partial files and republishes; it never deletes non-matching
+files. A marker that is present but mismatched/corrupt is refused for operator
+inspection rather than auto-repaired. An empty/malformed marker is cleaned
+only when both final files are absent; otherwise recovery fails closed. The
+marker remains after success so retries are idempotent and is removed only
+when both final files are removed. Stale stage directories are removed only
+after proving the exact stage prefix, root ownership, owner-private mode, safe
+ACL, and an allowlisted regular-file set.
+
+The command returns bounded JSON tagged by `outcome`:
+
+```json
+{
+  "outcome": "provisioned",
+  "certificate_path": "/etc/helicoid/tls/fullchain.pem",
+  "private_key_path": "/etc/helicoid/tls/private-key.pem",
+  "certificate_sha256": "<64 hex>",
+  "private_key_sha256": "<64 hex>",
+  "authority_host": "127.0.0.1"
+}
+```
+
+- `provisioned`: this invocation generated and installed new material.
+- `recovered`: a prior interrupted or completed own-marker publication was
+  verified from the publish marker and both matching files; no new generation
+  occurred.
+- `existing_unverified`: fixed certificate/key paths already existed without an
+  own marker. They are not read, validated, modified, or treated as ready. The
+  response contains the fixed paths, `certificate_present`,
+  `private_key_present`, `authority_host`, and `detail`. `plan-v2` must verify
+  the actual TLS material before readiness or installation.
+
+A root-owned, non-writable `0755` `/etc/helicoid` operator layout may return
+`existing_unverified` without mutation; strict private-store adoption happens
+only when this helper proceeds to provision new material. A marker that is
+present but corrupt/mismatched with final files remains a refusal, not
+`existing_unverified`, and requires operator inspection.
+
+It is development evidence only: self-signed, not a production CA, not
+notarized, and unavailable in a normal build. The normal build recognizes the
+command but refuses it because the compile feature is absent.
+
 The selected WebRTC public edge is a separate organization-owned deployment.
 Legacy RustDesk ports 21115–21117 are not reserved, opened, or installed by the
 current plan. Port 80/443 ownership and existing proxy configuration remain
@@ -246,7 +311,10 @@ root-owned install receipt, and the launchd plist, then bootstraps
 identity and refuses an already-completed installation. Every effect is
 preceded by a durable operation record and per-resource journal entry. State
 files are published with an exclusive private temp file, fsync, rename, and
-parent-directory fsync. A fixed product-wide persistent `flock` at
+parent-directory fsync. These fsyncs order data for a process crash; they do
+not provide guaranteed power-loss durability because macOS `F_FULLFSYNC` is
+not used, so an interrupted power failure may leave state requiring
+inspection. A fixed product-wide persistent `flock` at
 `/Library/Application Support/Helicoid-Installer.lock` serializes mutations
 across all state directories; the lock file is never a create-new recovery
 marker. Other or case-aliased state directories are refused. The unused

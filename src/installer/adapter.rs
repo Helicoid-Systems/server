@@ -1110,7 +1110,9 @@ pub(crate) fn open_dir_nofollow(path: &Path, create: bool) -> Result<std::os::fd
 }
 
 /// Atomic write: unique exclusive private temp in the destination
-/// directory, fsync, renameat, fsync parent. The temp is removed on
+/// directory, fsync, renameat, fsync parent. This orders the change across a
+/// process crash but, lacking macOS `F_FULLFSYNC`, does not guarantee
+/// power-loss durability. The temp is removed on
 /// failure. Destination and parents never follow symlinks. The previous
 /// destination file is preserved until the rename replaces it.
 #[cfg(unix)]

@@ -30,8 +30,39 @@ is deliberately lock-free and never creates the installer lock; operation
 state consistency remains `status-v2`'s responsibility. Apply's state-directory
 preparation now also requires the final directory to be owner-private, matching
 recovery validation. The Linux entry and Linux test-adapter state/config
-behavior remain unchanged. The real adapter now allows a bounded 10-second
-readiness window instead of treating
+behavior remain unchanged.
+
+The development-only `provision-macos-tls` command also uses the existing
+persistent installer `flock`, private-store directory validation (root-owned,
+owner-private, no ACL ALLOW), a private stage, and
+`renamex_np(RENAME_EXCL)` for each file. It generates a self-signed ECDSA
+certificate covering literal `127.0.0.1` with the optional `rcgen` dependency,
+never invokes shell/Python/openssl, and removes stale stages only after proving
+the exact prefix, root ownership, private mode, safe ACL, and allowlisted
+regular-file contents. A hidden publish marker records the intended public
+digests and is staged/installed atomically with no-replace rename: a process
+crash between the two file renames is recovered by completing the matching
+pair or removing only marker-matching partial files, so retry is not wedged.
+The marker directory is fsynced, but with fsync rather than macOS
+`F_FULLFSYNC`; durability is therefore scoped to process crashes, not power
+loss or kernel crashes. A marker that is present but mismatched/corrupt is
+refused for operator inspection. Empty/malformed markers are removed only
+when both final files are absent; otherwise recovery fails closed. The marker
+remains after success for idempotent retries and is removed only when both
+final files are removed.
+Recovery final files are read through the existing private-file reader
+(ACL-checked, `Zeroizing`), and generated private-key bytes are held in
+`Zeroizing`.
+
+The command now returns an explicit tagged outcome: `provisioned` for new
+material, `recovered` for a verified own-marker publication, and
+`existing_unverified` when operator certificate/key paths already exist without
+our marker. Existing-unverified detection uses lstat only and does not read,
+validate, mutate, or report readiness; it runs before strict private-store
+adoption so a root-owned non-writable `0755` operator layout can proceed to
+plan-time TLS validation. A mismatched/corrupt own marker still refuses. The
+normal build refuses the command because `macos-dev-install` is absent. The real adapter now allows a
+bounded 10-second readiness window instead of treating
 launchd presence as readiness; tests keep the shorter default. Its `/health`
 gate now requires the exact wire and storage schemas, an active authority,
 generation greater than zero, no recovery quarantine, and either a fully
@@ -79,7 +110,8 @@ changes; cleanup safeguards review remains pending. Privileged acceptance is
 never run locally.
 
 **Files:** `Cargo.toml`, `build.rs`, `src/models.rs`, `src/service.rs`,
-`src/main.rs`, `src/installer/macos_apply.rs`, `src/installer/macos_launchd.rs`,
+`src/main.rs`, `src/installer/mod.rs`, `src/installer/macos_apply.rs`,
+`src/installer/macos_launchd.rs`, `src/installer/macos_tls.rs`,
 `src/installer/machine.rs`, `tests/http_api.rs`, `tests/review_findings.rs`,
 `tests/installer.rs`, `tests/installer_macos_capabilities.rs`,
 `tests/installer_macos_launchd.rs`, `tests/installer_macos_plan.rs`,
@@ -121,7 +153,10 @@ so SIGKILL cannot wedge recovery with a stale create-new marker and separate
 `--state-dir` values cannot race. Only the fixed state directory
 `/Library/Application Support/Helicoid-Installer` is accepted; other or
 case-aliased paths are refused. State files use exclusive temp write, file
-fsync, rename, and parent-directory fsync. Product files/directories are
+fsync, rename, and parent-directory fsync. These fsyncs order a process crash
+but do not provide guaranteed power-loss durability (`F_FULLFSYNC` is not
+used), so a power interruption may leave state requiring inspection. Product
+files/directories are
 created relative to held parent descriptors with `fchmod`/`fchown` on the held
 object, avoiding path-based ownership changes inside service-owned TLS
 directories. TLS source bytes are bound to certificate/key digests captured
@@ -139,7 +174,8 @@ deleted by recognition; uncertain records are preserved and recovery is
 reported incomplete. Adapter cleanup no longer deletes partially-created
 identities by name. Journal persistence failures are returned as errors, not
 reported as successful rollback. Terminal records are persisted before journal
-unlink, so a crash preserves recovery evidence. Cancel refuses a completed
+unlink, so a process crash preserves recovery evidence (fsync-only; power loss
+may leave inconsistent state requiring inspection). Cancel refuses a completed
 journal without a finalized operation record unless the caller explicitly
 acknowledges recovery, so a potentially healthy install is not destroyed
 implicitly; normal `cancellation_available` is false in that state. Completed

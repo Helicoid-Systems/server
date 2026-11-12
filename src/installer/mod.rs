@@ -18,6 +18,8 @@ pub mod macos_apply;
 pub mod macos_identity;
 pub mod macos_launchd;
 pub mod macos_package;
+#[cfg(all(target_os = "macos", feature = "macos-dev-install"))]
+pub mod macos_tls;
 pub mod manifest;
 pub mod models;
 pub mod package_fs;

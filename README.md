@@ -356,7 +356,73 @@ hs-server installer plan-v2 --package-dir /path/to/package --verify-key <hex>
 # dev-only build uses --features macos-dev-install with a build-pinned key.
 hs-server installer apply-v2 --state-dir "/Library/Application Support/Helicoid-Installer"
 hs-server installer configuration-v2 --state-dir "/Library/Application Support/Helicoid-Installer"
+# Development-only macOS loopback TLS source provisioning:
+hs-server installer provision-macos-tls
 ```
+
+`provision-macos-tls` exists only in a macOS build compiled with
+`--features macos-dev-install`. It must run as root, uses the fixed
+`/etc/helicoid/tls` source paths, takes the existing installer `flock`, creates
+the fixed directories with the private-store validator, writes through a
+private stage, and installs with `renamex_np(RENAME_EXCL)`. It never uses a
+no-replace rename to overwrite an existing certificate/key; preexisting
+operator material is reported as `existing_unverified` without reading or
+modifying that certificate/key material. Strict private-store adoption and
+unsafe preexisting `/etc/helicoid` ownership/mode/ACL checks apply only when
+the helper proceeds to provision new material. Stale stage directories left by
+this helper are removed only when the TLS source directory already passes the
+same read-only root-owned/private/ACL-safe validation (and their names match
+the exact stage prefix plus a UUID), so an unvalidated operator layout is left
+completely untouched. Output is bounded JSON with an explicit outcome:
+
+```json
+{
+  "outcome": "provisioned",
+  "certificate_path": "/etc/helicoid/tls/fullchain.pem",
+  "private_key_path": "/etc/helicoid/tls/private-key.pem",
+  "certificate_sha256": "<64 hex>",
+  "private_key_sha256": "<64 hex>",
+  "authority_host": "127.0.0.1"
+}
+```
+
+`outcome` is one of:
+
+- `provisioned` — this invocation generated and installed new material.
+- `recovered` — a prior interrupted/complete publication was verified from the
+  publish marker and both matching files; no new material was generated.
+- `existing_unverified` — preexisting operator certificate/key material was
+  detected without reading, validating, or modifying that material or adopting
+  its directory layout. The response includes the fixed paths,
+  `certificate_present`, `private_key_present`, `authority_host`, and a detail
+  string. It is **not** a readiness claim; `plan-v2` must verify the real TLS
+  material before use.
+
+For `existing_unverified`, a root-owned non-writable `0755` operator
+`/etc/helicoid` is not mutated or rejected by this helper; strict private-store
+adoption is applied only when the helper is actually provisioning new material.
+Only stale directories created by this helper (exact stage prefix plus a UUID)
+may be cleaned, and only after the TLS source directory already passes the
+read-only private-store validation; otherwise nothing under it is touched. A
+mismatched/corrupt own marker still fails closed and requires operator
+inspection.
+
+The certificate is a development self-signed certificate covering literal
+`127.0.0.1`; it is not a production CA/notarization artifact. A hidden publish
+marker stores only the public SHA-256 digests and is itself staged and
+installed atomically with no-replace rename. Its directory is fsynced before
+the first certificate/key rename, so a process crash leaves recovery evidence.
+Those fsyncs (not macOS `F_FULLFSYNC`) do not guarantee power-loss durability:
+after power loss or a kernel crash the marker and files may be absent or
+inconsistent. A retry after a process crash between the two file renames
+either completes the already-published pair or removes only marker-matching
+partial files. A marker that is present but mismatched/corrupt is refused and
+requires operator inspection; it is not auto-repaired. An empty/malformed
+marker is cleaned only when both final files are absent. The marker remains
+after success to make retries idempotent; remove it together with the
+certificate/key to force re-provisioning. The normal build recognizes the
+command but fails closed with "requires the development-only
+macos-dev-install feature".
 
 `configuration-v2` is read-only. The macOS entry accepts only
 `/Library/Application Support/Helicoid-Installer` and only a `macos_launchd`

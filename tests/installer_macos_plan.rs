@@ -965,6 +965,34 @@ mod cli {
         );
     }
 
+    #[cfg(not(feature = "macos-dev-install"))]
+    #[test]
+    fn cli_provision_macos_tls_is_disabled_in_the_normal_build() {
+        let output = run_installer(&["provision-macos-tls"], "");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("requires the development-only macos-dev-install feature"),
+            "normal build must not expose TLS provisioning, stderr: {stderr}"
+        );
+    }
+
+    #[cfg(feature = "macos-dev-install")]
+    #[test]
+    fn cli_provision_macos_tls_refuses_non_root_without_effects() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let output = run_installer(&["provision-macos-tls"], "");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("requires root"),
+            "non-root TLS provisioning must fail closed, stderr: {stderr}"
+        );
+    }
+
     #[test]
     fn cli_plan_v2_is_wired_without_enabling_install() {
         let output = run_installer(

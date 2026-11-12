@@ -1878,9 +1878,10 @@ fn prepare_state_dir(adapter: &dyn MacosApplyAdapter, state_dir: &Path) -> AppRe
 }
 
 /// Minimal facts needed to validate an existing installer state directory.
-/// Implemented by the real macOS apply adapter and by test fakes.
+/// Implemented by the real macOS apply adapter, by the macOS TLS recovery
+/// facts, and by test fakes.
 #[cfg(target_os = "macos")]
-trait StateDirFacts {
+pub(super) trait StateDirFacts {
     fn path_metadata(&self, path: &Path) -> Result<Option<MacosApplyPathMetadata>, String>;
     fn extended_acl_is_safe(&self, path: &Path) -> Result<bool, String>;
 }

@@ -372,6 +372,9 @@ enum InstallerAction {
         #[arg(long, default_value_t = default_installer_state_dir())]
         state_dir: String,
     },
+    /// Development-only macOS loopback TLS source provisioning.
+    #[command(name = "provision-macos-tls", hide = true)]
+    ProvisionMacosTls,
     /// Verify and stage one TUF release package. This does not install it.
     VerifyTufRelease {
         /// Out-of-band trusted TUF root metadata JSON.
@@ -1494,8 +1497,27 @@ fn run_installer(action: InstallerAction) -> AppResult<()> {
             println!("{json}");
             Ok(())
         }
+        InstallerAction::ProvisionMacosTls => {
+            #[cfg(feature = "macos-dev-install")]
+            {
+                let result = hs_server::installer::macos_tls::provision()?;
+                let json = serde_json::to_string_pretty(&result).map_err(|err| {
+                    hs_server::AppError::internal(format!(
+                        "serialize macOS TLS provisioning result: {err}"
+                    ))
+                })?;
+                println!("{json}");
+                Ok(())
+            }
+            #[cfg(not(feature = "macos-dev-install"))]
+            {
+                Err(hs_server::AppError::not_implemented(
+                    "provision-macos-tls requires the development-only macos-dev-install feature",
+                ))
+            }
+        }
         _ => Err(hs_server::AppError::not_implemented(
-            "only installer capabilities-v2, preflight-v2, plan-v2, apply-v2, status-v2, cancel-v2, and configuration-v2 are available in this macOS build",
+            "only installer capabilities-v2, preflight-v2, plan-v2, apply-v2, status-v2, cancel-v2, configuration-v2, and development-only provision-macos-tls are available in this macOS build",
         )),
     }
 }
@@ -1680,6 +1702,11 @@ fn run_installer(action: InstallerAction) -> AppResult<()> {
             serde_json::to_value(result).map_err(|err| {
                 hs_server::AppError::internal(format!("serialize stored v2 configuration: {err}"))
             })?
+        }
+        InstallerAction::ProvisionMacosTls => {
+            return Err(hs_server::AppError::not_implemented(
+                "provision-macos-tls is available only in a macOS development build",
+            ));
         }
         InstallerAction::RemoveV2 { state_dir } => {
             let input: lifecycle_v2::RemoveInput =

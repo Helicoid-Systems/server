@@ -759,7 +759,8 @@ fn unix_create_new_private(abs: &Path, contents: &[u8]) -> AppResult<()> {
         return Err(err);
     }
 
-    // Durability of the directory entry.
+    // Ordering of the directory entry for process-crash recovery. This is
+    // fsync, not macOS F_FULLFSYNC, so power-loss durability is not claimed.
     if unsafe { libc::fsync(dir_raw) } != 0 {
         let err = std::io::Error::last_os_error();
         unlink_created_name(dir_raw, &file_c, &created);
