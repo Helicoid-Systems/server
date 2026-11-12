@@ -3274,7 +3274,10 @@ impl MacosApplyAdapter for MacosSystemApplyAdapter {
         {
             return Err("installed TLS certificate has an unsafe shape".to_string());
         }
-        if !self.extended_acl_is_safe(Path::new(super::macos_launchd::TLS_CERTIFICATE_PATH))? {
+        if !MacosApplyAdapter::extended_acl_is_safe(
+            self,
+            Path::new(super::macos_launchd::TLS_CERTIFICATE_PATH),
+        )? {
             return Err(
                 "installed TLS certificate carries an extended ACL with an ALLOW entry".to_string(),
             );
@@ -3378,7 +3381,7 @@ impl MacosApplyAdapter for MacosSystemApplyAdapter {
                 path.display()
             ));
         }
-        if !self.extended_acl_is_safe(path)? {
+        if !MacosApplyAdapter::extended_acl_is_safe(self, path)? {
             return Err(format!(
                 "lock '{}' carries an extended ACL with an ALLOW entry",
                 path.display()
