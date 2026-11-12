@@ -1,0 +1,98 @@
+name: macos-intel-validation
+
+# Unprivileged contract validation on a GitHub-hosted Intel macOS runner.
+#
+# This workflow exists to catch x86_64-only regressions in the development
+# macOS installer contract and in the TLS library tests. It compiles and tests
+# source only: it never uses sudo, creates accounts, invokes launchctl, writes
+# a product path, installs a package, or changes host state.
+#
+# It does NOT replace:
+#   - the ARM (macos-15) read-only plan and development-contract jobs in
+#     ci.yml, or
+#   - the privileged real-host install/rollback acceptance in
+#     macos-installer-acceptance.yml.
+# Those remain the authoritative ARM and real-acceptance evidence. A green run
+# here is Intel contract coverage only.
+#
+# Push validation is limited to the short-lived feature branch; manual dispatch
+# is available for explicit reruns. No secrets are used.
+
+on:
+  push:
+    branches:
+      - codex/macos-server-plan-ci
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-intel-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  intel-contract:
+    name: macOS Intel development contract (unprivileged)
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: server
+    steps:
+      - name: Assert unprivileged Intel GitHub-hosted runner
+        working-directory: .
+        run: |
+          set -euo pipefail
+          [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]
+          [ "$(uname -s)" = "Darwin" ]
+          [ "$(uname -m)" = "x86_64" ]
+          # This job must never depend on elevation. A root runner would
+          # invalidate the unprivileged claim, so fail closed instead.
+          [ "$(id -u)" -ne 0 ]
+
+      - name: Checkout server
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: server
+          persist-credentials: false
+
+      - name: Checkout pinned core sibling
+        uses: actions/checkout@v4
+        with:
+          repository: Helicoid-Systems/core
+          ref: 5d3f98eaad86330010e1bdaf4731189b286e0dbe
+          path: core
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Pin a synthetic compile-only development key
+        run: |
+          set -euo pipefail
+          # Deterministic contract-only pin with no matching signing key and no
+          # release package. It satisfies build.rs for the unprivileged tests;
+          # it cannot authorize an install and is not a trust root.
+          key_hex="$(python3 -c 'import hashlib; print(hashlib.sha256(b"helicoid macos intel validation contract key").hexdigest())')"
+          [[ "$key_hex" =~ ^[0-9a-f]{64}$ ]]
+          echo "HELICOID_MACOS_DEV_TRUST_KEY=$key_hex" >> "$GITHUB_ENV"
+
+      - name: Test development feature and TLS library
+        run: >-
+          cargo test --locked
+          --features macos-dev-install
+          --lib
+          --test installer_macos_plan
+          --test installer_macos_capabilities
+          --test installer_macos_dev_install
+
+      - name: Clippy development feature
+        run: cargo clippy --locked --all-targets --features macos-dev-install -- -D warnings
